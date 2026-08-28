@@ -1,0 +1,1624 @@
+// ==UserScript==
+// @name         Lincoln/Lancaster Development Viewer Toolkit
+// @namespace    https://gis.lincoln.ne.gov/
+// @version      1.6.1
+// @description  Auto-applies the redesigned parcel popup (v7) and the Quick Bar (v3.7, with the #INVALID repair extended to 19 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix) to the public Development Viewer. Replaces the console paste and the once-per-page-load bookmark click.
+// @match        https://gis.lincoln.ne.gov/apps/*
+// @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
+// @updateURL    https://raw.githubusercontent.com/McMittens1/dev-viewer-toolkit/main/DV_Toolkit.user.js
+// @downloadURL  https://raw.githubusercontent.com/McMittens1/dev-viewer-toolkit/main/DV_Toolkit.user.js
+// @run-at       document-idle
+// @grant        none
+// @noframes
+// ==/UserScript==
+//
+// @grant none is deliberate: it runs the script in the PAGE's JS context, which is
+// the only place window.$arcgis (the map) exists. Under any other @grant the script
+// is sandboxed and would see nothing.
+//
+// This script talks only to gis.lincoln.ne.gov. It sends nothing anywhere else and
+// stores nothing beyond a few localStorage keys in your own browser.
+
+(function () {
+  'use strict';
+
+  /* ---------------------------------------------------------------------
+   * Development Viewer Toolkit 1.6.0 -- auto-run wrapper.
+   *
+   * Runs the SAME two payloads as the manual install, at the right moment:
+   *   applyPopup()   = seed_apply_popup_v7.js  (popup v7, fail-safe gates)
+   *   runQuickBar()  = quickbar_v3.7_src.js    (Quick Bar v3.7, + #INVALID repair extended to 19 rows)
+   *
+   * Replaces both manual steps: the once-per-browser console paste and the
+   * once-per-page-load bookmark click. Nothing server-side, no portal rights,
+   * no change to what the payloads actually do.
+   *
+   * Uninstall: remove this script/extension, then in the console run
+   *   ['__claude_popup_patch','__claude_quick_layers','__claude_qb_preset1',
+   *    '__claude_qb_preset2','__claude_qb_hidden','__claude_qb_baseline','__claude_qb_nosearch','__claude_qb_nodats','__claude_qb_nodats','__claude_qb_baseline'].forEach(function(k){
+   *      localStorage.removeItem(k); });
+   * and reload. The browser is back to the stock viewer.
+   * ------------------------------------------------------------------- */
+
+  if (window.__dvToolkit) return;              /* never install twice */
+  window.__dvToolkit = { version: '1.6.1', ready: false };
+
+  /* The payloads alert() on "map not ready" / "layer not found". That is right
+   * for a bookmarklet someone just clicked, and wrong for something that runs on
+   * every page load -- a real alert() would also block the page. Shadowed here,
+   * lexically, so the host app's own alerts are untouched. */
+  function alert(msg) { console.warn('[DV Toolkit] ' + msg); }
+
+  function mapReady() {
+    try {
+      var vs = window.$arcgis && window.$arcgis.views;
+      if (!vs || !vs.length) return false;
+      var v = vs.getItemAt ? vs.getItemAt(0) : vs.items[0];
+      return !!(v && v.map && v.map.allLayers && v.map.allLayers.length);
+    } catch (e) { return false; }
+  }
+
+  function start() {
+    try { applyPopup(); }
+    catch (e) { console.error('[DV Toolkit] popup patch failed', e); }
+    try { runQuickBar(); }
+    catch (e) { console.error('[DV Toolkit] Quick Bar failed', e); }
+    window.__dvToolkit.ready = true;
+
+    /* If the app ever tears the bar out from under us (SPA re-render), put it
+     * back -- unless the user deliberately hid it, which the bar remembers. */
+    setInterval(function () {
+      try {
+        if (document.getElementById('cqb') || document.getElementById('cqb-handle')) return;
+        if (localStorage.getItem('__claude_qb_hidden') === '1') return;
+        if (!mapReady()) return;
+        runQuickBar();
+      } catch (e) { /* a watchdog must never throw */ }
+    }, 5000);
+  }
+
+  var tries = 0;
+  var timer = setInterval(function () {
+    if (++tries > 480) {                        /* 480 x 250ms = 2 minutes, then stop */
+      clearInterval(timer);
+      console.warn('[DV Toolkit] map never became ready; nothing applied');
+      return;
+    }
+    if (!mapReady()) return;
+    clearInterval(timer);
+    setTimeout(start, 400);                     /* one beat for layers to settle */
+  }, 250);
+
+  /* ===================== payload 1: popup v7 seed ===================== */
+function applyPopup() {
+  // seed_apply_popup_v7.js -- per-browser popup patch, Option C (no portal rights needed).
+  // v7: fail-safe display gates on the two warning banners + the empty-state line.
+  // See APPLY_INSTRUCTIONS.md. Run this once per browser (bookmarklet or console paste)
+  // after the Development Viewer has finished loading.
+  var popupInfo = {"popupElements": [{"type": "text", "text": "<div style='font-family:\"Segoe UI\", Arial, sans-serif;background-color:#141a22;border:1px solid #2c3a4d;border-radius:8px;padding:10px;color:#e8eef5;font-size:9.5pt;line-height:1.4;'><div style='margin-bottom:2px;'><span style='color:#8fa3ba;font-size:8pt;'>PID</span> <strong style='color:#ffffff;font-size:9.5pt;'>{PARCELID}</strong></div><div style='color:#c9d6e4;font-size:8.5pt;margin-bottom:2px;'>{OWNERNME1}</div><div style='color:#8fa3ba;font-size:8pt;margin-bottom:4px;'>{expression/expr38}</div><div style='display:none;display:{expression/expr31};background-color:#5b1111;border:1px solid #b04444;border-radius:6px;padding:6px 8px;margin:6px 0;color:#ffd9d9;font-size:9pt;'><strong>&#9888; FEMA: {expression/expr16}</strong></div><div style='display:none;display:{expression/expr30};background-color:#4d3305;border:1px solid #90661a;border-radius:6px;padding:6px 8px;margin:6px 0;color:#ffe3ad;font-size:8.5pt;'><strong>&#9888; Overlay districts:</strong> {expression/expr29}</div><div style='color:#6f8bb0;font-size:7.5pt;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;padding-bottom:2px;margin:8px 0 4px 0;'>ZONING &amp; LAND USE</div><table style='width:100%;border-collapse:collapse;'><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Zoning</td><td style='padding:2px 0;vertical-align:top;'><a href='{expression/expr0}' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;'><strong>{expression/expr1}</strong></a></td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Floodplain</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr16}</td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Existing use</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr3}</td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Future use</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr17}</td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Growth tier</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr18}</td></tr><tr style='display:{expression/expr33};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Subdivision</td><td style='padding:2px 0;vertical-align:top;'><a href='https://app.lincoln.ne.gov/aspx/cnty/survey/default.aspx?cmd=Final%20Plats&amp;SubDiv={CNVYNAME}' target='_blank' rel='noopener noreferrer' title='Open final plats for this subdivision' style='color:#7cc4ff;text-decoration:none;font-size:9pt;'><strong>{CNVYNAME}</strong></a></td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Area</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr2} ac &#183; {expression/expr41} ft&#178; &#177;</td></tr></table><div><div style='color:#6f8bb0;font-size:7.5pt;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;padding-bottom:2px;margin:8px 0 4px 0;'>DEVELOPMENT ACTIVITY</div><div style='display:none;display:{expression/expr56};color:#8fa3ba;font-size:8.5pt;padding:2px 0;'>No active applications on file</div><table style='display:{expression/expr32};width:100%;border-collapse:collapse;'><tr style='display:{expression/expr54};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Project</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr8}</td></tr><tr style='display:{expression/expr54};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Approved plan</td><td style='padding:2px 0;vertical-align:top;'><a href='https://app.lincoln.ne.gov/aspx/city/pats/default.aspx?AppNum={expression/expr5}' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;font-size:9pt;'><strong>{expression/expr5}</strong></a></td></tr><tr style='display:{expression/expr54};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Amendment</td><td style='padding:2px 0;vertical-align:top;'><a href='https://app.lincoln.ne.gov/aspx/city/pats/default.aspx?AppNum={expression/expr7}' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;font-size:9pt;'><strong>{expression/expr7}</strong></a></td></tr><tr style='display:{expression/expr54};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Parent app</td><td style='padding:2px 0;vertical-align:top;'><a href='https://app.lincoln.ne.gov/aspx/city/pats/default.aspx?AppNum={expression/expr6}' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;font-size:9pt;'><strong>{expression/expr6}</strong></a></td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Applications</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr4}</td></tr><tr style='display:{expression/expr55};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Subdiv. permit</td><td style='padding:2px 0;vertical-align:top;'><a href='https://app.lincoln.ne.gov/aspx/docview.aspx?path=//CitySubs//&amp;project=plangis&amp;ext=pdf&amp;cmd=View&amp;filename={expression/expr15}' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;font-size:9pt;'><strong>{expression/expr15}</strong></a></td></tr><tr style='display:{expression/expr39};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Annex. agmt.</td><td style='padding:2px 0;vertical-align:top;'><a href='https://www.lincoln.ne.gov/City/Departments/Planning-Department/Development-Review/Annexations/Annexation-Agreements' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;font-size:9pt;'><strong>Resolution {expression/expr14}</strong></a></td></tr></table></div><div style='color:#6f8bb0;font-size:7.5pt;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;padding-bottom:2px;margin:8px 0 4px 0;'>PROPERTY</div><div style='color:#c9d6e4;font-size:8pt;margin-bottom:4px;'>{PRPRTYDSCRP}</div><table style='width:100%;border-collapse:collapse;margin-bottom:4px;'><tr style='display:{expression/expr42};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Class</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{CLASSDSCRP}</td></tr><tr style='display:{expression/expr44};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Built</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr43}</td></tr><tr style='display:{expression/expr46};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Floor area</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr45} ft&#178;</td></tr><tr style='display:{expression/expr48};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Assessed</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr47}</td></tr></table><div style='display:{expression/expr34};margin:4px 0;'><a href='https://orion.lancaster.ne.gov/appraisal/publicaccess/PropertyDetail.aspx?PropertyNumber={PARCELID}' target='_blank' rel='noopener noreferrer' title='Open Assessor property record'><img src='{PHOTOPATH}' alt='Property photo' style='width:100%;border-radius:5px;border:1px solid #2c3a4d;' /></a></div><div style='color:#6f8bb0;font-size:7.5pt;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;padding-bottom:2px;margin:8px 0 4px 0;'>SERVICES</div><div style='color:#c9d6e4;font-size:8.5pt;'>School: <strong style='color:#ffffff;'>{expression/expr40}</strong><br />Fire: <strong style='color:#ffffff;'>{expression/expr26}</strong> &#183; Police: <strong style='color:#ffffff;'>{expression/expr27}</strong></div><div style='color:#6f8bb0;font-size:7.5pt;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;padding-bottom:2px;margin:8px 0 4px 0;'>STAFF &amp; CONTACTS</div><div style='color:#c9d6e4;font-size:8.5pt;'>Area planner: <strong style='color:#ffffff;'>{expression/expr50}</strong><div style='display:{expression/expr53};margin-top:2px;'>Case planner: <strong style='color:#ffffff;'>{expression/expr52}</strong></div><details style='margin-top:6px;'><summary style='cursor:pointer;color:#8fa3ba;font-size:8pt;letter-spacing:.03em;'>Inspector assignments (Building Safety)</summary><table style='width:100%;border-collapse:collapse;margin-top:4px;'><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Building</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr57}</td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Electrical</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr58}</td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Housing</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr59}</td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Mechanical</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr60}</td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Plumbing</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr61}</td></tr></table><div style='margin-top:4px;font-size:7.5pt;color:#ffe3ad;background-color:#4d3305;border-radius:4px;padding:4px 6px;'>Assignment dates for these areas range from roughly two years old to a few weeks old &mdash; confirm before relying on this for anything more than a starting point.</div></details></div><div style='margin-top:8px;border-top:1px solid #2c3a4d;padding-top:7px;'><a href='https://orion.lancaster.ne.gov/appraisal/publicaccess/PropertyDetail.aspx?PropertyNumber={PARCELID}' target='_blank' rel='noopener noreferrer' style='display:inline-block;background-color:#24354d;color:#cfe8ff;text-decoration:none;font-size:8pt;font-weight:bold;padding:4px 8px;border-radius:4px;margin:0 4px 4px 0;'>Assessor Record</a><a href='{expression/expr35}' target='_blank' rel='noopener noreferrer' style='display:{expression/expr36};background-color:#24354d;color:#cfe8ff;text-decoration:none;font-size:8pt;font-weight:bold;padding:4px 8px;border-radius:4px;margin:0 4px 4px 0;'>Google Maps</a><a href='{expression/expr49}' target='_blank' rel='noopener noreferrer' title='Nearest street-level panorama to the parcel (may be unavailable on new or rural streets - use Google Maps if black screen)' style='display:{expression/expr36};background-color:#24354d;color:#cfe8ff;text-decoration:none;font-size:8pt;font-weight:bold;padding:4px 8px;border-radius:4px;margin:0 4px 4px 0;'>Street View</a><a href='{expression/expr10}' target='_blank' rel='noopener noreferrer' style='display:inline-block;background-color:#24354d;color:#cfe8ff;text-decoration:none;font-size:8pt;font-weight:bold;padding:4px 8px;border-radius:4px;margin:0 4px 4px 0;'>Sectional Map</a></div></div>"}], "description": "<div style='font-family:\"Segoe UI\", Arial, sans-serif;background-color:#141a22;border:1px solid #2c3a4d;border-radius:8px;padding:10px;color:#e8eef5;font-size:9.5pt;line-height:1.4;'><div style='margin-bottom:2px;'><span style='color:#8fa3ba;font-size:8pt;'>PID</span> <strong style='color:#ffffff;font-size:9.5pt;'>{PARCELID}</strong></div><div style='color:#c9d6e4;font-size:8.5pt;margin-bottom:2px;'>{OWNERNME1}</div><div style='color:#8fa3ba;font-size:8pt;margin-bottom:4px;'>{expression/expr38}</div><div style='display:{expression/expr31};background-color:#5b1111;border:1px solid #b04444;border-radius:6px;padding:6px 8px;margin:6px 0;color:#ffd9d9;font-size:9pt;'><strong>&#9888; FEMA: {expression/expr16}</strong></div><div style='display:{expression/expr30};background-color:#4d3305;border:1px solid #90661a;border-radius:6px;padding:6px 8px;margin:6px 0;color:#ffe3ad;font-size:8.5pt;'><strong>&#9888; Overlay districts:</strong> {expression/expr29}</div><div style='color:#6f8bb0;font-size:7.5pt;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;padding-bottom:2px;margin:8px 0 4px 0;'>ZONING &amp; LAND USE</div><table style='width:100%;border-collapse:collapse;'><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Zoning</td><td style='padding:2px 0;vertical-align:top;'><a href='{expression/expr0}' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;'><strong>{expression/expr1}</strong></a></td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Floodplain</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr16}</td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Existing use</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr3}</td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Future use</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr17}</td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Growth tier</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr18}</td></tr><tr style='display:{expression/expr33};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Subdivision</td><td style='padding:2px 0;vertical-align:top;'><a href='https://app.lincoln.ne.gov/aspx/cnty/survey/default.aspx?cmd=Final%20Plats&amp;SubDiv={CNVYNAME}' target='_blank' rel='noopener noreferrer' title='Open final plats for this subdivision' style='color:#7cc4ff;text-decoration:none;font-size:9pt;'><strong>{CNVYNAME}</strong></a></td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Area</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr2} ac &#183; {expression/expr41} ft&#178; &#177;</td></tr></table><div style='display:{expression/expr32};'><div style='color:#6f8bb0;font-size:7.5pt;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;padding-bottom:2px;margin:8px 0 4px 0;'>DEVELOPMENT ACTIVITY</div><table style='width:100%;border-collapse:collapse;'><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Project</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr8}</td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Approved plan</td><td style='padding:2px 0;vertical-align:top;'><a href='https://app.lincoln.ne.gov/aspx/city/pats/default.aspx?AppNum={expression/expr5}' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;font-size:9pt;'><strong>{expression/expr5}</strong></a></td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Amendment</td><td style='padding:2px 0;vertical-align:top;'><a href='https://app.lincoln.ne.gov/aspx/city/pats/default.aspx?AppNum={expression/expr7}' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;font-size:9pt;'><strong>{expression/expr7}</strong></a></td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Parent app</td><td style='padding:2px 0;vertical-align:top;'><a href='https://app.lincoln.ne.gov/aspx/city/pats/default.aspx?AppNum={expression/expr6}' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;font-size:9pt;'><strong>{expression/expr6}</strong></a></td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Applications</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr4}</td></tr><tr><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Subdiv. permit</td><td style='padding:2px 0;vertical-align:top;'><a href='https://app.lincoln.ne.gov/aspx/docview.aspx?path=//CitySubs//&amp;project=plangis&amp;ext=pdf&amp;cmd=View&amp;filename={expression/expr15}' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;font-size:9pt;'><strong>{expression/expr15}</strong></a></td></tr><tr style='display:{expression/expr53};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Planner</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr52}</td></tr><tr style='display:{expression/expr39};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Annex. agmt.</td><td style='padding:2px 0;vertical-align:top;'><a href='https://www.lincoln.ne.gov/City/Departments/Planning-Department/Development-Review/Annexations/Annexation-Agreements' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;font-size:9pt;'><strong>Resolution {expression/expr14}</strong></a></td></tr></table></div><div style='color:#6f8bb0;font-size:7.5pt;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;padding-bottom:2px;margin:8px 0 4px 0;'>PROPERTY</div><div style='color:#c9d6e4;font-size:8pt;margin-bottom:4px;'>{PRPRTYDSCRP}</div><table style='width:100%;border-collapse:collapse;margin-bottom:4px;'><tr style='display:{expression/expr42};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Class</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{CLASSDSCRP}</td></tr><tr style='display:{expression/expr44};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Built</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr43}</td></tr><tr style='display:{expression/expr46};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Floor area</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr45} ft&#178;</td></tr><tr style='display:{expression/expr48};'><td style='color:#8fa3ba;font-size:8pt;padding:2px 6px 2px 0;vertical-align:top;white-space:nowrap;'>Assessed</td><td style='color:#ffffff;font-weight:bold;padding:2px 0;vertical-align:top;font-size:9pt;'>{expression/expr47}</td></tr></table><div style='display:{expression/expr34};margin:4px 0;'><a href='https://orion.lancaster.ne.gov/appraisal/publicaccess/PropertyDetail.aspx?PropertyNumber={PARCELID}' target='_blank' rel='noopener noreferrer' title='Open Assessor property record'><img src='{PHOTOPATH}' alt='Property photo' style='width:100%;border-radius:5px;border:1px solid #2c3a4d;' /></a></div><div style='color:#6f8bb0;font-size:7.5pt;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;padding-bottom:2px;margin:8px 0 4px 0;'>SERVICES</div><div style='color:#c9d6e4;font-size:8.5pt;'>School: <strong style='color:#ffffff;'>{expression/expr40}</strong><br />Fire: <strong style='color:#ffffff;'>{expression/expr26}</strong> &#183; Police: <strong style='color:#ffffff;'>{expression/expr27}</strong><br />Area planner: <strong style='color:#ffffff;'>{expression/expr50}</strong></div><div style='margin-top:8px;border-top:1px solid #2c3a4d;padding-top:7px;'><a href='https://orion.lancaster.ne.gov/appraisal/publicaccess/PropertyDetail.aspx?PropertyNumber={PARCELID}' target='_blank' rel='noopener noreferrer' style='display:inline-block;background-color:#24354d;color:#cfe8ff;text-decoration:none;font-size:8pt;font-weight:bold;padding:4px 8px;border-radius:4px;margin:0 4px 4px 0;'>Assessor Record</a><a href='{expression/expr35}' target='_blank' rel='noopener noreferrer' style='display:{expression/expr36};background-color:#24354d;color:#cfe8ff;text-decoration:none;font-size:8pt;font-weight:bold;padding:4px 8px;border-radius:4px;margin:0 4px 4px 0;'>Google Maps</a><a href='{expression/expr49}' target='_blank' rel='noopener noreferrer' title='Nearest street-level panorama to the parcel (may be unavailable on new or rural streets - use Google Maps if black screen)' style='display:{expression/expr36};background-color:#24354d;color:#cfe8ff;text-decoration:none;font-size:8pt;font-weight:bold;padding:4px 8px;border-radius:4px;margin:0 4px 4px 0;'>Street View</a><a href='{expression/expr10}' target='_blank' rel='noopener noreferrer' style='display:inline-block;background-color:#24354d;color:#cfe8ff;text-decoration:none;font-size:8pt;font-weight:bold;padding:4px 8px;border-radius:4px;margin:0 4px 4px 0;'>Sectional Map</a></div></div>", "expressionInfos": [{"name": "expr0", "title": "zoningLink", "expression": "var zoningLyr = FeatureSetByName($map, \"Zoning\")\r\nvar parFeature = (Buffer($feature, -10, 'feet'))\r\nvar intersectLayer = Intersects(zoningLyr, parFeature)\r\nvar zoningLink = \"\"\r\nvar intLayCnt = Count(intersectLayer)\r\nfor (var f in intersectLayer){\r\n if (f.JURISDICTION == \"Lincoln\"){\r\n zoningLink = Decode(f.ZONE,\r\n 'AG','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11521',\r\n 'AGR','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11531',\r\n 'B-1','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11678',\r\n 'B-2','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11689',\r\n 'B-3','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11703',\r\n 'B-4','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11714',\r\n 'B-5','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11725',\r\n 'H-1','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11738',\r\n 'H-2','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11749',\r\n 'H-3','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11760',\r\n 'H-4','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11771',\r\n 'I-1','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11783',\r\n 'I-2','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11794',\r\n 'I-3','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11806',\r\n 'O-1','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11630',\r\n 'O-2','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-12525',\r\n 'O-3','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11652',\r\n 'P','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11922',\r\n 'R-1','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11541',\r\n 'R-2','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11552',\r\n 'R-3','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11563',\r\n 'R-4','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11574',\r\n 'R-5','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11585',\r\n 'R-6','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11596',\r\n 'R-7','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11607',\r\n 'R-8','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11618',\r\n 'R-T','https://online.encodeplus.com/regs/lincoln-ne/doc-viewer.aspx#secid-11665',\r\n 'Other')\r\n }\r\n else if (f.JURISDICTION == \"County\"){\r\n zoningLink = Decode(f.ZONE,\r\n 'AG','http://online.encodeplus.com/regs/lincoln-ne-lcz/doc-viewer.aspx#secid-156',\r\n 'AGR','http://online.encodeplus.com/regs/lincoln-ne-lcz/doc-viewer.aspx#secid-165',\r\n 'B','http://online.encodeplus.com/regs/lincoln-ne-lcz/doc-viewer.aspx#secid-183',\r\n 'I','http://online.encodeplus.com/regs/lincoln-ne-lcz/doc-viewer.aspx#secid-192',\r\n 'R','http://online.encodeplus.com/regs/lincoln-ne-lcz/doc-viewer.aspx#secid-174',\r\n 'Other')\r\n }\r\n else if (f.JURISDICTION == \"Hickman\"){\r\n zoningLink = 'https://lancaster.ne.gov/hickman/default.aspx'\r\n }\r\n else if (f.JURISDICTION == \"Bennett\"){\r\n zoningLink = 'https://lancaster.ne.gov/bennett/default.aspx'\r\n }\r\n else if (f.JURISDICTION == \"Ceresco\"){\r\n zoningLink = 'https://www.cerescone.com/'\r\n }\r\n else if (f.JURISDICTION == \"Cortland\"){\r\n zoningLink = 'https://lancaster.ne.gov/cortland/default.aspx'\r\n }\r\n else if (f.JURISDICTION == \"Crete\"){\r\n zoningLink = 'https://www.crete.ne.gov/'\r\n }\r\n else if (f.JURISDICTION == \"Davey\"){\r\n zoningLink = 'https://lancaster.ne.gov/davey/default.aspx'\r\n }\r\n else if (f.JURISDICTION == \"Denton\"){\r\n zoningLink = 'https://lancaster.ne.gov/denton/default.aspx'\r\n }\r\n else if (f.JURISDICTION == \"Firth\"){\r\n zoningLink = 'https://lancaster.ne.gov/firth/default.aspx'\r\n }\r\n else if (f.JURISDICTION == \"Hallam\"){\r\n zoningLink = 'https://lancaster.ne.gov/hallam/default.aspx'\r\n }\r\n else if (f.JURISDICTION == \"Malcolm\"){\r\n zoningLink = 'https://lancaster.ne.gov/malcolm/default.aspx'\r\n }\r\n else if (f.JURISDICTION == \"Hickman\"){\r\n zoningLink = 'https://lancaster.ne.gov/hickman/default.aspx'\r\n }\r\n else if (f.JURISDICTION == \"Panama\"){\r\n zoningLink = 'https://lancaster.ne.gov/panama/default.aspx'\r\n }\r\n else if (f.JURISDICTION == \"Raymond\"){\r\n zoningLink = 'https://lancaster.ne.gov/raymond/default.aspx'\r\n }\r\n else if (f.JURISDICTION == \"Roca\"){\r\n zoningLink = 'https://lancaster.ne.gov/roca/default.aspx'\r\n }\r\n else if (f.JURISDICTION == \"Sprague\"){\r\n zoningLink = 'https://lancaster.ne.gov/sprague/default.aspx'\r\n }\r\n else if (f.JURISDICTION == \"Pleasant Dale\"){\r\n zoningLink = 'https://pdale-ne.us/'\r\n }\r\n else if (f.JURISDICTION == \"Waverly\"){\r\n zoningLink = 'https://citywaverly.com'\r\n }\r\n}\r\nreturn zoningLink;", "returnType": "string"}, {"name": "expr1", "title": "zoning", "expression": "// Improved: collects ALL distinct zoning districts (original kept only the last one)\nvar zoningLyr = FeatureSetByName($map, \"Zoning\")\nvar parFeature = Buffer($feature, -10, 'feet')\nvar zones = []\nfor (var f in Intersects(zoningLyr, parFeature)) {\n    Push(zones, f.ZONE)\n}\nif (Count(zones) == 0) { return \"Unknown\" }\nreturn Concatenate(Sort(Distinct(zones)), ', ')", "returnType": "string"}, {"name": "expr2", "title": "parAcres", "expression": "// Write a script to return a value to show in the pop-up. \r\n// For example, get the average of 4 fields:\r\n// Average($feature.SalesQ1, $feature.SalesQ2, $feature.SalesQ3, $feature.SalesQ4)\r\nvar sqft = $feature[\"GIS_AREA\"]\r\nvar acres1 = (sqft/43560)\r\nvar acres2 = Round(acres1,2)\r\nreturn acres2", "returnType": "number"}, {"name": "expr3", "title": "elu", "expression": "var attributeLyr = FeatureSetByName($map, \"Existing Land Use (Planning)\")\r\nvar parFeature = (Buffer($feature, -10, 'feet'))\r\nvar intersectLayer = Intersects(attributeLyr, parFeature)\r\nvar attribute = []\r\nvar intLyrCt = Count(intersectLayer)\r\n//Console(\"count=\" + intLyrCt)\r\nif (intLyrCt > 0){\r\n for (var f in intersectLayer){\r\n Push(attribute, Decode(f.LUCODE,\r\n 11, \"Single Family Detached\",\r\n 12, \"Duplex\",\r\n 13, \"Single Family Attached\",\r\n 14, \"Apartments\", \r\n 15, \"Group Quarters\",\r\n 16, \"Special Housing\",\r\n 17, \"Mobile Homes, Parks and Courts\",\r\n 21, \"Commercial - NEC\",\r\n 22, \"Commercial w/Residential Units Above\",\r\n 23, \"Parking Lot\",\r\n 24, \"Parking Garage\",\r\n 31, \"Light Industrial\",\r\n 32, \"Heavy Industrial\",\r\n 33, \"Utility Facility\",\r\n 34, \"Railroad\",\r\n 35, \"Airports\",\r\n 41, \"Public & Semi-Public NEC\",\r\n 42, \"Educational Institutions\",\r\n 43, \"Churches, Synagogues and Temples\",\r\n 44, \"Hospitals\",\r\n 51, \"Park Land\",\r\n 52, \"Open Space\",\r\n 53, \"Golf Courses\",\r\n 61, \"Lakes\",\r\n 62, \"Streams and Creeks\",\r\n 63, \"Wetlands\",\r\n 64, \"Environmental Preserve\",\r\n 65, \"Forest/Woodlands\",\r\n 71, \"Public Right of Way\",\r\n 72, \"Vacated ROW\",\r\n 81, \"Agricultural Production:Crops/Tree Farms\",\r\n 82, \"Agricultural Production: Livestock & Animal/Feed Lots\",\r\n 83, \"Mining and Extraction\",\r\n 84, \"Pasture/Grassland\",\r\n 90, \"Vacant\", \"Other\")\r\n )}\r\n }\r\n else{\r\n attribute = \"No Existing Landuse Values Determined\"\r\n }\r\nreturn Concatenate(Sort(Distinct(attribute)), ', ');", "returnType": "string"}, {"name": "expr4", "title": "applications", "expression": "// Improved: returns \"None\" instead of \"No Applications returned\"\nvar attributeLyr = FeatureSetByName($map, \"Applications\")\nvar parFeature = Buffer($feature, -10, 'feet')\nvar intersectLayer = Intersects(attributeLyr, parFeature)\nvar attribute = []\nif (Count(intersectLayer) > 0) {\n    for (var f in intersectLayer) {\n        Push(attribute, f.APPNUM)\n    }\n} else {\n    Push(attribute, \"None\")\n}\nreturn Concatenate(Sort(Distinct(attribute)), ', ')", "returnType": "string"}, {"name": "expr5", "title": "fap", "expression": "var attributeLyr = FeatureSetByName($map, \"Final Approved Plans\")\r\nvar parFeature = (Buffer($feature, -10, 'feet'))\r\nvar intersectLayer = Intersects(attributeLyr, parFeature)\r\nvar attribute = []\r\nvar intLyrCt = Count(intersectLayer)\r\n//Console(\"count=\" + intLyrCt)\r\nif (intLyrCt > 0){\r\n for (var f in intersectLayer){\r\n Push(attribute, f.APPNUM)\r\n }\r\n }\r\nelse{\r\n Push(attribute, \"\")\r\n }\r\nreturn Concatenate(Sort(Distinct(attribute)), ', ');", "returnType": "string"}, {"name": "expr6", "title": "parentApp", "expression": "var attributeLyr = FeatureSetByName($map, \"Final Approved Plans\")\r\nvar parFeature = (Buffer($feature, -10, 'feet'))\r\nvar intersectLayer = Intersects(attributeLyr, parFeature)\r\nvar attribute = []\r\nvar intLyrCt = Count(intersectLayer)\r\n//Console(\"count=\" + intLyrCt)\r\nif (intLyrCt > 0){\r\n for (var f in intersectLayer){\r\n Push(attribute, f.ParentApp)\r\n }\r\n }\r\nelse{\r\n Push(attribute, \"\")\r\n }\r\nreturn Concatenate(Sort(Distinct(attribute)), ', ');", "returnType": "string"}, {"name": "expr7", "title": "AmmendApp", "expression": "var attributeLyr = FeatureSetByName($map, \"Final Approved Plans\")\r\nvar parFeature = (Buffer($feature, -10, 'feet'))\r\nvar intersectLayer = Intersects(attributeLyr, parFeature)\r\nvar attribute = []\r\nvar intLyrCt = Count(intersectLayer)\r\n//Console(\"count=\" + intLyrCt)\r\nif (intLyrCt > 0){\r\n for (var f in intersectLayer){\r\n Push(attribute, f.ApproveApp)\r\n }\r\n }\r\nelse{\r\n Push(attribute, \"\")\r\n }\r\nreturn Concatenate(Sort(Distinct(attribute)), ', ');", "returnType": "string"}, {"name": "expr8", "title": "fapName", "expression": "var attributeLyr = FeatureSetByName($map, \"Final Approved Plans\")\r\nvar parFeature = (Buffer($feature, -10, 'feet'))\r\nvar intersectLayer = Intersects(attributeLyr, parFeature)\r\nvar attribute = []\r\nvar intLyrCt = Count(intersectLayer)\r\n//Console(\"count=\" + intLyrCt)\r\nif (intLyrCt > 0){\r\n for (var f in intersectLayer){\r\n Push(attribute, f.Title)\r\n }\r\n }\r\nelse{\r\n Push(attribute, \"\")\r\n }\r\nreturn Concatenate(Sort(Distinct(attribute)), ', ');", "returnType": "string"}, {"name": "expr10", "title": "str", "expression": "var attributeLyr = FeatureSetByName($map, \"PLSS - Sections\")\r\nvar parFeature = (Buffer($feature, -10, 'feet'))\r\nvar intersectLayer = Intersects(attributeLyr, parFeature)\r\nvar attribute = \"\"\r\nvar intLyrCt = Count(intersectLayer)\r\n//Console(\"count=\" + intLyrCt)\r\nif (intLyrCt > 0){\r\n for (var f in intersectLayer){\r\n attribute = \"https://app.lincoln.ne.gov/aspx/docview.aspx?path=&#92;sectionals&#92;&project=plangis&ext=pdf&cmd=View&filename=l\" + Replace(f.FRSTDIVID, \"-\", \"\")\r\n }\r\n }\r\nelse{\r\n Push(attribute, \"\")\r\n }\r\n//return Concatenate(Sort(Distinct(attribute)), ', ');\r\nreturn attribute", "returnType": "string"}, {"name": "expr14", "title": "annexAgr", "expression": "var attributeLyr = FeatureSetByName($map, \"Annexation Agreements\")\r\nvar parFeature = (Buffer($feature, -10, 'feet'))\r\nvar intersectLayer = Intersects(attributeLyr, parFeature)\r\nvar attribute = []\r\nvar intLyrCt = Count(intersectLayer)\r\n//Console(\"count=\" + intLyrCt)\r\nif (intLyrCt > 0){\r\n for (var f in intersectLayer){\r\n Push(attribute, f.RESNO) //or AXNUM\r\n }\r\n }\r\nelse{\r\n Push(attribute, \"\")\r\n }\r\nreturn Concatenate(Sort(Distinct(attribute)), ', ');", "returnType": "string"}, {"name": "expr15", "title": "citySubdv", "expression": "var attributeLyr = FeatureSetByName($map, \"City Subdivision Permits\")\r\nvar parFeature = (Buffer($feature, -10, 'feet'))\r\nvar intersectLayer = Intersects(attributeLyr, parFeature)\r\nvar attribute = []\r\nvar intLyrCt = Count(intersectLayer)\r\n//Console(\"count=\" + intLyrCt)\r\nif (intLyrCt > 0){\r\n for (var f in intersectLayer){\r\n Push(attribute, f.PermitNo) \r\n }\r\n }\r\nelse{\r\n Push(attribute, \"\")\r\n }\r\nreturn Concatenate(Sort(Distinct(attribute)), ', ');", "returnType": "string"}, {"name": "expr16", "title": "flood", "expression": "// Improved: clearer labels; explicit \"None mapped\" instead of blank/\"N/A\"\nvar attributeLyr = FeatureSetByName($map, \"FEMA Floodplain\")\nvar parFeature = Buffer($feature, -10, 'feet')\nvar intersectLayer = Intersects(attributeLyr, parFeature)\nvar parts = []\nfor (var f in intersectLayer) {\n    if (f.FLD_ZONE == 'AE') {\n        Push(parts, '100-Year Floodplain (Zone AE)')\n        if (f.FLOODWAY == 'FLOODWAY') {\n            Push(parts, 'FLOODWAY')\n        }\n    }\n}\nif (Count(parts) == 0) { return 'None mapped' }\nreturn Concatenate(Sort(Distinct(parts)), ' + ')", "returnType": "string"}, {"name": "expr17", "title": "flu", "expression": "var attributeLyr = FeatureSetByName($map, \"Future Land Use (2050 Comp Plan)\")\r\nvar parFeature = (Buffer($feature, -10, 'feet'))\r\nvar intersectLayer = Intersects(attributeLyr, parFeature)\r\nvar attribute = []\r\nvar intLyrCt = Count(intersectLayer)\r\n//Console(\"count=\" + intLyrCt)\r\nif (intLyrCt > 0){\r\n for (var f in intersectLayer){\r\n Push(attribute, f.CAT) //or \r\n }\r\n }\r\nelse{\r\n Push(attribute, \"\")\r\n }\r\nreturn Concatenate(Sort(Distinct(attribute)), ', ');", "returnType": "string"}, {"name": "expr18", "title": "gt2050", "expression": "// Improved: em-dash instead of blank when parcel is outside all growth tiers\nvar attributeLyr = FeatureSetByName($map, \"Growth Tiers (2050 Comp Plan)\")\nvar parFeature = Buffer($feature, -10, 'feet')\nvar intersectLayer = Intersects(attributeLyr, parFeature)\nvar attribute = []\nfor (var f in intersectLayer) {\n    Push(attribute, f.Tier)\n}\nif (Count(attribute) == 0) { return '\u2014' }\nreturn Concatenate(Sort(Distinct(attribute)), ', ')", "returnType": "string"}, {"name": "expr26", "title": "Fire", "expression": "var attributeLyr = FeatureSetByName($map, \"Fire Districts\")\nif (attributeLyr == null) { return '\u2014' }\nvar parFeature = Buffer($feature, -10, 'feet')\nif (parFeature == null) { parFeature = $feature }\nvar intersectLayer = Intersects(attributeLyr, parFeature)\nvar attribute = []\nvar intLyrCt = Count(intersectLayer)\nif (intLyrCt > 0){\n for (var f in intersectLayer){\n Push(attribute, f.Dist_Name)\n }\n }\nelse{\n Push(attribute, \"N/A\")\n }\nreturn Concatenate(Sort(Distinct(attribute)), ', ');", "returnType": "string"}, {"name": "expr27", "title": "LPDLSO", "expression": "// Write a script to return a value to show in the pop-up. \n// For example, get the average of 4 fields:\n// Average($feature.SalesQ1, $feature.SalesQ2, $feature.SalesQ3, $feature.SalesQ4)\nvar attributeLyr1 = FeatureSetById($map, \"18df1907f67-layer-10\")\nvar attributeLyr2 = FeatureSetById($map, \"18df190b139-layer-11\")\nvar attributeLyr3 = FeatureSetById($map, \"18df18f78c7-layer-7\")\n//Console(\"one\")\nvar parFeature = (Buffer($feature, -10, 'feet'))\nvar intersectLayer1 = Intersects(attributeLyr1, parFeature)\nvar intersectLayer2 = Intersects(attributeLyr2, parFeature)\nvar intersectLayer3 = Intersects(attributeLyr3, parFeature)\n//Console(\"two\")\nvar intLyrCt1 = Count(intersectLayer1)\n//Console(Text(intLyrCt1))\nvar intLyrCt2 = Count(intersectLayer2)\n//Console(Text(intLyrCt2))\nvar intLyrCt3 = Count(intersectLayer3)\n//Console(Text(intLyrCt3))\nvar attribute = []\n//Console(\"three\")\nWhen(\n intLyrCt1 == 1, Push(attribute, \"Lincoln Police Department\"),\n intLyrCt2 == 1, Push(attribute, \"Lancaster Co. Sheriff\"),\n intLyrCt3 == 1, Push(attribute, \"Lancaster Co. Sheriff\"),\n Push(attribute, \"Lancaster Co. Sheriff\")\n )\nreturn Concatenate(Sort(Distinct(attribute)), ', ');", "returnType": "string"}, {"name": "expr29", "title": "ovlText", "expression": "// NEW: one combined line of overlay/constraint findings (empty string when none)\nvar pf = Buffer($feature, -10, 'feet')\nvar parts = []\nfor (var f in Intersects(FeatureSetByName($map, \"Historic Preservation Districts\"), pf)) {\n    Push(parts, \"Historic District: \" + f.NAME)\n}\nfor (var f in Intersects(FeatureSetByName($map, \"Historic Preservation Sites\"), pf)) {\n    Push(parts, \"Historic Site: \" + f.Name)\n}\nfor (var f in Intersects(FeatureSetByName($map, \"Building Design Standard Boundaries\"), pf)) {\n    Push(parts, \"Design Review: \" + f.ReviewType)\n}\nfor (var f in Intersects(FeatureSetByName($map, \"Airport Authority Boundary - Avigation Zone\"), pf)) {\n    Push(parts, \"Airport Zoning: \" + f.DESCRIP)\n}\nfor (var f in Intersects(FeatureSetByName($map, \"Capitol Environs District Height Restrictions\"), pf)) {\n    Push(parts, \"Capitol Environs: \" + Decode(f.POLY_CODE, 1, \"57 ft height limit\", 2, \"45 ft height limit\", \"height restriction\"))\n}\nfor (var f in Intersects(FeatureSetByName($map, \"Capitol View Overlay Districts\"), pf)) {\n    Push(parts, \"Capitol View Overlay: \" + f.DISTRICT)\n}\nif (Count(Intersects(FeatureSetByName($map, \"Capitol View Corridors\"), pf)) > 0) {\n    Push(parts, \"Capitol View Corridor\")\n}\nreturn Concatenate(Distinct(parts), '   |   ')", "returnType": "string"}, {"name": "expr30", "title": "ovlShow", "expression": "// NEW: 'block' when any overlay constraint applies, else 'none' (drives flag visibility)\nvar pf = Buffer($feature, -10, 'feet')\nif (Count(Intersects(FeatureSetByName($map, \"Historic Preservation Districts\"), pf)) > 0) { return 'block' }\nif (Count(Intersects(FeatureSetByName($map, \"Historic Preservation Sites\"), pf)) > 0) { return 'block' }\nif (Count(Intersects(FeatureSetByName($map, \"Building Design Standard Boundaries\"), pf)) > 0) { return 'block' }\nif (Count(Intersects(FeatureSetByName($map, \"Airport Authority Boundary - Avigation Zone\"), pf)) > 0) { return 'block' }\nif (Count(Intersects(FeatureSetByName($map, \"Capitol Environs District Height Restrictions\"), pf)) > 0) { return 'block' }\nif (Count(Intersects(FeatureSetByName($map, \"Capitol View Overlay Districts\"), pf)) > 0) { return 'block' }\nif (Count(Intersects(FeatureSetByName($map, \"Capitol View Corridors\"), pf)) > 0) { return 'block' }\nreturn 'none'", "returnType": "string"}, {"name": "expr31", "title": "floodShow", "expression": "// NEW: 'block' when parcel touches Zone AE floodplain, else 'none' (drives flood flag)\nvar pf = Buffer($feature, -10, 'feet')\nfor (var f in Intersects(FeatureSetByName($map, \"FEMA Floodplain\"), pf)) {\n    if (f.FLD_ZONE == 'AE') { return 'block' }\n}\nreturn 'none'", "returnType": "string"}, {"name": "expr32", "title": "devShow", "expression": "// NEW: 'block' when any development-review record touches the parcel, else 'none'\nvar pf = Buffer($feature, -10, 'feet')\nif (Count(Intersects(FeatureSetByName($map, \"Final Approved Plans\"), pf)) > 0) { return 'block' }\nif (Count(Intersects(FeatureSetByName($map, \"Applications\"), pf)) > 0) { return 'block' }\nif (Count(Intersects(FeatureSetByName($map, \"City Subdivision Permits\"), pf)) > 0) { return 'block' }\nif (Count(Intersects(FeatureSetByName($map, \"Annexation Agreements\"), pf)) > 0) { return 'block' }\nreturn 'none'", "returnType": "string"}, {"name": "expr33", "title": "subdivShow", "expression": "// NEW (no query): hide Subdivision row when parcel has no subdivision name\nreturn IIf(IsEmpty($feature.CNVYNAME), 'none', 'table-row')", "returnType": "string"}, {"name": "expr34", "title": "photoShow", "expression": "// NEW (no query): hide photo block when no real photo (empty or county no-photo placeholder)\nvar p = $feature.PHOTOPATH\nreturn IIf(IsEmpty(p) || Find('NoPropPhoto', p) > -1, 'none', 'block')", "returnType": "string"}, {"name": "expr35", "title": "gmap", "expression": "// NEW (no query): Google Maps search URL from the site address\nvar addr = DefaultValue($feature.SITEADDRESS, '')\nreturn 'https://www.google.com/maps/search/?api=1&query=' + UrlEncode(addr + ', Lancaster County, NE')", "returnType": "string"}, {"name": "expr36", "title": "gmapShow", "expression": "// NEW (no query): hide Google Maps action when parcel has no site address\nreturn IIf(IsEmpty($feature.SITEADDRESS), 'none', 'inline-block')", "returnType": "string"}, {"name": "expr37", "title": "title", "expression": "// NEW (no query): popup title = site address, falling back to parcel PID\nvar addr = $feature.SITEADDRESS\nreturn IIf(IsEmpty(addr), 'Parcel ' + $feature.PARCELID, addr)", "returnType": "string"}, {"name": "expr38", "title": "jurisAnnex", "expression": "// NEW: jurisdiction line with annexation year folded in (replaces expr28 + expr11 rows)\nvar pf = Buffer($feature, -10, 'feet')\nvar cityLimits = FeatureSetById($map, \"18df1907f67-layer-10\")\nvar threeMile = FeatureSetById($map, \"18df190b139-layer-11\")\nif (Count(Intersects(cityLimits, pf)) > 0) {\n    var yrs = []\n    for (var f in Intersects(FeatureSetByName($map, \"Annexations\"), pf)) {\n        Push(yrs, f.ANNEXYR)\n    }\n    var y = Concatenate(Sort(Distinct(yrs)), ', ')\n    return IIf(IsEmpty(y) || y == '', 'Lincoln City Limits', 'Lincoln City Limits (annexed ' + y + ')')\n}\nif (Count(Intersects(threeMile, pf)) > 0) {\n    return 'Lincoln 3-Mile ETJ'\n}\nreturn 'Lancaster County / Village'", "returnType": "string"}, {"name": "expr39", "title": "annexAgrShow", "expression": "// NEW: show annexation-agreement row only when an agreement touches the parcel\nvar pf = Buffer($feature, -10, 'feet')\nreturn IIf(Count(Intersects(FeatureSetByName($map, \"Annexation Agreements\"), pf)) > 0, 'table-row', 'none')", "returnType": "string"}, {"name": "expr40", "title": "school", "expression": "// NEW (no query): school district with em-dash fallback\nreturn DefaultValue($feature.SCHLDSCRP, '\u2014')", "returnType": "string"}, {"name": "expr41", "title": "sqft", "expression": "// NEW (no query): thousands-separated square footage (consistent across renderers)\nreturn Text(Round($feature.GIS_AREA, 0), '#,###')", "returnType": "string"}, {"name": "expr42", "title": "classShow", "expression": "// NEW v3 (no query): hide Class row when property class is empty\nreturn IIf(IsEmpty($feature.CLASSDSCRP), 'none', 'table-row')", "returnType": "string"}, {"name": "expr43", "title": "builtText", "expression": "// NEW v3 (no query): year built plus structure type, e.g. '2004 \u00b7 1 Story'\nvar s = Text($feature.RESYRBLT, '####')\nif (!IsEmpty($feature.RESSTRTYP)) { s = s + ' \u00b7 ' + $feature.RESSTRTYP }\nreturn s", "returnType": "string"}, {"name": "expr44", "title": "builtShow", "expression": "// NEW v3 (no query): hide Built row when no residential year built\nreturn IIf($feature.RESYRBLT > 0, 'table-row', 'none')", "returnType": "string"}, {"name": "expr45", "title": "flrareaText", "expression": "// NEW v3 (no query): thousands-separated residential floor area\nreturn Text(Round($feature.RESFLRAREA, 0), '#,###')", "returnType": "string"}, {"name": "expr46", "title": "flrareaShow", "expression": "// NEW v3 (no query): hide Floor area row when zero/empty\nreturn IIf($feature.RESFLRAREA > 0, 'table-row', 'none')", "returnType": "string"}, {"name": "expr47", "title": "assessedText", "expression": "// NEW v3 (no query): current assessed value as dollars\nreturn Text(Round($feature.CNTASSDVAL, 0), '$#,###')", "returnType": "string"}, {"name": "expr48", "title": "assessedShow", "expression": "// NEW v3 (no query): hide Assessed row when zero/empty\nreturn IIf($feature.CNTASSDVAL > 0, 'table-row', 'none')", "returnType": "string"}, {"name": "expr49", "title": "svLink", "returnType": "string", "expression": "// NEW v4 (no query): Google Street View at parcel centroid (documented Maps URLs API)\nvar g = Centroid(Geometry($feature))\nif (IsEmpty(g)) { return '' }\nvar lon = g.x * 180.0 / 20037508.342787\nvar lat = (Atan(Exp(g.y / 6378137.0)) * 2 - PI / 2) * 180.0 / PI\nreturn 'https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=' + Text(lat, '#.000000') + ',' + Text(lon, '#.000000')"}, {"name": "expr50", "title": "areaPlanner", "returnType": "string", "expression": "// NEW v5: geographic duty planner from Development Review Areas (runtime-added layer)\nvar fs = FeatureSetByName($map, \"Development Review Areas\")\nif (fs == null) { return '\u2014' }\nvar pf = Buffer($feature, -10, 'feet')\nvar parts = []\nfor (var f in Intersects(fs, pf)) {\n    var n = IIf(f.Region == 'Village', 'Village of ' + f.Planner, f.Planner)\n    if (!IsEmpty(f.Phone)) { n = n + ' \u00b7 ' + f.Phone }\n    Push(parts, n)\n}\nif (Count(parts) == 0) { return '\u2014' }\nreturn Concatenate(Distinct(parts), ', ')"}, {"name": "expr52", "title": "casePlanner", "returnType": "string", "expression": "// NEW v5: case planner(s) of applications touching this parcel (PATS PLANNER_ASSIGNED)\nvar pf = Buffer($feature, -10, 'feet')\nvar parts = []\nfor (var f in Intersects(FeatureSetByName($map, \"Applications View\"), pf)) {\n    if (!IsEmpty(f.PLANNER_ASSIGNED)) { Push(parts, f.PLANNER_ASSIGNED) }\n}\nreturn Concatenate(Sort(Distinct(parts)), ', ')"}, {"name": "expr53", "title": "casePlannerShow", "returnType": "string", "expression": "// NEW v5: show the case-planner row only when an application with a planner touches the parcel\nvar pf = Buffer($feature, -10, 'feet')\nfor (var f in Intersects(FeatureSetByName($map, \"Applications View\"), pf)) {\n    if (!IsEmpty(f.PLANNER_ASSIGNED)) { return 'table-row' }\n}\nreturn 'none'"}, {"name": "expr54", "title": "finalApprovedPlansShow", "returnType": "string", "expression": "// NEW v6: show Project / Approved plan / Amendment / Parent app rows only when\n// a Final Approved Plans record touches the parcel -- all four read fields off\n// the same intersecting record(s) (see expr8/expr5/expr7/expr6), so one shared gate.\nvar pf = Buffer($feature, -10, 'feet')\nif (pf == null) { pf = $feature }\nreturn IIf(Count(Intersects(FeatureSetByName($map, \"Final Approved Plans\"), pf)) > 0, 'table-row', 'none')"}, {"name": "expr55", "title": "citySubdivShow", "returnType": "string", "expression": "// NEW v6: show Subdiv. permit row only when a City Subdivision Permits record touches the parcel\nvar pf = Buffer($feature, -10, 'feet')\nif (pf == null) { pf = $feature }\nreturn IIf(Count(Intersects(FeatureSetByName($map, \"City Subdivision Permits\"), pf)) > 0, 'table-row', 'none')"}, {"name": "expr56", "title": "devActivityEmptyShow", "returnType": "string", "expression": "// NEW v6: inverse of expr32 -- 'block' (show the empty-state line) only when NONE of the\n// four development-review record types touch the parcel\nvar pf = Buffer($feature, -10, 'feet')\nif (Count(Intersects(FeatureSetByName($map, \"Final Approved Plans\"), pf)) > 0) { return 'none' }\nif (Count(Intersects(FeatureSetByName($map, \"Applications\"), pf)) > 0) { return 'none' }\nif (Count(Intersects(FeatureSetByName($map, \"City Subdivision Permits\"), pf)) > 0) { return 'none' }\nif (Count(Intersects(FeatureSetByName($map, \"Annexation Agreements\"), pf)) > 0) { return 'none' }\nreturn 'block'"}, {"name": "expr57", "title": "inspectorBuilding", "returnType": "string", "expression": "// NEW v6: inspector(s)/phone assigned to this discipline's area, from BuildingSafety/InspectorAreas\nvar fs = FeatureSetByName($map, \"Inspector Areas - Building\")\nif (fs == null) { return '\u2014' }\nvar pf = Buffer($feature, -10, 'feet')\nif (pf == null) { pf = $feature }\nvar parts = []\nfor (var f in Intersects(fs, pf)) {\n    if (!IsEmpty(f.InspectorName)) {\n        var n = f.InspectorName\n        if (!IsEmpty(f.PhoneNumber)) { n = n + ' \u00b7 ' + f.PhoneNumber }\n        Push(parts, n)\n    }\n}\nif (Count(parts) == 0) { return '\u2014' }\nreturn Concatenate(Distinct(parts), ', ')"}, {"name": "expr58", "title": "inspectorElectrical", "returnType": "string", "expression": "// NEW v6: inspector(s)/phone assigned to this discipline's area, from BuildingSafety/InspectorAreas\nvar fs = FeatureSetByName($map, \"Inspector Areas - Electrical\")\nif (fs == null) { return '\u2014' }\nvar pf = Buffer($feature, -10, 'feet')\nif (pf == null) { pf = $feature }\nvar parts = []\nfor (var f in Intersects(fs, pf)) {\n    if (!IsEmpty(f.InspectorName)) {\n        var n = f.InspectorName\n        if (!IsEmpty(f.PhoneNumber)) { n = n + ' \u00b7 ' + f.PhoneNumber }\n        Push(parts, n)\n    }\n}\nif (Count(parts) == 0) { return '\u2014' }\nreturn Concatenate(Distinct(parts), ', ')"}, {"name": "expr59", "title": "inspectorHousing", "returnType": "string", "expression": "// NEW v6: inspector(s)/phone assigned to this discipline's area, from BuildingSafety/InspectorAreas\nvar fs = FeatureSetByName($map, \"Inspector Areas - Housing\")\nif (fs == null) { return '\u2014' }\nvar pf = Buffer($feature, -10, 'feet')\nif (pf == null) { pf = $feature }\nvar parts = []\nfor (var f in Intersects(fs, pf)) {\n    if (!IsEmpty(f.InspectorName)) {\n        var n = f.InspectorName\n        if (!IsEmpty(f.PhoneNumber)) { n = n + ' \u00b7 ' + f.PhoneNumber }\n        Push(parts, n)\n    }\n}\nif (Count(parts) == 0) { return '\u2014' }\nreturn Concatenate(Distinct(parts), ', ')"}, {"name": "expr60", "title": "inspectorMechanical", "returnType": "string", "expression": "// NEW v6: inspector(s)/phone assigned to this discipline's area, from BuildingSafety/InspectorAreas\nvar fs = FeatureSetByName($map, \"Inspector Areas - Mechanical\")\nif (fs == null) { return '\u2014' }\nvar pf = Buffer($feature, -10, 'feet')\nif (pf == null) { pf = $feature }\nvar parts = []\nfor (var f in Intersects(fs, pf)) {\n    if (!IsEmpty(f.InspectorName)) {\n        var n = f.InspectorName\n        if (!IsEmpty(f.PhoneNumber)) { n = n + ' \u00b7 ' + f.PhoneNumber }\n        Push(parts, n)\n    }\n}\nif (Count(parts) == 0) { return '\u2014' }\nreturn Concatenate(Distinct(parts), ', ')"}, {"name": "expr61", "title": "inspectorPlumbing", "returnType": "string", "expression": "// NEW v6: inspector(s)/phone assigned to this discipline's area, from BuildingSafety/InspectorAreas\nvar fs = FeatureSetByName($map, \"Inspector Areas - Plumbing\")\nif (fs == null) { return '\u2014' }\nvar pf = Buffer($feature, -10, 'feet')\nif (pf == null) { pf = $feature }\nvar parts = []\nfor (var f in Intersects(fs, pf)) {\n    if (!IsEmpty(f.InspectorName)) {\n        var n = f.InspectorName\n        if (!IsEmpty(f.PhoneNumber)) { n = n + ' \u00b7 ' + f.PhoneNumber }\n        Push(parts, n)\n    }\n}\nif (Count(parts) == 0) { return '\u2014' }\nreturn Concatenate(Distinct(parts), ', ')"}], "fieldInfos": [{"fieldName": "OBJECTID", "isEditable": true, "label": "OBJECTID", "visible": false}, {"fieldName": "ASSDPCNTCG", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Assessed Value % Change", "visible": true}, {"fieldName": "ASSDVALYRCG", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Assessed Value Year Over Year Change", "visible": true}, {"fieldName": "NGHBRHDCD", "isEditable": true, "label": "Assessing Neighbornood Code", "visible": true}, {"fieldName": "USECD", "isEditable": true, "label": "Assessing Use Code", "visible": true}, {"fieldName": "USEDSCRP", "isEditable": true, "label": "Assessing Use Description", "visible": true}, {"fieldName": "BLDGAREA", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Building Area", "visible": true}, {"fieldName": "CNTASSDVAL", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Current Assessed Value", "visible": true}, {"fieldName": "CNTSMRTXOD", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Current Summer Taxes Owed", "visible": true}, {"fieldName": "CNTTXBLVAL", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Current Taxable Value", "visible": true}, {"fieldName": "CNTWNTTXOD", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Current Winter Taxes Owed", "visible": true}, {"fieldName": "OWNERNME1", "isEditable": true, "label": "First Owner Name", "visible": true}, {"fieldName": "GIS_AREA", "isEditable": true, "label": "GIS Area", "visible": true, "format": {"digitSeparator": true, "places": 0}}, {"fieldName": "LNDVALUE", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Land Value", "visible": true}, {"fieldName": "LGLSTARTDT", "format": {"dateFormat": "longMonthDayYear", "digitSeparator": false}, "isEditable": true, "label": "Legal Start Date", "visible": true}, {"fieldName": "LOWPARCELID", "isEditable": true, "label": "Lowest Parcel Identification Number", "visible": true}, {"fieldName": "FLOORCOUNT", "format": {"digitSeparator": true, "places": 0}, "isEditable": true, "label": "Number of Floors", "visible": true}, {"fieldName": "PARCELID", "isEditable": true, "label": "Parcel Identification Number", "visible": true}, {"fieldName": "PSTLADDRESS", "isEditable": true, "label": "Postal Address", "visible": true}, {"fieldName": "PSTLCITY", "isEditable": true, "label": "Postal City", "visible": true}, {"fieldName": "PSTLSTATE", "isEditable": true, "label": "Postal State", "visible": true}, {"fieldName": "PSTLZIP4", "isEditable": true, "label": "Postal Zip +4", "visible": true}, {"fieldName": "PSTLZIP5", "isEditable": true, "label": "Postal Zip 5", "visible": true}, {"fieldName": "PRVASSDVAL", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Previous Assessed Value", "visible": true}, {"fieldName": "PRVSMRTXOD", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Previous Summer Taxes Owed", "visible": true}, {"fieldName": "PRVTXBLVAL", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Previous Taxable Value", "visible": true}, {"fieldName": "PRVWNTTXOD", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Previous Winter Taxes Owed", "visible": true}, {"fieldName": "CLASSDSCRP", "isEditable": true, "label": "Property Class", "visible": true}, {"fieldName": "CLASSCD", "isEditable": true, "label": "Property Class Code", "visible": true}, {"fieldName": "GREENBELT", "isEditable": true, "label": "Property Greenbelt Status", "visible": true}, {"fieldName": "PRPRTYDSCRP", "isEditable": true, "label": "Property Legal Description", "visible": true}, {"fieldName": "PHOTOPATH", "isEditable": true, "label": "Property Photo", "visible": true}, {"fieldName": "PRIMEUSE", "isEditable": true, "label": "Property Primary Use Code", "visible": true}, {"fieldName": "VALMETHOD", "isEditable": true, "label": "Property Valuation Method", "visible": true}, {"fieldName": "RESFLRAREA", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Residential Floor Area", "visible": true}, {"fieldName": "RESSTRTYP", "isEditable": true, "label": "Residential Structure Type", "visible": true}, {"fieldName": "RESYRBLT", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Residential Year Built", "visible": true}, {"fieldName": "SCHLTXCD", "isEditable": true, "label": "School District Code", "visible": true}, {"fieldName": "SCHLDSCRP", "isEditable": true, "label": "School District Description", "visible": true}, {"fieldName": "OWNERNME2", "isEditable": true, "label": "Second Owner Name", "visible": true}, {"fieldName": "SEWERSERV", "isEditable": true, "label": "Sewer Service Provider", "visible": true}, {"fieldName": "Shape.STArea()", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "SHAPE.STArea()", "visible": false}, {"fieldName": "Shape.STLength()", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "SHAPE.STLength()", "visible": false}, {"fieldName": "SITEADDRESS", "isEditable": true, "label": "Site Address", "visible": true}, {"fieldName": "STRCLASS", "isEditable": true, "label": "Structure Class", "visible": true}, {"fieldName": "CLASSMOD", "isEditable": true, "label": "Structure Class Modifier", "visible": true}, {"fieldName": "CNVYNAME", "isEditable": true, "label": "Sub or Condo Name", "visible": true}, {"fieldName": "CVTTXCD", "isEditable": true, "label": "Tax District Code", "visible": true}, {"fieldName": "CVTTXDSCRP", "isEditable": true, "label": "Tax District Description", "visible": true}, {"fieldName": "TXBLPCNTCHG", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Taxable Value % Change", "visible": true}, {"fieldName": "TXBLVALYRCHG", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Taxable Value Year Over Year Change", "visible": true}, {"fieldName": "TXODPCNTCHG", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Taxes Owed % Change", "visible": true}, {"fieldName": "TXODYRCHG", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Taxes Owed Year Over Year Change", "visible": true}, {"fieldName": "TOTCNTTXOD", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Total Current Taxes Owed", "visible": true}, {"fieldName": "TOTPRVTXTOD", "format": {"digitSeparator": true, "places": 2}, "isEditable": true, "label": "Total Previous Taxes Owed", "visible": true}, {"fieldName": "WATERSERV", "isEditable": true, "label": "Water Service Provider", "visible": true}, {"fieldName": "OBJECTID_1", "isEditable": true, "label": "OBJECTID_1", "visible": false}, {"fieldName": "GlobalID", "isEditable": true, "label": "GlobalID", "visible": false}, {"fieldName": "OriginalObjectID", "isEditable": true, "label": "Original ObjectID", "visible": false}, {"fieldName": "OriginalGlobalID", "isEditable": true, "label": "Original GlobalID", "visible": false}, {"fieldName": "CreatedByRecord", "isEditable": true, "label": "Created By Record", "visible": false}, {"fieldName": "RetiredByRecord", "isEditable": true, "label": "Retired By Record", "visible": false}, {"fieldName": "last_edited_date", "isEditable": true, "label": "Modified Date", "visible": false}, {"fieldName": "LegalEndDate", "isEditable": true, "label": "Legal End Date", "visible": false}, {"fieldName": "StatedArea", "isEditable": true, "label": "Stated Area", "visible": false}, {"fieldName": "StatedAreaUnit", "isEditable": true, "label": "Stated Area Unit", "visible": false}, {"fieldName": "NetArea", "isEditable": true, "label": "Net Area", "visible": false}, {"fieldName": "CalculatedArea", "isEditable": true, "label": "Calculated Area", "visible": false}, {"fieldName": "HighRise", "isEditable": true, "label": "Condo High Rise", "visible": false}, {"fieldName": "FloorOrder", "isEditable": true, "label": "Condo Floor Number ", "visible": false}, {"fieldName": "UnitNumber", "isEditable": true, "label": "Condo Unit Number", "visible": false}, {"fieldName": "expression/expr0", "isEditable": true, "visible": false}, {"fieldName": "expression/expr1", "isEditable": true, "visible": false}, {"fieldName": "expression/expr2", "isEditable": true, "visible": false}, {"fieldName": "expression/expr3", "isEditable": true, "visible": false}, {"fieldName": "expression/expr4", "isEditable": true, "visible": false}, {"fieldName": "expression/expr5", "isEditable": true, "visible": false}, {"fieldName": "expression/expr6", "isEditable": true, "visible": false}, {"fieldName": "expression/expr7", "isEditable": true, "visible": false}, {"fieldName": "expression/expr8", "isEditable": true, "visible": false}, {"fieldName": "expression/expr10", "isEditable": true, "visible": false}, {"fieldName": "expression/expr14", "isEditable": true, "visible": false}, {"fieldName": "expression/expr15", "isEditable": true, "visible": false}, {"fieldName": "expression/expr16", "isEditable": true, "visible": false}, {"fieldName": "expression/expr17", "isEditable": true, "visible": false}, {"fieldName": "expression/expr18", "isEditable": true, "visible": false}, {"fieldName": "expression/expr26", "isEditable": true, "visible": false}, {"fieldName": "expression/expr27", "isEditable": true, "visible": false}, {"fieldName": "expression/expr29", "isEditable": true, "visible": false}, {"fieldName": "expression/expr30", "isEditable": true, "visible": false}, {"fieldName": "expression/expr31", "isEditable": true, "visible": false}, {"fieldName": "expression/expr32", "isEditable": true, "visible": false}, {"fieldName": "expression/expr33", "isEditable": true, "visible": false}, {"fieldName": "expression/expr34", "isEditable": true, "visible": false}, {"fieldName": "expression/expr35", "isEditable": true, "visible": false}, {"fieldName": "expression/expr36", "isEditable": true, "visible": false}, {"fieldName": "expression/expr37", "isEditable": true, "visible": false}, {"fieldName": "expression/expr38", "isEditable": true, "visible": false}, {"fieldName": "expression/expr39", "isEditable": true, "visible": false}, {"fieldName": "expression/expr40", "isEditable": true, "visible": false}, {"fieldName": "expression/expr41", "isEditable": true, "visible": false}, {"fieldName": "expression/expr42", "isEditable": true, "visible": false}, {"fieldName": "expression/expr43", "isEditable": true, "visible": false}, {"fieldName": "expression/expr44", "isEditable": true, "visible": false}, {"fieldName": "expression/expr45", "isEditable": true, "visible": false}, {"fieldName": "expression/expr46", "isEditable": true, "visible": false}, {"fieldName": "expression/expr47", "isEditable": true, "visible": false}, {"fieldName": "expression/expr48", "isEditable": true, "visible": false}, {"fieldName": "expression/expr49", "isEditable": true, "visible": false}, {"fieldName": "expression/expr50", "isEditable": true, "visible": false}, {"fieldName": "expression/expr52", "isEditable": true, "visible": false}, {"fieldName": "expression/expr53", "isEditable": true, "visible": false}], "title": "{expression/expr37}"};
+  localStorage.setItem('__claude_popup_patch', JSON.stringify(popupInfo));
+
+  var v = window.$arcgis && window.$arcgis.views;
+  if (!v || !v.length) { alert('Map not ready yet -- open the Development Viewer, wait for it to finish loading, then run this again.'); return; }
+  var view = v.getItemAt ? v.getItemAt(0) : v.items[0];
+
+  var FL = null;
+  function featureLayerCtor() {
+    if (FL) return FL;
+    var sample = view.map.allLayers.find(function(l){ return l.type === 'feature'; });
+    if (!sample) return null;
+    FL = sample.constructor;
+    return FL;
+  }
+
+  function ensureHiddenLayer(title, url) {
+    if (view.map.allLayers.some(function(l){ return l.title === title; })) return;
+    var ctor = featureLayerCtor();
+    if (!ctor) { console.warn('[seed v7] could not find a FeatureLayer constructor to add "' + title + '"'); return; }
+    view.map.add(new ctor({
+      url: url,
+      title: title,
+      visible: false,
+      listMode: 'hide',
+      legendEnabled: false,
+      popupEnabled: false
+    }), 0);
+  }
+
+  // Carried over from v5 -- expr50 (Area planner) / expr52 / expr53 (Case planner) still need this.
+  ensureHiddenLayer('Development Review Areas', 'https://gis.lincoln.ne.gov/public/rest/services/Planning/DevReviewAreas/MapServer/0');
+
+  // NEW in v6 -- expr57-61 (Inspector assignments, Staff & Contacts section) need these.
+  var inspectorLayers = [{"title": "Inspector Areas - Building", "url": "https://gis.lincoln.ne.gov/public/rest/services/BuildingSafety/InspectorAreas/MapServer/0"}, {"title": "Inspector Areas - Electrical", "url": "https://gis.lincoln.ne.gov/public/rest/services/BuildingSafety/InspectorAreas/MapServer/1"}, {"title": "Inspector Areas - Housing", "url": "https://gis.lincoln.ne.gov/public/rest/services/BuildingSafety/InspectorAreas/MapServer/2"}, {"title": "Inspector Areas - Mechanical", "url": "https://gis.lincoln.ne.gov/public/rest/services/BuildingSafety/InspectorAreas/MapServer/3"}, {"title": "Inspector Areas - Plumbing", "url": "https://gis.lincoln.ne.gov/public/rest/services/BuildingSafety/InspectorAreas/MapServer/4"}];
+  inspectorLayers.forEach(function(spec){ ensureHiddenLayer(spec.title, spec.url); });
+
+  var d = null;
+  view.map.allLayers.forEach(function(l){ if (l.title === 'Development Information') d = l; });
+  if (!d) { alert('Development Information layer not found -- check that it has not been renamed.'); return; }
+
+  if (!window.__origDevTemplate) window.__origDevTemplate = d.popupTemplate;
+  d.popupTemplate = d.popupTemplate.constructor.fromJSON(popupInfo);
+
+  console.log('[seed v7] Development Information popup patched (v7): everything from v6, plus the FEMA banner, Overlay-districts banner and "No active applications on file" line now fail CLOSED instead of open when the VertiGIS Arcade paging bug hits their gate expression. ' + inspectorLayers.length + ' Inspector Areas layers + Development Review Areas ensured. Reload clears this -- run again after a refresh.');
+}
+
+  /* ===================== payload 2: Quick Bar v3.3 ===================== */
+  /* Development Viewer Quick Bar v3.3 — injected control strip.
+   * Layer toggles (configurable via a Settings popover), 2 named+saveable snap slots (Snap 1/Snap 2),
+   * Declutter, Find Parcel card (multi-match picker + HOA/NA row), popup re-apply, locator pause,
+   * blank-export fix, hidden planner-areas layer, remembered show/hide state.
+   * v3.2 additions (see plan.html Section 03/04 "Proposed V1 Changes"):
+   *   - bar re-anchors to the map container (.gcx-map-container) so it stays centered over the
+   *     map and does not drift under the sidebar when it opens/closes; falls back to the old
+   *     viewport-centered fixed position if that container can't be found.
+   *   - P1/P2 renamed Snap 1/Snap 2 (the old labels read as version numbers, not view snapshots).
+   *   - aria-label added to the sidebar Minimize/Maximize buttons (mirrors their existing title).
+   *   - a one-line hint is added under the native Legend panel's empty-state message.
+   *   - "View Oblique Aerials" is hidden from the per-result action row for every result EXCEPT
+   *     the Development Information (parcel) popup, where it's still useful. Detected by content,
+   *     not a DOM marker attribute or data-* attribute -- both get stripped by the popup's HTML
+   *     sanitizer (confirmed live 2026-08-27); "STAFF & CONTACTS"/"DEVELOPMENT ACTIVITY" are plain
+   *     text in the v6 popup template and always visible, so they survive and are unique to it.
+   * v3.3 addition:
+   *   - repairs "#INVALID" values in the parcel popup. Those come from a bug inside
+   *     VertiGIS's own bundle (their paged Arcade FeatureSet query throws), so no Arcade
+   *     change can fix them -- but the map services are healthy, so the real value is
+   *     fetched over REST and written back into the panel. Layer URLs are resolved from
+   *     the live map by the same titles the Arcade uses, so they track app config.
+   *     Repaired values get a dotted underline + tooltip so they read as recovered,
+   *     not native. Covers Zoning, Floodplain (and the FEMA banner), Existing use,
+   *     Future use, Growth tier.
+   * Accessibility: chips are keyboard buttons (Tab/Enter/Space), aria-pressed states.
+   * Config: localStorage __claude_quick_layers = JSON [{"k":"flood","t":"Layer Title","l":"Chip"}, ...]
+   * Snap slots: localStorage __claude_qb_preset1/2 = JSON {"name":"...", "snap":[[path,bool],...]} (legacy raw array still read)
+   * Bar visibility: localStorage __claude_qb_hidden = "1" when last hidden by the user
+   */
+function runQuickBar() {
+  var v = window.$arcgis && window.$arcgis.views && window.$arcgis.views.getItemAt(0);
+  if (!v) { alert('Map not ready yet - let the map finish loading, then click the bookmark again.'); return; }
+
+  /* ---- 0. deep-link constants + baseline capture (v3.4) ----
+   * This has to happen before anything below changes a layer's visibility: step 2 pauses the
+   * locator layers, and a "baseline" recorded after that would no longer describe what this
+   * app shows on a normal load. Full rationale in section 4b. */
+  /* The hidden lookup layers the popup's Arcade expressions resolve BY NAME with
+   * FeatureSetByName(). Two things about them matter and were learned the hard way:
+   *
+   *   1. They live in the map object, NOT in localStorage, so they do not survive a page reload.
+   *      The seed script adds them, but the seed is a once-per-browser paste, so its copies last
+   *      exactly one page load. Re-adding them here, on every run, is what keeps them alive --
+   *      and until v3.6 only the first entry was re-added, which is why the Inspector rows went
+   *      quietly back to '—' after any refresh (expr57-61 return '—' when the layer is missing,
+   *      by design, so nothing ever surfaced an error).
+   *   2. They are prepended at index 0, so a browser running this toolkit has six operational
+   *      layers a stock browser does not. The deep-link index space has to exclude them.
+   *
+   * Both needs read from THIS one table. Keeping two hand-maintained lists in step is precisely
+   * what failed before, so there is now only one list to maintain. */
+  var CQB_LOOKUP_LAYERS = [
+    { title: 'Development Review Areas',       url: 'https://gis.lincoln.ne.gov/public/rest/services/Planning/DevReviewAreas/MapServer/0' },        /* expr50 area planner, expr52 case planner */
+    { title: 'Inspector Areas - Building',     url: 'https://gis.lincoln.ne.gov/public/rest/services/BuildingSafety/InspectorAreas/MapServer/0' },  /* expr57 */
+    { title: 'Inspector Areas - Electrical',   url: 'https://gis.lincoln.ne.gov/public/rest/services/BuildingSafety/InspectorAreas/MapServer/1' },  /* expr58 */
+    { title: 'Inspector Areas - Housing',      url: 'https://gis.lincoln.ne.gov/public/rest/services/BuildingSafety/InspectorAreas/MapServer/2' },  /* expr59 */
+    { title: 'Inspector Areas - Mechanical',   url: 'https://gis.lincoln.ne.gov/public/rest/services/BuildingSafety/InspectorAreas/MapServer/3' },  /* expr60 */
+    { title: 'Inspector Areas - Plumbing',     url: 'https://gis.lincoln.ne.gov/public/rest/services/BuildingSafety/InspectorAreas/MapServer/4' }   /* expr61 */
+  ];
+  var CQB_TOOLKIT_TITLES = {};
+  CQB_LOOKUP_LAYERS.forEach(function (spec) { CQB_TOOLKIT_TITLES[spec.title] = 1; });
+  var CQB_BASE_KEY = '__claude_qb_baseline';
+  var CQB_MAP_EXT = 'default';
+  try { cqbCaptureBaseline(false); } catch (e) { /* a link feature must never block the bar */ }
+
+  /* ---- 1. re-apply improved popup from localStorage ---- */
+  var raw = localStorage.getItem('__claude_popup_patch');
+  if (raw) {
+    var dl = null;
+    v.map.allLayers.forEach(function (l) { if (l.title === 'Development Information') dl = l; });
+    if (dl) {
+      if (!window.__origDevTemplate) window.__origDevTemplate = dl.popupTemplate;
+      dl.popupTemplate = dl.popupTemplate.constructor.fromJSON(JSON.parse(raw));
+    }
+  }
+  /* ---- 2. pause the five invisible locator layers (query traffic) ---- */
+  v.map.allLayers.forEach(function (l) {
+    if (l.opacity === 0 && /-Locator$/.test(l.title || '')) { try { l.visible = false; } catch (e) {} }
+  });
+  /* ---- 2b. stop blank out-of-scale exports ---- */
+  v.map.allLayers.forEach(function (l) {
+    if (l.type === 'map-image' && l.title === 'Building Footprints' && !l.minScale) l.minScale = 10000;
+  });
+  /* ---- 2c. re-add every hidden lookup layer the popup's Arcade needs ----
+   * Not just the first one. See the note on CQB_LOOKUP_LAYERS above: these do not survive a page
+   * reload, and the popup's Inspector rows silently read '—' whenever their layer is absent. */
+  (function () {
+    var sample = v.map.allLayers.find(function (l) { return l.type === 'feature'; });
+    if (!sample) return;                       /* no FeatureLayer to borrow a constructor from */
+    var FL0 = sample.constructor;
+    CQB_LOOKUP_LAYERS.forEach(function (spec) {
+      if (v.map.allLayers.some(function (l) { return l.title === spec.title; })) return;
+      try {
+        v.map.add(new FL0({ url: spec.url, title: spec.title, visible: false,
+          listMode: 'hide', legendEnabled: false, popupEnabled: false }), 0);
+      } catch (e) { /* one unreachable lookup layer must not stop the rest */ }
+    });
+  })();
+
+  /* ---- 3. quick layer config ---- */
+  var DEFAULTS = [
+    { k: 'flood', t: 'Floodplain and Natural Resources', l: 'Flood' },
+    { k: 'transp', t: 'Transportation', l: 'Transp' },
+    { k: 'contour', t: 'Contours', l: 'Contours' },
+    { k: 'lots', t: 'Legal Lots', l: 'Lots' },
+    { k: 'bldg', t: 'Building Footprints', l: 'Bldgs', sub: 7 },
+    { k: 'landuse', t: 'Land Use and Growth', l: 'LandUse' },
+    { k: 'zoning', t: 'Zoning And Regulations', l: 'Zoning' }
+  ];
+  var cfg;
+  try {
+    var storedCfg = JSON.parse(localStorage.getItem('__claude_quick_layers'));
+    /* always an independent copy - cfg is mutated in place (Settings add/remove), and must never alias DEFAULTS */
+    cfg = (Array.isArray(storedCfg) && storedCfg.length ? storedCfg : DEFAULTS).slice();
+  } catch (e) { cfg = DEFAULTS.slice(); }
+  function saveCfg() { localStorage.setItem('__claude_quick_layers', JSON.stringify(cfg)); }
+  function layerOf(title) {
+    var found = null;
+    v.map.layers.forEach(function (l) { if (l.title === title) found = l; });
+    if (!found) v.map.allLayers.forEach(function (l) { if (!found && l.title === title) found = l; });
+    return found;
+  }
+  function ensureSub(lyr, q) {
+    if (lyr.visible && lyr.type === 'map-image' && lyr.allSublayers) {
+      var anyOn = false;
+      lyr.allSublayers.forEach(function (s) { if (s.visible) anyOn = true; });
+      if (!anyOn) lyr.allSublayers.forEach(function (s) { if (s.id === (q.sub === undefined ? -1 : q.sub)) s.visible = true; });
+    }
+  }
+
+  /* ---- 4. snap slots: full-tree visibility snapshots ---- */
+  function snapshot() {
+    var s = [];
+    (function walk(ls, path) {
+      ls.forEach(function (l, i) {
+        var p = path + '/' + i;
+        s.push([p, !!l.visible]);
+        if (l.layers) walk(l.layers, p);
+      });
+    })(v.map.layers, '');
+    return s;
+  }
+  function applySnap(s) {
+    var byPath = {};
+    s.forEach(function (e) { byPath[e[0]] = e[1]; });
+    (function walk(ls, path) {
+      ls.forEach(function (l, i) {
+        var p = path + '/' + i;
+        if (p in byPath && l.visible !== byPath[p]) l.visible = byPath[p];
+        if (l.layers) walk(l.layers, p);
+      });
+    })(v.map.layers, '');
+    refresh();
+  }
+
+
+  /* ---- 4b. shareable deep links (v3.4) --------------------------------------------------
+   * Produces a URL that reopens what is on screen right now:
+   *
+   *   center-default=<x>,<y>   VertiGIS, documented   exact view centre (Web Mercator)
+   *   scale-default=<n>        VertiGIS, documented   exact scale
+   *   layers-default=<i,j,k>   VertiGIS, documented   best effort -- see the note below
+   *   pid=<PARCELID>           ours                   reopens the record card; the app ignores it
+   *   qbl=<sig>~<hex>          ours                   exact layer state; the app ignores it
+   *
+   * On the native layers- parameter. VertiGIS documents its value only as a "zero based index
+   * value of a particular layer ... toggles the visibility". Both halves of that sentence matter
+   * and neither is spelled out, so both were established by experiment against this app
+   * (2026-08-28), not assumed:
+   *
+   *   - The index counts the map's *operational* layers, flattened, with the basemap excluded --
+   *     that is, allLayers minus its leading basemap entries. Verified at indices 7, 10, 16, 31,
+   *     54 and 99: each one moved allLayers[i+1] and nothing else, allLayers[0] being the
+   *     LancoBasemap vector-tile layer.
+   *   - It genuinely TOGGLES rather than sets. layers-default=5 turned OFF a layer that is on by
+   *     default. So a link cannot state an absolute layer state natively; it can only state a
+   *     difference from whatever this app happens to show on a normal load.
+   *
+   * That difference has to be measured, because it cannot be looked up. The web map item's own
+   * operationalLayers[].visibility does NOT describe what the app actually shows: checked directly
+   * against the running app, 28 of its 121 layers disagree with the value stored in the web map,
+   * because the VertiGIS app configuration overrides them. So the baseline is captured instead --
+   * the first time the bar runs on a page whose URL carries no layer parameters, it records every
+   * operational layer's visibility before touching anything, and later links are diffed against
+   * that recording. "Recalibrate" in the Settings popover re-takes it on demand.
+   *
+   * Where that leaves each recipient:
+   *   - with the toolkit:    qbl restores the exact layer state, and is authoritative.
+   *   - without the toolkit: layers- replays the sharer's deliberate layer changes on top of that
+   *                          recipient's own app defaults. With no baseline captured yet, the
+   *                          parameter is omitted entirely rather than emitted wrong.
+   *
+   * The hidden lookup layers this toolkit adds itself are excluded from the index space. They are
+   * prepended at index 0 and a stock browser does not have them, so leaving them in would shift
+   * every index by six for the recipient. */
+
+  /* operational layers in the order VertiGIS's layers- parameter counts them, as a browser
+   * without this toolkit would see them */
+  function cqbStockOps() {
+    var tree = [];
+    (function walk(col) { col.forEach(function (l) { tree.push(l); if (l.layers) walk(l.layers); }); })(v.map.layers);
+    var out = [];
+    v.map.allLayers.forEach(function (l) {
+      if (tree.indexOf(l) < 0) return;                 /* basemap / reference layers */
+      if (CQB_TOOLKIT_TITLES[l.title || '']) return;   /* added by this toolkit, absent for a recipient */
+      out.push(l);
+    });
+    return out;
+  }
+  /* identity of the layer list itself, so a stale baseline or a link made against a different
+   * version of this map is detected instead of applied to the wrong layers */
+  function cqbOpsSig(ops) {
+    var str = ops.map(function (l) { return l.title || '?'; }).join('|'), h = 0;
+    for (var i = 0; i < str.length; i++) h = (h * 131 + str.charCodeAt(i)) % 4294967291;
+    return h + '.' + ops.length;
+  }
+  function cqbBitsOf(ops) { return ops.map(function (l) { return l.visible ? '1' : '0'; }).join(''); }
+  function cqbBitsToHex(bits) {
+    var out = '';
+    for (var i = 0; i < bits.length; i += 4) out += parseInt((bits.substr(i, 4) + '0000').substr(0, 4), 2).toString(16);
+    return out;
+  }
+  function cqbHexToBits(hex, len) {
+    var out = '';
+    for (var i = 0; i < hex.length; i++) {
+      var nib = parseInt(hex.charAt(i), 16);
+      if (isNaN(nib)) return null;
+      out += ('000' + nib.toString(2)).slice(-4);
+    }
+    return out.length < len ? null : out.substr(0, len);
+  }
+  function cqbUrlHasLayerState() {
+    var qs = (location.search || '');
+    return /[?&]layers-/.test(qs) || /[?&]qbl=/.test(qs);
+  }
+  function cqbReadBaseline(sig) {
+    try {
+      var b = JSON.parse(localStorage.getItem(CQB_BASE_KEY) || 'null');
+      if (!b || b.sig !== sig || typeof b.bits !== 'string') return null;
+      return b.bits.length === +String(sig).split('.')[1] ? b : null;
+    } catch (e) { return null; }
+  }
+  /* Records the app's normal startup layer visibility. Refuses to record it from a page that was
+   * itself opened from a shared link (its layers are already someone else's), and never silently
+   * replaces a baseline that is still valid for this map -- force=true is the Settings button. */
+  function cqbCaptureBaseline(force) {
+    var ops = cqbStockOps(), sig = cqbOpsSig(ops);
+    if (!force) {
+      if (cqbUrlHasLayerState()) return null;
+      var have = cqbReadBaseline(sig);
+      if (have) return have;
+    }
+    var b = { sig: sig, bits: cqbBitsOf(ops) };
+    try { localStorage.setItem(CQB_BASE_KEY, JSON.stringify(b)); } catch (e) {}
+    return b;
+  }
+
+  /* the parcel whose record is on screen: the app's own popup first, then the last Find Parcel */
+  function cqbVisiblePid() {
+    var found = null;
+    document.querySelectorAll('.gcx-feature-details').forEach(function (p) {
+      if (found || !isDevInfoPanel(p)) return;
+      var pid = cqbPidOf(p);
+      if (pid) found = pid;
+    });
+    return found || window.__cqbLastPid || null;
+  }
+
+  function cqbBuildLink() {
+    var ops = cqbStockOps(), sig = cqbOpsSig(ops), bits = cqbBitsOf(ops);
+    var qs = new URLSearchParams(location.search || '');
+    var parts = [];
+    if (qs.get('app')) parts.push('app=' + encodeURIComponent(qs.get('app')));
+    if (qs.get('viewer')) parts.push('viewer=' + encodeURIComponent(qs.get('viewer')));
+    var meta = { view: false, native: 0, baseline: false, pid: null };
+
+    var c = v.center, sc = v.scale;
+    if (c && sc) {
+      parts.push('center-' + CQB_MAP_EXT + '=' + Math.round(c.x) + ',' + Math.round(c.y));
+      parts.push('scale-' + CQB_MAP_EXT + '=' + Math.round(sc));
+      meta.view = true;
+    }
+
+    var base = cqbReadBaseline(sig);
+    if (base) {
+      meta.baseline = true;
+      var toggles = [];
+      for (var i = 0; i < bits.length; i++) {
+        if (bits.charAt(i) === base.bits.charAt(i)) continue;
+        var l = ops[i];
+        /* the bar pauses these on every load and a recipient's own bar will pause them again;
+         * they are invisible either way, so shipping them would be noise in the URL */
+        if (l && l.opacity === 0 && /-Locator$/.test(l.title || '')) continue;
+        toggles.push(i);
+      }
+      if (toggles.length) {
+        parts.push('layers-' + CQB_MAP_EXT + '=' + toggles.join(','));
+        meta.native = toggles.length;
+      }
+    }
+    parts.push('qbl=' + encodeURIComponent(sig + '~' + cqbBitsToHex(bits)));
+
+    var pid = cqbVisiblePid();
+    if (pid) { parts.push('pid=' + encodeURIComponent(pid)); meta.pid = pid; }
+
+    return { url: location.origin + location.pathname + '?' + parts.join('&'), meta: meta };
+  }
+
+  function cqbCopy(text, okMsg) {
+    function fallback() {
+      var d = card('<b>Copy link</b>' +
+        "<div style='color:#8fa3ba;margin:4px 0 6px 0;'>Clipboard access was refused - select this and copy it:</div>" +
+        "<textarea readonly style='width:100%;height:78px;background:#0d1319;color:#cfe8ff;border:1px solid #2c3a4d;border-radius:4px;font:11px monospace;padding:5px;box-sizing:border-box;'>" + esc(text) + '</textarea>');
+      var ta = d.querySelector('textarea');
+      if (ta) { try { ta.focus(); ta.select(); } catch (e) {} }
+    }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { toast(okMsg); }, fallback);
+        return;
+      }
+    } catch (e) {}
+    fallback();
+  }
+
+  /* Applies the our-own half of an incoming link. The native center-/scale-/layers- parameters
+   * are the app's job and have already been applied by the time this runs. */
+  function cqbApplyIncomingLink() {
+    if (window.__cqbLinkApplied) return;
+    window.__cqbLinkApplied = true;
+    var qs;
+    try { qs = new URLSearchParams(location.search || ''); } catch (e) { return; }
+    var qbl = qs.get('qbl'), pid = qs.get('pid');
+
+    if (qbl) {
+      var ops = cqbStockOps(), sig = cqbOpsSig(ops);
+      var split = qbl.split('~');
+      var incoming = split.length === 2 ? cqbHexToBits(split[1], ops.length) : null;
+      if (split[0] === sig && incoming) {
+        /* parents before children, or a child set visible under a still-hidden group stays hidden */
+        var order = [];
+        (function walk(col, depth) {
+          col.forEach(function (l) { order.push({ l: l, d: depth }); if (l.layers) walk(l.layers, depth + 1); });
+        })(v.map.layers, 0);
+        order.sort(function (a, b) { return a.d - b.d; });
+        order.forEach(function (e) {
+          var i = ops.indexOf(e.l);
+          if (i < 0) return;
+          var want = incoming.charAt(i) === '1';
+          if (e.l.visible !== want) { try { e.l.visible = want; } catch (err) {} }
+        });
+        try { refresh(); } catch (e) {}
+      } else {
+        toast('Shared link: layer state skipped - this map is not the one the link was made from');
+      }
+    }
+
+    if (pid && /^\d{10,14}$/.test(pid)) {
+      /* if the link also carried a view, keep the sharer's view and just highlight the parcel;
+       * with no view in the link, zoom to the parcel as Find Parcel normally would */
+      findParcel(pid, { noZoom: qs.has('center-' + CQB_MAP_EXT) && qs.has('scale-' + CQB_MAP_EXT) });
+    }
+  }
+
+
+  /* ---- 4c. parcel results in the native search box (v3.5) --------------------------------
+   * The Help tab states that "Results beginning with Development Information provide the most
+   * common development-related details." They never do: every search source in the app config is
+   * a geocoder locator, so the box returns places, and the result table shows locator internals
+   * (Loc_name, Score, Rank) instead of parcel data. Find Parcel was V1's answer to that -- a
+   * second search box on our own bar. This closes the gap in the box people actually reach for.
+   *
+   * Why the rendered dropdown and not the config. Adding a real search source is config-side and
+   * unreachable: the search widget reads its configuration before any point at which injected
+   * code can run, so there is no moment at which a source can be added. What IS reachable is the
+   * dropdown the widget renders. Measured live (2026-08-28):
+   *
+   *   - The dropdown is a [role="listbox"] with id "gcx-search-listbox-...", holding one
+   *     DIV[role="group"] per configured source -- currently just the Lincoln-Lancaster geocoder.
+   *   - Each group is a header (h3.gcx-search-suggestion-group-title) followed by LI[role=option]
+   *     rows. The markup this builds mirrors that, so the injected group is styled by the app's
+   *     own CSS rather than by anything hard-coded here.
+   *   - Typing updates the listbox's children IN PLACE: across keystrokes the listbox node and
+   *     the geocoder's group node keep their identity. A foreign group prepended to the listbox
+   *     therefore survives React's re-renders -- verified by typing, deleting and retyping with a
+   *     probe group in place: it stayed, stayed first, and the native options kept updating
+   *     correctly, with no React error.
+   *   - Closing the dropdown UNMOUNTS the listbox; reopening builds a new node with the same id.
+   *     So injection cannot be a one-shot -- it rides the same debounced sweep that already
+   *     maintains the oblique-aerials button and the #INVALID repair.
+   *
+   * What this deliberately does not do: take over the arrow keys. Which option is highlighted is
+   * React state the widget owns, and it has no idea these rows exist. Rows are clickable and
+   * individually focusable (Tab, then Enter or Space) instead of being spliced into the native
+   * keyboard sequence, because quietly breaking arrow-key navigation of the real search results
+   * would cost more than it gained. */
+
+  var CQB_SUG_MAX = 6;              /* rows shown; the geocoder's own group shows about five */
+  var CQB_SUG_MINLEN = 3;
+  var cqbSugCache = {};             /* upper-cased term -> array of {pid, addr, owner} */
+  var cqbSugPending = null;
+  var cqbSugSeq = 0;
+
+  function cqbSearchInput() { return document.querySelector('input[aria-label="Type your search terms"]'); }
+  function cqbSearchListbox() {
+    var found = null;
+    document.querySelectorAll('[role="listbox"]').forEach(function (L) {
+      if (!found && /^gcx-search-listbox/.test(L.id || '')) found = L;
+    });
+    return found;
+  }
+  function cqbSugRemove(lb) {
+    var g = (lb || document).querySelector('#cqb-sug-group');
+    if (g && g.parentNode) g.parentNode.removeChild(g);
+  }
+
+  /* address or PID, the same two shapes Find Parcel accepts, so the two behave alike */
+  function cqbSugWhere(term) {
+    var clean = term.replace(/'/g, "''").toUpperCase();
+    if (/^\d{10,14}$/.test(clean)) return "PARCELID = '" + clean + "'";
+    /* strip LIKE wildcards so a typed % or _ searches for itself rather than matching everything */
+    var like = clean.split(',')[0].replace(/[%_]/g, ' ').trim();
+    if (like.length < CQB_SUG_MINLEN) return null;
+    return "UPPER(SITEADDRESS) LIKE '" + like + "%'";
+  }
+
+  function cqbSugRender(lb, term, rows) {
+    var existing = lb.querySelector('#cqb-sug-group');
+    if (existing && existing.getAttribute('data-term') === term && lb.firstChild === existing) return;
+    if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+    if (!rows || !rows.length) return;
+
+    var g = document.createElement('div');
+    g.id = 'cqb-sug-group';
+    g.setAttribute('role', 'group');
+    g.setAttribute('aria-label', 'Development Information');
+    g.setAttribute('data-term', term);
+    g.className = 'MuiBox-root';
+
+    var head = document.createElement('div');
+    head.className = 'MuiStack-root';
+    var h = document.createElement('h3');
+    h.setAttribute('role', 'presentation');
+    h.className = 'MuiTypography-root MuiTypography-h4 gcx-search-suggestion-group-title';
+    h.textContent = 'Development Information';
+    head.appendChild(h);
+    g.appendChild(head);
+
+    rows.forEach(function (r, i) {
+      var li = document.createElement('li');
+      li.id = 'cqb-sug-' + i;
+      li.setAttribute('role', 'option');
+      li.setAttribute('tabindex', '0');
+      li.className = 'MuiButtonBase-root MuiMenuItem-root MuiMenuItem-dense';
+      var wrap = document.createElement('div');
+      wrap.className = 'MuiListItemText-root MuiListItemText-dense';
+      var primary = document.createElement('span');
+      primary.className = 'MuiTypography-root MuiTypography-body2 MuiListItemText-primary';
+      primary.textContent = r.addr || ('Parcel ' + r.pid);
+      var secondary = document.createElement('span');
+      secondary.className = 'MuiTypography-root MuiTypography-body2';
+      secondary.style.cssText = 'display:block;opacity:.7;font-size:11px;';
+      secondary.textContent = 'PID ' + r.pid + (r.owner ? ' · ' + r.owner : '');
+      wrap.appendChild(primary); wrap.appendChild(secondary);
+      li.appendChild(wrap);
+      var chosen = false;
+      function choose(ev) {
+        if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+        if (chosen) return;                 /* mousedown and click both bind to this */
+        chosen = true;
+        cqbSugRemove(lb);
+        var inp = cqbSearchInput();
+        if (inp) { try { inp.blur(); } catch (e) {} }
+        findParcel(r.pid);
+      }
+      /* mousedown, not click. Pressing the mouse blurs the input, which unmounts the entire
+       * dropdown -- so by the time a click event would be dispatched the row no longer exists.
+       * Measured live: the row receives pointerdown and mousedown and never a click.
+       * preventDefault on mousedown also stops the focus loss that causes it. */
+      li.addEventListener('mousedown', choose);
+      li.addEventListener('click', choose);   /* fallback for anything that gets this far */
+      li.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter' || ev.key === ' ') choose(ev);
+      });
+      g.appendChild(li);
+    });
+
+    lb.insertBefore(g, lb.firstChild);
+  }
+
+  function cqbSugLookup(term) {
+    var where = cqbSugWhere(term);
+    if (!where) return Promise.resolve([]);
+    return q('/Assessor/TaxParcels/MapServer/0', {
+      where: where, returnGeometry: 'false', outFields: 'PARCELID,SITEADDRESS,OWNERNME1',
+      orderByFields: 'SITEADDRESS', resultRecordCount: String(CQB_SUG_MAX)
+    }).then(function (j) {
+      return (j.features || []).map(function (f) {
+        return { pid: String(f.attributes.PARCELID || ''), addr: f.attributes.SITEADDRESS || '', owner: f.attributes.OWNERNME1 || '' };
+      }).filter(function (r) { return r.pid; });
+    });
+  }
+
+  /* Called from the periodic sweep. Everything here is best-effort: on any failure the native
+   * dropdown is simply left exactly as the app rendered it. */
+  function maintainSearchGroup() {
+    if (localStorage.getItem('__claude_qb_nosearch') === '1') { cqbSugRemove(null); return; }
+    var lb = cqbSearchListbox();
+    if (!lb) return;                                     /* dropdown closed; nothing to do */
+    var inp = cqbSearchInput();
+    var term = ((inp && inp.value) || '').trim().toUpperCase();
+    if (term.length < CQB_SUG_MINLEN || term.length > 60) { cqbSugRemove(lb); return; }
+    if (cqbSugCache[term]) { cqbSugRender(lb, term, cqbSugCache[term]); return; }
+    if (cqbSugPending === term) return;                  /* already in flight for this term */
+    cqbSugPending = term;
+    var seq = ++cqbSugSeq;
+    cqbSugLookup(term).then(function (rows) {
+      cqbSugCache[term] = rows;
+      if (seq !== cqbSugSeq) return;                     /* a later keystroke superseded this */
+      var lb2 = cqbSearchListbox();
+      if (lb2) cqbSugRender(lb2, term, rows);
+    }).catch(function () {
+      cqbSugCache[term] = [];                            /* remember the miss; do not retry in a loop */
+    }).then(function () {
+      if (cqbSugPending === term) cqbSugPending = null;
+    });
+  }
+
+  /* ---- 5. the bar ---- */
+  var old = document.getElementById('cqb'); if (old) old.remove();
+  var oldHandle = document.getElementById('cqb-handle'); if (oldHandle) oldHandle.remove();
+  if (window.__cqbRefreshTimer) { clearInterval(window.__cqbRefreshTimer); } /* a prior click's chip-repaint loop would otherwise run forever */
+  if (window.__cqbResizeObserver) { try { window.__cqbResizeObserver.disconnect(); } catch (e) {} }
+  if (window.__cqbFeatureObserver) { try { window.__cqbFeatureObserver.disconnect(); } catch (e) {} }
+  var bar = document.createElement('div');
+  bar.id = 'cqb';
+  bar.setAttribute('role', 'toolbar');
+  bar.setAttribute('aria-label', 'Quick layer controls');
+  bar.style.cssText = 'position:fixed;bottom:100px;left:50%;transform:translateX(-50%);width:max-content;z-index:9999;display:flex;gap:4px;align-items:center;background:rgba(15,20,28,.94);border:1px solid #2c3a4d;border-radius:16px;padding:4px 8px;font:11px "Segoe UI",sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.5);flex-wrap:wrap;justify-content:center;max-width:min(680px,86vw);';
+  function chip(label, title) {
+    var c = document.createElement('span');
+    c.textContent = label;
+    c.title = title;
+    c.setAttribute('role', 'button');
+    c.setAttribute('tabindex', '0');
+    c.setAttribute('aria-label', title);
+    c.style.cssText = 'cursor:pointer;padding:4px 10px;border-radius:12px;user-select:none;white-space:nowrap;outline-offset:2px;';
+    c.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); c.click(); }
+    });
+    c.addEventListener('focus', function () { c.style.outline = '2px solid #7cc4ff'; });
+    c.addEventListener('blur', function () { c.style.outline = 'none'; });
+    return c;
+  }
+  function paint(c, on) {
+    c.style.background = on ? '#1b5e20' : '#232b36';
+    c.style.color = on ? '#d7ffd9' : '#a9bccf';
+    c.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+
+  var sep = document.createElement('span');
+  sep.setAttribute('aria-hidden', 'true');
+  sep.style.cssText = 'width:1px;height:16px;background:#2c3a4d;margin:0 2px;';
+  bar.appendChild(sep);
+
+  /* chip row is rebuildable so the Settings popover can add/remove/relabel without a page reload */
+  var chips = [];
+  function renderChips() {
+    chips.forEach(function (x) { x.c.remove(); });
+    chips = [];
+    cfg.forEach(function (q) {
+      var lyr = layerOf(q.t);
+      if (!lyr) return;
+      var c = chip(q.l, 'Toggle layer: ' + q.t);
+      paint(c, lyr.visible);
+      c.onclick = function () { lyr.visible = !lyr.visible; ensureSub(lyr, q); paint(c, lyr.visible); };
+      chips.push({ c: c, lyr: lyr });
+      bar.insertBefore(c, sep);
+    });
+  }
+  renderChips();
+  function refresh() { chips.forEach(function (x) { paint(x.c, x.lyr.visible); }); }
+
+  /* snap slots (named) */
+  [1, 2].forEach(function (n) {
+    var key = '__claude_qb_preset' + n;
+    function readPreset() {
+      var rawp = localStorage.getItem(key);
+      if (!rawp) return null;
+      try {
+        var parsed = JSON.parse(rawp);
+        return Array.isArray(parsed) ? { name: '', snap: parsed } : parsed; /* legacy raw-array snapshots still load */
+      } catch (e) { return null; }
+    }
+    var c = chip('Snap ' + n, '');
+    function retitle() {
+      var p = readPreset();
+      c.title = p
+        ? 'Snap ' + n + (p.name ? ' ("' + p.name + '")' : '') + ': click applies; Shift+click re-saves'
+        : 'Snap ' + n + ' is empty: Shift+click to save the current layers';
+      c.setAttribute('aria-label', c.title);
+      c.style.color = p ? '#7cc4ff' : '#7a8ba0';
+    }
+    c.style.background = '#232b36';
+    retitle();
+    c.onclick = function (ev) {
+      if (ev.shiftKey) {
+        var existing = readPreset();
+        var nm = prompt('Name this snapshot (optional, Cancel keeps the current name):', existing && existing.name || '');
+        if (nm === null) nm = (existing && existing.name) || '';
+        localStorage.setItem(key, JSON.stringify({ name: nm, snap: snapshot() }));
+        retitle();
+        toast('Saved to Snap ' + n + (nm ? ' ("' + nm + '")' : ''));
+      } else {
+        var p = readPreset();
+        if (!p) { toast('Snap ' + n + ' is empty - Shift+click to save the current layers'); return; }
+        applySnap(p.snap);
+        toast('Snap ' + n + (p.name ? ' ("' + p.name + '")' : '') + ' applied');
+      }
+    };
+    bar.appendChild(c);
+  });
+
+  /* Declutter / Restore */
+  var dc = chip('Declutter', 'Turn everything off except parcels and development; click again to restore');
+  dc.style.background = '#232b36'; dc.style.color = '#ffcf87';
+  dc.onclick = function () {
+    if (window.__qbDeclutterSnap) {
+      applySnap(window.__qbDeclutterSnap);
+      window.__qbDeclutterSnap = null;
+      dc.textContent = 'Declutter';
+      toast('Layers restored');
+    } else {
+      window.__qbDeclutterSnap = snapshot();
+      var keep = { 'Development': 1, 'Parcel Information': 1, 'City and Village Limits': 1, 'GWV Special Layer': 1 };
+      v.map.layers.forEach(function (l) {
+        if (l.opacity === 0) return;
+        l.visible = !!keep[l.title];
+      });
+      refresh();
+      dc.textContent = 'Restore';
+      toast('Decluttered - click Restore to bring layers back');
+    }
+  };
+  bar.appendChild(dc);
+
+  /* Find Parcel accelerator */
+  var fp = chip('⌕ Parcel', 'Find a parcel by address or PID and show its record card (uses the search box text if present)');
+  fp.style.background = '#24354d'; fp.style.color = '#cfe8ff';
+  fp.onclick = function () { findParcel(); };
+  bar.appendChild(fp);
+
+  /* Copy a shareable deep link to the current view (and parcel) */
+  var lk = chip('🔗 Link', 'Copy a link that reopens this view - and this parcel record, for anyone who also has the toolkit');
+  lk.style.background = '#24354d'; lk.style.color = '#cfe8ff';
+  lk.onclick = function () {
+    var r = cqbBuildLink();
+    var said = [r.meta.view ? 'view' : 'view unavailable'];
+    if (r.meta.pid) said.push('parcel ' + r.meta.pid);
+    said.push(r.meta.baseline
+      ? (r.meta.native ? r.meta.native + ' layer change' + (r.meta.native === 1 ? '' : 's') : 'default layers')
+      : 'layers for toolkit users only');
+    cqbCopy(r.url, 'Link copied - ' + said.join(' \u00b7 '));
+  };
+  bar.appendChild(lk);
+
+  /* Settings: reconfigure which layers appear as chips */
+  var gear = chip('⚙', 'Configure which layers appear as chips on this bar');
+  gear.style.color = '#a9bccf';
+  gear.onclick = function () { openSettings(); };
+  bar.appendChild(gear);
+
+  var x = chip('×', 'Hide this bar (remembered on this browser - click the small tab to bring it back)');
+  x.style.color = '#a9bccf'; x.style.padding = '4px 7px';
+  x.onclick = function () { hideBar(); };
+  bar.appendChild(x);
+  document.body.appendChild(bar);
+
+  /* ---- 5a. re-anchor the bar to the map container, not the viewport ----
+   * The sidebar (Home/Layers/Results/etc.) changes the map's on-screen width and left edge
+   * when it opens, closes, or gets resized. A bar centered on the *viewport* drifts off-center
+   * over the map whenever that happens. .gcx-map-container is VertiGIS's own wrapper around the
+   * map view and tracks that area exactly; anchor to it and fall back to the old viewport-centered
+   * behavior if it's ever missing (a VertiGIS markup change, or a differently-configured app). */
+  function positionBar() {
+    var mc = document.querySelector('.gcx-map-container');
+    if (mc && mc.offsetWidth > 0) {
+      var r = mc.getBoundingClientRect();
+      bar.style.left = Math.round(r.left + r.width / 2) + 'px';
+      bar.style.transform = 'translateX(-50%)';
+      bar.style.maxWidth = 'min(680px,' + Math.max(200, Math.round(r.width * 0.86)) + 'px)';
+    } else {
+      bar.style.left = '50%';
+      bar.style.transform = 'translateX(-50%)';
+      bar.style.maxWidth = 'min(680px,86vw)';
+    }
+  }
+  positionBar();
+  var mapContainerEl = document.querySelector('.gcx-map-container');
+  if (window.ResizeObserver && mapContainerEl) {
+    var ro = new ResizeObserver(positionBar);
+    ro.observe(mapContainerEl);
+    window.__cqbResizeObserver = ro;
+  }
+  window.addEventListener('resize', positionBar);
+
+  /* ---- 5b. remembered show/hide state ---- */
+  function hideBar() {
+    localStorage.setItem('__claude_qb_hidden', '1');
+    bar.style.display = 'none';
+    showHandle();
+  }
+  function showHandle() {
+    if (document.getElementById('cqb-handle')) return;
+    var h = document.createElement('span');
+    h.id = 'cqb-handle';
+    h.textContent = '▲ Quick Bar';
+    h.setAttribute('role', 'button'); h.setAttribute('tabindex', '0');
+    h.setAttribute('aria-label', 'Show the Quick Bar');
+    h.style.cssText = 'position:fixed;bottom:8px;left:50%;transform:translateX(-50%);z-index:9999;background:rgba(15,20,28,.9);color:#7a8ba0;border:1px solid #2c3a4d;border-radius:10px;padding:2px 10px;font:10px "Segoe UI",sans-serif;cursor:pointer;user-select:none;';
+    function show() {
+      localStorage.setItem('__claude_qb_hidden', '0');
+      h.remove();
+      bar.style.display = 'flex';
+    }
+    h.onclick = show;
+    h.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); show(); } });
+    document.body.appendChild(h);
+  }
+  if (localStorage.getItem('__claude_qb_hidden') === '1') { bar.style.display = 'none'; showHandle(); }
+
+  /* ---- 5c. small accessibility/UX patches on existing chrome (self-healing, re-applied on a timer
+   * since the SPA re-renders this chrome independently of anything the bar does) ---- */
+  function fixAriaLabels() {
+    ['minimize', 'maximize'].forEach(function (key) {
+      var el = document.querySelector('[data-test="' + key + '"]');
+      if (el && !el.getAttribute('aria-label') && el.title) el.setAttribute('aria-label', el.title);
+    });
+  }
+  function annotateEmptyLegend() {
+    document.querySelectorAll('.esri-legend__message').forEach(function (el) {
+      if (el.__cqbAnnotated) return;
+      el.__cqbAnnotated = true;
+      var hint = document.createElement('div');
+      hint.className = 'cqb-legend-hint';
+      hint.textContent = 'Turn on a layer to see its legend.';
+      hint.style.cssText = 'color:#6f8bb0;font-size:11px;margin-top:4px;';
+      el.insertAdjacentElement('afterend', hint);
+    });
+  }
+
+  /* ---- 5d. hide "View Oblique Aerials" on every result except the Development Information popup ----
+   * The per-result action row (role="menubar" inside .gcx-feature-details) is the same six buttons
+   * for every layer's result; "View Oblique Aerials" is only meaningful for a parcel. There's no
+   * reliable DOM marker to test for "this is our popup" -- the sanitizer strips id / class / data-* / title
+   * attributes from plain tags (live-confirmed 2026-08-27), so this keys off plain visible text instead: the v6
+   * popup always renders a "DEVELOPMENT ACTIVITY" and "STAFF & CONTACTS" section header, in that exact
+   * text, which is not something the sanitizer can strip. */
+  function isDevInfoPanel(panel) {
+    var desc = panel.querySelector('[data-test="description-value"]');
+    var t = (desc && desc.textContent) || '';
+    return t.indexOf('STAFF & CONTACTS') !== -1 || t.indexOf('DEVELOPMENT ACTIVITY') !== -1;
+  }
+  function fixObliqueButton(panel) {
+    var btn = panel.querySelector('[role="menubar"] [aria-label="View Oblique Aerials"]');
+    if (!btn) return;
+    var item = btn.closest('li') || btn;
+    item.style.display = isDevInfoPanel(panel) ? '' : 'none';
+  }
+
+  /* ---- 5e. repair "#INVALID" values left by the VertiGIS Arcade paging bug ----
+   * The bug lives inside VertiGIS's own bundle (their paged FeatureSet query throws
+   * "Cannot read properties of undefined (reading 'featureResult')"), so no Arcade-level
+   * change can catch it -- the popup just renders the literal text "#INVALID".
+   * The map services themselves are fine, so we re-run the equivalent query over REST
+   * and write the real value back into the DOM. Live-proven on PID 1616406005000:
+   * popup said "#INVALID" for Zoning, REST said "AGR".
+   * Self-contained on purpose (own service root + fetch helper) so it has no ordering
+   * dependency on the Find Parcel section defined further down this file. */
+  var CQB_SVC = 'https://gis.lincoln.ne.gov/public/rest/services';
+  var cqbLayerUrl = {};      /* layer title -> ".../MapServer/<n>", resolved from the live map */
+  var cqbGeomCache = {};     /* pid -> parcel geometry (one fetch per parcel, not per field) */
+  var cqbValueCache = {};    /* pid + "|" + label -> repaired string */
+  var cqbInFlight = {};
+
+  function cqbQuery(url, params) {
+    return fetch(url + '/query', {
+      method: 'POST',
+      body: new URLSearchParams(Object.assign({ f: 'json' }, params))
+    }).then(function (r) { return r.json(); });
+  }
+
+  /* Resolve by the same title the Arcade passes to FeatureSetByName. Prefer a real
+   * feature layer: several titles in this web map are shared with group layers. */
+  function cqbResolveLayer(title) {
+    if (cqbLayerUrl[title] !== undefined) return cqbLayerUrl[title];
+    var hit = null;
+    v.map.allLayers.forEach(function (l) {
+      if (hit) return;
+      if (l.title === title && l.type === 'feature' && l.url && l.layerId !== null && l.layerId !== undefined) hit = l;
+    });
+    cqbLayerUrl[title] = hit ? (hit.url + '/' + hit.layerId) : null;
+    return cqbLayerUrl[title];
+  }
+
+  /* The inspector/planner phone fields carry three different formats and at least one
+   * malformed value ("(402 580-8117", missing its closing bracket) -- counted live across all
+   * 22 inspector records. Normalise for display only; the underlying data is the county's. */
+  /* Arcade's Distinct() preserves order; Sort(Distinct()) does not. Some rows use one and
+   * some the other, so both are needed to reproduce them faithfully. */
+  function cqbUniq(arr) {
+    var seen = {}, out = [];
+    arr.forEach(function (x) {
+      if (x === null || x === undefined) return;
+      var s = String(x).trim();
+      if (!s || seen[s]) return;
+      seen[s] = 1; out.push(s);
+    });
+    return out;
+  }
+
+  function cqbPhone(raw) {
+    if (raw === null || raw === undefined) return '';
+    var digits = String(raw).replace(/[^0-9]/g, '');
+    if (digits.length === 11 && digits.charAt(0) === '1') digits = digits.slice(1);
+    if (digits.length !== 10) return String(raw).trim();      /* not a NANP number: leave as-is */
+    return '(' + digits.slice(0, 3) + ') ' + digits.slice(3, 6) + '-' + digits.slice(6);
+  }
+
+  function cqbUniqSort(arr) {
+    var seen = {}, out = [];
+    arr.forEach(function (x) {
+      if (x === null || x === undefined) return;
+      var s = String(x).trim();
+      if (!s || seen[s]) return;
+      seen[s] = 1; out.push(s);
+    });
+    return out.sort();
+  }
+
+  /* expr3's decode table, reproduced exactly. */
+  var CQB_LUCODE = {
+    11: 'Single Family Detached', 12: 'Duplex', 13: 'Single Family Attached', 14: 'Apartments',
+    15: 'Group Quarters', 16: 'Special Housing', 17: 'Mobile Homes, Parks and Courts',
+    21: 'Commercial - NEC', 22: 'Commercial w/Residential Units Above', 23: 'Parking Lot',
+    24: 'Parking Garage', 31: 'Light Industrial', 32: 'Heavy Industrial', 33: 'Utility Facility',
+    34: 'Railroad', 35: 'Airports', 41: 'Public & Semi-Public NEC', 42: 'Educational Institutions',
+    43: 'Churches, Synagogues and Temples', 44: 'Hospitals', 51: 'Park Land', 52: 'Open Space',
+    53: 'Golf Courses', 61: 'Lakes', 62: 'Streams and Creeks', 63: 'Wetlands',
+    64: 'Environmental Preserve', 65: 'Forest/Woodlands', 71: 'Public Right of Way',
+    72: 'Vacated ROW', 81: 'Agricultural Production:Crops/Tree Farms',
+    82: 'Agricultural Production: Livestock & Animal/Feed Lots', 83: 'Mining and Extraction',
+    84: 'Pasture/Grassland', 90: 'Vacant'
+  };
+
+  /* One entry per repairable row. `fields` is what we ask the service for; `format`
+   * turns the returned features into the exact string the Arcade would have produced,
+   * including its empty-case fallback. */
+  var CQB_REPAIRS = {
+    'Zoning': {
+      layer: 'Zoning', fields: 'ZONE',
+      format: function (fs) {
+        var vals = cqbUniqSort(fs.map(function (f) { return f.attributes.ZONE; }));
+        return vals.length ? vals.join(', ') : 'Unknown';           /* expr1 */
+      }
+    },
+    'Floodplain': {
+      layer: 'FEMA Floodplain', fields: 'FLD_ZONE,FLOODWAY',
+      format: function (fs) {
+        var parts = [];
+        fs.forEach(function (f) {
+          if (f.attributes.FLD_ZONE === 'AE') {
+            parts.push('100-Year Floodplain (Zone AE)');
+            if (f.attributes.FLOODWAY === 'FLOODWAY') parts.push('FLOODWAY');
+          }
+        });
+        return parts.length ? cqbUniqSort(parts).join(' + ') : 'None mapped';   /* expr16 */
+      }
+    },
+    'Existing use': {
+      layer: 'Existing Land Use (Planning)', fields: 'LUCODE',
+      format: function (fs) {
+        var vals = cqbUniqSort(fs.map(function (f) {
+          var c = f.attributes.LUCODE;
+          return CQB_LUCODE[c] || (c === null || c === undefined ? null : 'Other');
+        }));
+        return vals.length ? vals.join(', ') : 'No Existing Landuse Values Determined';  /* expr3 */
+      }
+    },
+    'Future use': {
+      layer: 'Future Land Use (2050 Comp Plan)', fields: 'CAT',
+      format: function (fs) {
+        return cqbUniqSort(fs.map(function (f) { return f.attributes.CAT; })).join(', ');  /* expr17 */
+      }
+    },
+    'Growth tier': {
+      layer: 'Growth Tiers (2050 Comp Plan)', fields: 'Tier',
+      format: function (fs) {
+        var vals = cqbUniqSort(fs.map(function (f) { return f.attributes.Tier; }));
+        return vals.length ? vals.join(', ') : '—';             /* expr18 */
+      }    },
+    /* ---- v3.7: the rest of the rows that can hit the same platform bug ----
+     * Each reproduces its Arcade expression exactly, including which ones Sort and which
+     * only Distinct, and each expression's own empty-case string -- those differ per row
+     * ('None', '', 'N/A', an em-dash) and getting them wrong would be a silent rewrite of
+     * what the popup says. */
+    'Applications': {
+      layer: 'Applications', fields: 'APPNUM',
+      format: function (fs) {
+        var vals = cqbUniqSort(fs.map(function (f) { return f.attributes.APPNUM; }));
+        return vals.length ? vals.join(', ') : 'None';                       /* expr4 */
+      }
+    },
+    'Project': {
+      layer: 'Final Approved Plans', fields: 'Title',
+      format: function (fs) { return cqbUniqSort(fs.map(function (f) { return f.attributes.Title; })).join(', '); }   /* expr8 */
+    },
+    'Approved plan': {
+      layer: 'Final Approved Plans', fields: 'APPNUM',
+      format: function (fs) { return cqbUniqSort(fs.map(function (f) { return f.attributes.APPNUM; })).join(', '); }  /* expr5 */
+    },
+    'Amendment': {
+      layer: 'Final Approved Plans', fields: 'ApproveApp',
+      format: function (fs) { return cqbUniqSort(fs.map(function (f) { return f.attributes.ApproveApp; })).join(', '); } /* expr7 */
+    },
+    'Parent app': {
+      layer: 'Final Approved Plans', fields: 'ParentApp',
+      format: function (fs) { return cqbUniqSort(fs.map(function (f) { return f.attributes.ParentApp; })).join(', '); } /* expr6 */
+    },
+    'Subdiv. permit': {
+      layer: 'City Subdivision Permits', fields: 'PermitNo',
+      format: function (fs) { return cqbUniqSort(fs.map(function (f) { return f.attributes.PermitNo; })).join(', '); } /* expr15 */
+    },
+    'Annex. agmt.': {
+      layer: 'Annexation Agreements', fields: 'RESNO',
+      format: function (fs) { return cqbUniqSort(fs.map(function (f) { return f.attributes.RESNO; })).join(', '); }   /* expr14 */
+    },
+    'Fire': {
+      layer: 'Fire Districts', fields: 'Dist_Name',
+      format: function (fs) {
+        var vals = cqbUniqSort(fs.map(function (f) { return f.attributes.Dist_Name; }));
+        return vals.length ? vals.join(', ') : 'N/A';                        /* expr26 */
+      }
+    },
+    'Area planner': {
+      layer: 'Development Review Areas', fields: 'Region,Planner,Phone',
+      format: function (fs) {
+        var parts = [];
+        fs.forEach(function (f) {
+          var a = f.attributes;
+          var n = a.Region === 'Village' ? 'Village of ' + a.Planner : a.Planner;
+          if (a.Phone !== null && a.Phone !== undefined && String(a.Phone).trim() !== '') n = n + ' · ' + cqbPhone(a.Phone);
+          if (n) parts.push(n);
+        });
+        return parts.length ? cqbUniq(parts).join(', ') : '—';          /* expr50: Distinct, not Sort */
+      }
+    },
+    'Case planner': {
+      layer: 'Applications View', fields: 'PLANNER_ASSIGNED',
+      format: function (fs) {
+        var vals = [];
+        fs.forEach(function (f) {
+          var p = f.attributes.PLANNER_ASSIGNED;
+          if (p !== null && p !== undefined && String(p).trim() !== '') vals.push(p);
+        });
+        return cqbUniqSort(vals).join(', ');                                 /* expr52 */
+      }
+    }
+  };
+
+  /* the five Inspector rows are one shape; generated so a discipline cannot be half-wired */
+  ['Building', 'Electrical', 'Housing', 'Mechanical', 'Plumbing'].forEach(function (disc) {
+    CQB_REPAIRS[disc] = {
+      layer: 'Inspector Areas - ' + disc, fields: 'InspectorName,PhoneNumber',
+      format: function (fs) {
+        var parts = [];
+        fs.forEach(function (f) {
+          var a = f.attributes;
+          if (a.InspectorName === null || a.InspectorName === undefined || String(a.InspectorName).trim() === '') return;
+          var n = String(a.InspectorName).trim();
+          if (a.PhoneNumber !== null && a.PhoneNumber !== undefined && String(a.PhoneNumber).trim() !== '') n = n + ' \u00b7 ' + cqbPhone(a.PhoneNumber);
+          parts.push(n);
+        });
+        return parts.length ? cqbUniq(parts).join(', ') : '\u2014';        /* expr57-61: Distinct, not Sort */
+      }
+    };
+  });
+
+  /* The Arcade shrinks the parcel 10 ft inward before intersecting so a boundary that
+   * coincides with a zoning line doesn't drag in the neighbour. No geometryEngine is
+   * reachable from the page, so approximate it by pulling every vertex toward the ring
+   * centroid. Web Mercator exaggerates distance by 1/cos(latitude), so convert first.
+   * Only used to disambiguate a multi-value result -- see cqbLookup. */
+  function cqbShrink(geom, feet) {
+    if (!geom || !geom.rings || !geom.rings.length) return geom;
+    var lat = 2 * Math.atan(Math.exp(geom.rings[0][0][1] / 6378137)) - Math.PI / 2;
+    var d = (feet * 0.3048) / Math.max(0.2, Math.cos(lat));
+    var rings = geom.rings.map(function (ring) {
+      var cx = 0, cy = 0;
+      ring.forEach(function (p) { cx += p[0]; cy += p[1]; });
+      cx /= ring.length; cy /= ring.length;
+      return ring.map(function (p) {
+        var dx = p[0] - cx, dy = p[1] - cy, len = Math.sqrt(dx * dx + dy * dy);
+        if (len <= d * 1.5) return [p[0], p[1]];   /* too small to shrink safely */
+        var k = (len - d) / len;
+        return [cx + dx * k, cy + dy * k];
+      });
+    });
+    return { rings: rings, spatialReference: geom.spatialReference };
+  }
+
+  function cqbParcelGeom(pid) {
+    if (cqbGeomCache[pid]) return Promise.resolve(cqbGeomCache[pid]);
+    return cqbQuery(CQB_SVC + '/Assessor/TaxParcels/MapServer/0', {
+      where: "PARCELID='" + String(pid).replace(/'/g, "''") + "'",
+      outSR: '3857', returnGeometry: 'true', outFields: 'PARCELID', resultRecordCount: '1'
+    }).then(function (r) {
+      var g = r.features && r.features[0] && r.features[0].geometry;
+      if (g) cqbGeomCache[pid] = g;
+      return g;
+    });
+  }
+
+  function cqbLookup(pid, label) {
+    var key = pid + '|' + label;
+    if (cqbValueCache[key] !== undefined) return Promise.resolve(cqbValueCache[key]);
+    if (cqbInFlight[key]) return cqbInFlight[key];
+    var spec = CQB_REPAIRS[label];
+    var url = spec && cqbResolveLayer(spec.layer);
+    if (!url) return Promise.resolve(null);
+
+    var p = cqbParcelGeom(pid).then(function (geom) {
+      if (!geom) return null;
+      function run(g) {
+        return cqbQuery(url, {
+          geometry: JSON.stringify(g), geometryType: 'esriGeometryPolygon', inSR: '3857',
+          spatialRel: 'esriSpatialRelIntersects', returnGeometry: 'false',
+          outFields: spec.fields, resultRecordCount: '50'
+        }).then(function (r) { return (r && r.features) || []; });
+      }
+      return run(geom).then(function (feats) {
+        /* Exactly one distinct answer means the -10 ft buffer could not have changed it,
+         * so skip the approximation entirely. Only disambiguate when it actually matters. */
+        var distinct = cqbUniqSort(feats.map(function (f) {
+          return spec.fields.split(',').map(function (k) { return f.attributes[k]; }).join('');
+        }));
+        if (distinct.length <= 1) return spec.format(feats);
+        return run(cqbShrink(geom, 10)).then(function (inner) {
+          return spec.format(inner.length ? inner : feats);
+        });
+      });
+    }).then(function (val) {
+      cqbValueCache[key] = val;
+      delete cqbInFlight[key];
+      return val;
+    }).catch(function () { delete cqbInFlight[key]; return null; });
+
+    cqbInFlight[key] = p;
+    return p;
+  }
+
+  function cqbPidOf(panel) {
+    var desc = panel.querySelector('[data-test="description-value"]');
+    var m = desc && (desc.textContent || '').match(/PID\s*([0-9]{8,16})/);
+    return m ? m[1] : null;
+  }
+
+  /* Which repair applies to the element holding this "#INVALID"? Row values are in a
+   * <tr> whose first <td> is the label; the FEMA banner is a <div> with its own text. */
+  function cqbLabelFor(el) {
+    var row = el.closest && el.closest('tr');
+    if (row) {
+      var td = row.querySelector('td');
+      if (td) {
+        var l = (td.textContent || '').trim();
+        if (CQB_REPAIRS[l]) return l;
+      }
+    }
+    /* Some values are not table rows at all but inline "Label: <strong>value</strong>"
+     * (Fire, Area planner, Case planner). Key off the text immediately before the <strong>. */
+    if (el && el.tagName === 'STRONG') {
+      var prev = el.previousSibling, txt = '';
+      while (prev && txt.length < 40) {
+        if (prev.nodeType === 3) txt = prev.nodeValue + txt;
+        else if (prev.nodeType === 1) txt = (prev.textContent || '') + txt;
+        prev = prev.previousSibling;
+      }
+      var m2 = txt.replace(/\s+/g, ' ').match(/([A-Za-z][A-Za-z .]{1,18}):\s*$/);
+      if (m2) {
+        var inline = m2[1].trim();
+        if (CQB_REPAIRS[inline]) return inline;
+      }
+    }
+    var node = el;
+    for (var i = 0; i < 4 && node; i++) {
+      var t = (node.textContent || '').trim();
+      if (t.indexOf('⚠ FEMA:') === 0) return 'Floodplain';
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  function repairInvalidValues(panel) {
+    if (!isDevInfoPanel(panel)) return;
+    var pid = cqbPidOf(panel);
+    if (!pid) return;
+    var desc = panel.querySelector('[data-test="description-value"]');
+    if (!desc) return;
+    var walker = document.createTreeWalker(desc, NodeFilter.SHOW_TEXT, null);
+    var targets = [], n;
+    while ((n = walker.nextNode())) {
+      if (n.nodeValue.indexOf('#INVALID') !== -1 && !n.__cqbRepairing) targets.push(n);
+    }
+    targets.forEach(function (node) {
+      var el = node.parentElement;
+      if (!el) return;
+      var label = cqbLabelFor(el);
+      if (!label) return;
+      node.__cqbRepairing = true;
+      cqbLookup(pid, label).then(function (val) {
+        if (val === null || val === undefined) { node.__cqbRepairing = false; return; }
+        if (!node.parentElement || !document.contains(node)) return;  /* panel re-rendered under us */
+        node.nodeValue = node.nodeValue.replace(/#INVALID/g, val);
+        var mark = node.parentElement;
+        mark.style.borderBottom = '1px dotted #7cc4ff';
+        mark.title = 'Recovered by Quick Bar: the app\'s own lookup for this field failed '
+          + '(a known VertiGIS bug), so this value was read straight from the '
+          + 'map service instead.';
+      });
+    });
+  }
+
+
+  /* ---- 5d. the DATS Report menu item (v3.6) ----------------------------------------------
+   * "I want to... > DATS Report" runs VertiGIS workflow item e40e25c0d0d74553b81c041160672b58,
+   * which is not shared publicly. For an anonymous visitor the workflow runtime loads and then
+   * nothing happens at all -- no message, no error, just a menu item that does nothing.
+   *
+   * This does NOT blanket-hide it. It asks the portal whether this session can actually reach
+   * the item, and hides it only when the answer is no, so anyone signed in keeps the feature.
+   * Note the check: ArcGIS reports the refusal as {"error":{"code":403}} in the BODY of an
+   * HTTP 200 response, so testing response.ok would report success -- verified live. */
+  var CQB_DATS_ITEM = 'e40e25c0d0d74553b81c041160672b58';
+  var cqbDatsBlocked = null;            /* null = not known yet; true = unusable; false = fine */
+  function cqbProbeDats() {
+    if (window.__cqbDatsProbed) return;
+    window.__cqbDatsProbed = true;
+    fetch('https://gis.lincoln.ne.gov/portal/sharing/rest/content/items/' + CQB_DATS_ITEM + '?f=json',
+      { credentials: 'include' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) { cqbDatsBlocked = !!(j && j.error); })
+      .catch(function () { cqbDatsBlocked = null; });   /* unknown -> leave the menu alone */
+  }
+  function gateDatsMenuItem() {
+    if (localStorage.getItem('__claude_qb_nodats') === '1') return;
+    cqbProbeDats();
+    if (cqbDatsBlocked !== true) return;                /* usable, or not yet known: never hide */
+    document.querySelectorAll('[role="menuitem"]').forEach(function (mi) {
+      if ((mi.textContent || '').indexOf('DATS Report') !== 0) return;
+      if (mi.style.display !== 'none') mi.style.display = 'none';
+    });
+  }
+
+  function fixAllFeatureDetailPanels() {
+    document.querySelectorAll('.gcx-feature-details').forEach(function (p) {
+      fixObliqueButton(p);
+      try { repairInvalidValues(p); } catch (e) { /* never let a repair break the bar */ }
+    });
+    try { maintainSearchGroup(); } catch (e) { /* the search box must survive our mistakes */ }
+    try { gateDatsMenuItem(); } catch (e) { /* nor must the "I want to..." menu */ }
+  }
+  var featureObsTimer = null;
+  if (window.MutationObserver) {
+    var fo = new MutationObserver(function () {
+      /* debounce: a result render touches the DOM many times in quick succession */
+      if (featureObsTimer) clearTimeout(featureObsTimer);
+      featureObsTimer = setTimeout(fixAllFeatureDetailPanels, 150);
+    });
+    fo.observe(document.body, { childList: true, subtree: true, characterData: true });
+    window.__cqbFeatureObserver = fo;
+  }
+  fixAllFeatureDetailPanels();
+
+  function periodicMaintenance() {
+    refresh();
+    fixAriaLabels();
+    annotateEmptyLegend();
+  }
+  periodicMaintenance();
+  window.__cqbRefreshTimer = setInterval(periodicMaintenance, 1500);
+
+  /* ---- 6. Find Parcel card + Settings popover ---- */
+  var SVC = 'https://gis.lincoln.ne.gov/public/rest/services';
+  function q(path, params) {
+    return fetch(SVC + path + '/query', { method: 'POST', body: new URLSearchParams(Object.assign({ f: 'json' }, params)) })
+      .then(function (r) { return r.json(); });
+  }
+  function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/'/g, '&#39;'); }
+  function card(html) {
+    var oldc = document.getElementById('cqb-card'); if (oldc) oldc.remove();
+    var d = document.createElement('div');
+    d.id = 'cqb-card';
+    d.setAttribute('role', 'dialog');
+    d.setAttribute('aria-label', 'Parcel record card');
+    d.style.cssText = 'position:fixed;top:56px;right:12px;z-index:99998;width:min(330px,92vw);max-height:calc(100vh - 140px);overflow-y:auto;background:#141a22;border:1px solid #2c3a4d;border-radius:8px;padding:12px;color:#e8eef5;font:12px "Segoe UI",sans-serif;box-shadow:0 4px 18px rgba(0,0,0,.6);line-height:1.45;';
+    d.innerHTML = html;
+    var close = document.createElement('div');
+    close.style.cssText = 'text-align:right;margin-top:8px;';
+    close.innerHTML = "<span role='button' tabindex='0' id='cqb-card-x' style='cursor:pointer;color:#a9bccf;padding:2px 10px;border:1px solid #2c3a4d;border-radius:4px;'>close</span>";
+    d.appendChild(close);
+    document.body.appendChild(d);
+    var cx = document.getElementById('cqb-card-x');
+    cx.onclick = function () { d.remove(); };
+    cx.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); d.remove(); } });
+    document.addEventListener('keydown', function esck(ev) { if (ev.key === 'Escape') { d.remove(); document.removeEventListener('keydown', esck); } });
+    return d;
+  }
+  function row(label, val) {
+    if (!val) return '';
+    return "<tr><td style='color:#8fa3ba;padding:1px 6px 1px 0;vertical-align:top;white-space:nowrap;'>" + label + "</td><td style='color:#fff;font-weight:bold;'>" + val + "</td></tr>";
+  }
+
+  /* Settings popover */
+  function openSettings() {
+    var avail = [];
+    v.map.allLayers.forEach(function (l) {
+      if (!l.title) return;
+      if (l.opacity === 0) return; /* helper/locator layers */
+      if (l.listMode === 'hide') return; /* internal helper layers (e.g. Development Review Areas) */
+      if (l.title === 'Development Information') return;
+      if (cfg.some(function (qc) { return qc.t === l.title; })) return;
+      if (avail.indexOf(l.title) < 0) avail.push(l.title);
+    });
+    avail.sort();
+    var rows = cfg.map(function (qc, i) {
+      return "<tr data-i='" + i + "'><td style='padding:3px 4px;'><input data-f='l' value=\"" + esc(qc.l) + "\" style='width:70px;background:#0e131a;color:#fff;border:1px solid #2c3a4d;border-radius:4px;padding:2px 4px;'/></td>" +
+        "<td style='padding:3px 4px;color:#8fa3ba;font-size:11px;'>" + esc(qc.t) + "</td>" +
+        "<td style='padding:3px 4px;'><span role='button' tabindex='0' class='cqb-rm' data-i='" + i + "' style='cursor:pointer;color:#ff9a9a;padding:1px 6px;'>remove</span></td></tr>";
+    }).join('');
+    var options = avail.map(function (t) { return "<option value=\"" + esc(t) + "\">" + esc(t) + '</option>'; }).join('');
+    var d = card(
+      "<b>Configure Quick Bar layers</b>" +
+      "<table style='width:100%;border-collapse:collapse;margin:8px 0;' id='cqb-cfg-rows'>" + rows + '</table>' +
+      (avail.length
+        ? "<div style='margin-top:6px;padding-top:6px;border-top:1px solid #2c3a4d;'>" +
+          "<select id='cqb-add-sel' style='background:#0e131a;color:#fff;border:1px solid #2c3a4d;border-radius:4px;padding:2px 4px;max-width:55%;'>" + options + '</select> ' +
+          "<input id='cqb-add-label' placeholder='chip label' style='width:70px;background:#0e131a;color:#fff;border:1px solid #2c3a4d;border-radius:4px;padding:2px 4px;'/> " +
+          "<span role='button' tabindex='0' id='cqb-add-btn' style='cursor:pointer;color:#7cc4ff;padding:1px 8px;border:1px solid #2c3a4d;border-radius:4px;'>add</span>" +
+          '</div>'
+        : "<div style='color:#6f8bb0;font-size:11px;'>No more un-configured layers found.</div>") +
+      "<div style='margin-top:8px;'><span role='button' tabindex='0' id='cqb-save-btn' style='cursor:pointer;background:#1b5e20;color:#d7ffd9;padding:3px 10px;border-radius:4px;margin-right:6px;'>Save</span>" +
+      "<span role='button' tabindex='0' id='cqb-reset-btn' style='cursor:pointer;color:#ffcf87;padding:3px 10px;'>Reset to defaults</span></div>" +
+      "<div style='margin-top:10px;padding-top:8px;border-top:1px solid #2c3a4d;color:#6f8bb0;font-size:11px;line-height:1.5;'>" +
+      "<b style='color:#a9bccf;'>Shared links</b><br/>The Link chip needs to know this app's normal startup layers so it can " +
+      "describe your changes to someone who does not have the toolkit. It records that the first time the bar runs on a " +
+      "freshly-opened viewer. If you first ran it after already changing layers, reload the viewer and recalibrate.<br/>" +
+      "<span role='button' tabindex='0' id='cqb-recal-btn' style='display:inline-block;margin-top:6px;cursor:pointer;color:#7cc4ff;padding:2px 8px;border:1px solid #2c3a4d;border-radius:4px;'>Recalibrate from the current layers</span></div>" +
+      "<div style='margin-top:10px;padding-top:8px;border-top:1px solid #2c3a4d;color:#6f8bb0;font-size:11px;line-height:1.5;'>" +
+      "<b style='color:#a9bccf;'>Parcels in the search box</b><br/>Adds a &ldquo;Development Information&rdquo; group of real parcel matches to the top of the app&rsquo;s own search dropdown.<br/>" +
+      "<span role='button' tabindex='0' id='cqb-sug-toggle' style='display:inline-block;margin-top:6px;cursor:pointer;color:#7cc4ff;padding:2px 8px;border:1px solid #2c3a4d;border-radius:4px;'>" +
+      (localStorage.getItem('__claude_qb_nosearch') === '1' ? 'Currently OFF &mdash; turn on' : 'Currently ON &mdash; turn off') + '</span></div>'
+    );
+    var sugBtn = d.querySelector('#cqb-sug-toggle');
+    if (sugBtn) sugBtn.onclick = function () {
+      var off = localStorage.getItem('__claude_qb_nosearch') === '1';
+      if (off) localStorage.removeItem('__claude_qb_nosearch'); else localStorage.setItem('__claude_qb_nosearch', '1');
+      try { cqbSugRemove(null); } catch (e) {}
+      d.remove();
+      toast('Parcel results in the search box: ' + (off ? 'on' : 'off'));
+    };
+    var recal = d.querySelector('#cqb-recal-btn');
+    if (recal) recal.onclick = function () {
+      if (!confirm('Record the layers that are on right now as this app\u2019s normal startup state?\n\nDo this on a freshly-loaded viewer you have not changed yet.')) return;
+      cqbCaptureBaseline(true); d.remove();
+      toast('Layer baseline recorded');
+    };
+    d.querySelectorAll('.cqb-rm').forEach(function (r) {
+      r.onclick = function () { cfg.splice(+r.getAttribute('data-i'), 1); saveCfg(); renderChips(); d.remove(); openSettings(); };
+    });
+    var addBtn = d.querySelector('#cqb-add-btn');
+    if (addBtn) addBtn.onclick = function () {
+      var sel = d.querySelector('#cqb-add-sel'), lab = d.querySelector('#cqb-add-label');
+      var t = sel.value, l = (lab.value || t.slice(0, 8)).trim();
+      if (!t) return;
+      cfg.push({ k: 'c' + Date.now(), t: t, l: l });
+      saveCfg(); renderChips(); d.remove(); openSettings();
+    };
+    var saveBtn = d.querySelector('#cqb-save-btn');
+    saveBtn.onclick = function () {
+      d.querySelectorAll('#cqb-cfg-rows tr').forEach(function (tr) {
+        var i = +tr.getAttribute('data-i');
+        var inp = tr.querySelector('input[data-f="l"]');
+        if (inp && cfg[i]) cfg[i].l = inp.value.trim() || cfg[i].l;
+      });
+      saveCfg(); renderChips(); d.remove();
+      toast('Chip labels saved');
+    };
+    d.querySelector('#cqb-reset-btn').onclick = function () {
+      if (!confirm('Reset to the default 7 layers? This clears your custom chip configuration.')) return;
+      cfg = DEFAULTS.slice(); saveCfg(); renderChips(); d.remove();
+      toast('Reset to default layers');
+    };
+  }
+
+  /* Find Parcel: search -> (single result | picker) -> record card */
+  function findParcel(text, opts) {
+    var inp = document.querySelector('input[placeholder*="Search" i], .gcx-search input');
+    var term = (text || (inp && inp.value) || '').trim();
+    if (!term) term = prompt('Address or parcel ID:') || '';
+    term = term.trim();
+    if (!term) return;
+    var clean = term.replace(/'/g, "''").toUpperCase();
+    var where = /^\d{10,14}$/.test(clean)
+      ? "PARCELID = '" + clean + "'"
+      : "UPPER(SITEADDRESS) LIKE '" + clean.split(',')[0] + "%'";
+    card('<b>Find Parcel</b><br/>Searching for &ldquo;' + esc(term) + '&rdquo; &hellip;');
+    q('/Assessor/TaxParcels/MapServer/0', { where: where, outSR: '3857', returnGeometry: 'true',
+      outFields: 'PARCELID,SITEADDRESS,OWNERNME1,GIS_AREA,PRPRTYDSCRP,CLASSDSCRP,RESYRBLT,RESSTRTYP,RESFLRAREA,CNTASSDVAL,CNVYNAME', resultRecordCount: '8' })
+    .then(function (pj) {
+      if (!pj.features || !pj.features.length) { card('<b>Find Parcel</b><br/>No parcel found for &ldquo;' + esc(term) + '&rdquo;. Try the street number + name only, or a 13-digit PID.'); return; }
+      if (pj.features.length === 1) { showParcel(pj.features[0], 1, opts); return; }
+      showPicker(pj.features, term);
+    }).catch(function (e) { card('<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e)); });
+  }
+
+  /* multiple address/PID matches: let the user pick which parcel before loading the full card */
+  function showPicker(feats, term) {
+    var rows = feats.map(function (f, i) {
+      var a = f.attributes;
+      return "<tr data-i='" + i + "' class='cqb-pick' role='button' tabindex='0' style='cursor:pointer;border-bottom:1px solid #232b36;'>" +
+        "<td style='padding:5px 4px;color:#fff;'>" + esc(a.SITEADDRESS || 'PID ' + a.PARCELID) + '</td>' +
+        "<td style='padding:5px 4px;color:#8fa3ba;font-size:11px;text-align:right;'>" + esc(a.PARCELID) + '</td></tr>';
+    }).join('');
+    var d = card('<b>Find Parcel</b><br/>' + feats.length + ' matches for &ldquo;' + esc(term) + '&rdquo; &mdash; pick one:' +
+      "<table style='width:100%;border-collapse:collapse;margin-top:6px;'>" + rows + '</table>');
+    function pick(i) { showParcel(feats[i], feats.length); }
+    d.querySelectorAll('.cqb-pick').forEach(function (tr) {
+      tr.onclick = function () { pick(+tr.getAttribute('data-i')); };
+      tr.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); pick(+tr.getAttribute('data-i')); } });
+    });
+  }
+
+  /* full record card for one chosen parcel feature */
+  function showParcel(f, matchCount, opts) {
+    var at = f.attributes;
+    window.__cqbLastPid = at.PARCELID || window.__cqbLastPid;
+    var g = f.geometry;
+    var ring = g.rings[0];
+    var xs = ring.map(function (p) { return p[0]; }), ys = ring.map(function (p) { return p[1]; });
+    var ext = { xmin: Math.min.apply(0, xs), ymin: Math.min.apply(0, ys), xmax: Math.max.apply(0, xs), ymax: Math.max.apply(0, ys) };
+    var cx0 = (ext.xmin + ext.xmax) / 2, cy0 = (ext.ymin + ext.ymax) / 2;
+    var pad = Math.max(ext.xmax - ext.xmin, ext.ymax - ext.ymin) * 0.8 + 30;
+    if (!(opts && opts.noZoom)) {
+      v.center = { x: cx0, y: cy0, spatialReference: v.spatialReference };
+      v.scale = Math.max(1000, pad * 8);
+    }
+    try {
+      v.graphics.removeAll();
+      v.graphics.add({ geometry: { type: 'polygon', rings: g.rings, spatialReference: g.spatialReference },
+        symbol: { type: 'simple-fill', color: [124, 196, 255, 0.12], outline: { color: [124, 196, 255, 1], width: 2.5 } } });
+    } catch (e) {}
+    var gp = JSON.stringify(g);
+    var lat = (Math.atan(Math.exp(cy0 / 6378137)) * 2 - Math.PI / 2) * 180 / Math.PI;
+    var lon = cx0 * 180 / 20037508.342787;
+    var geomP = { geometry: gp, geometryType: 'esriGeometryPolygon', spatialRel: 'esriSpatialRelIntersects', where: '1=1', returnGeometry: 'false' };
+    card('<b>Find Parcel</b><br/>Loading record for ' + esc(at.SITEADDRESS || at.PARCELID) + '&hellip;');
+    Promise.all([
+      q('/Planning/DevRevZoningandRegulations/MapServer/1', Object.assign({ outFields: 'ZONE' }, geomP)),
+      q('/LTUWatershed/FEMAFlood/MapServer/1', Object.assign({ outFields: 'FLD_ZONE,FLOODWAY' }, geomP)),
+      q('/Planning/DevRevLanduseAndGrowth/MapServer/12', Object.assign({ outFields: 'CAT' }, geomP)),
+      q('/Planning/DevRevLanduseAndGrowth/MapServer/13', Object.assign({ outFields: 'Tier' }, geomP)),
+      q('/Planning/DevReviewAreas/MapServer/0', Object.assign({ outFields: 'Region,Planner,Phone' }, geomP)),
+      q('/Planning/DevRevAPPLICATIONS/MapServer/1', Object.assign({ outFields: 'APPNUM,STATUS,PLANNER_ASSIGNED,HYPERLINK', resultRecordCount: '8' }, geomP)),
+      q('/Planning/HOANA2/MapServer/0', Object.assign({ outFields: 'na_name,first_name,last_name,phone,email', resultRecordCount: '10' }, geomP)).catch(function () { return { features: [] }; }),
+      q('/Planning/HOANA2/MapServer/1', Object.assign({ outFields: 'ASSOCNAME,SHORTNAME,first_name,last_name,phone,email', resultRecordCount: '10' }, geomP)).catch(function () { return { features: [] }; })
+    ]).then(function (rs) {
+      function vals(j, fld) {
+        var s = [];
+        (j.features || []).forEach(function (ff) { var vv = ff.attributes[fld]; if (vv != null && String(vv).trim() !== '' && s.indexOf(vv) < 0) s.push(vv); });
+        return s;
+      }
+      var zoning = vals(rs[0], 'ZONE').sort().join(', ');
+      var flood = (rs[1].features || []).some(function (ff) { return ff.attributes.FLD_ZONE === 'AE'; })
+        ? '100-yr (AE)' + ((rs[1].features || []).some(function (ff) { return (ff.attributes.FLOODWAY || '').trim() === 'FLOODWAY'; }) ? ' + FLOODWAY' : '')
+        : 'None mapped';
+      var flu = vals(rs[2], 'CAT').join(', ');
+      var tier = vals(rs[3], 'Tier').join(', ');
+      var planner = (rs[4].features || []).map(function (ff) {
+        var a = ff.attributes;
+        var n = a.Region === 'Village' ? 'Village of ' + a.Planner : a.Planner;
+        return a.Phone ? n + ' · ' + a.Phone : n;
+      }).filter(function (xv, i, arr) { return arr.indexOf(xv) === i; }).join(', ');
+      var apps = (rs[5].features || []).map(function (ff) {
+        var a = ff.attributes;
+        var lab = esc(a.APPNUM) + (a.STATUS ? ' · ' + esc(a.STATUS) : '') + (a.PLANNER_ASSIGNED ? ' · ' + esc(a.PLANNER_ASSIGNED) : '');
+        return a.HYPERLINK ? "<a href='" + esc(a.HYPERLINK) + "' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;'>" + lab + '</a>' : lab;
+      });
+      /* HOA/NA: field names confirmed live 2026-08-27 against Planning/HOANA2/0 ("Neighborhood
+         Association Contacts": na_name) and /1 ("Homeowner Association Contacts": ASSOCNAME/SHORTNAME);
+         both share first_name/last_name/phone/email for the contact person. */
+      var hoaFeats = (rs[6].features || []).concat(rs[7].features || []);
+      /* HOANA2 stores one feature per board contact, all sharing the same association name/boundary
+         (live-confirmed: Country Meadows HOA returned 3 features — Jeff Woita, Christine Kiewra, Steve
+         Lovell — for one parcel). Group by association name so multi-contact HOAs render as one line
+         with every distinct contact, instead of the same association name repeated per contact. */
+      var hoaGroups = {}, hoaOrder = [];
+      hoaFeats.forEach(function (ff) {
+        var a = ff.attributes;
+        var assoc = a.na_name || a.ASSOCNAME || a.SHORTNAME || '';
+        var key = assoc || ' ';
+        if (!hoaGroups[key]) { hoaGroups[key] = { assoc: assoc, contacts: [] }; hoaOrder.push(key); }
+        var contact = [a.first_name, a.last_name].filter(Boolean).join(' ');
+        var bits = [];
+        if (contact) bits.push(contact);
+        if (a.phone) bits.push(a.phone);
+        if (a.email) bits.push(a.email);
+        var line = bits.join(' · ');
+        if (line && hoaGroups[key].contacts.indexOf(line) < 0) hoaGroups[key].contacts.push(line);
+      });
+      var hoa = hoaOrder.map(function (key) {
+        var grp = hoaGroups[key];
+        if (!grp.assoc && !grp.contacts.length) return '';
+        return esc(grp.assoc || 'Association') + (grp.contacts.length ? ' — ' + esc(grp.contacts.join('; ')) : '');
+      }).filter(Boolean);
+      var ac = Math.round(at.GIS_AREA / 43560 * 100) / 100;
+      var built = at.RESYRBLT ? Math.round(at.RESYRBLT) + (at.RESSTRTYP ? ' · ' + esc(at.RESSTRTYP) : '') : '';
+      var money = at.CNTASSDVAL ? '$' + Math.round(at.CNTASSDVAL).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') : '';
+      var flr = at.RESFLRAREA ? Math.round(at.RESFLRAREA).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' ft²' : '';
+      var B = "display:inline-block;background:#24354d;color:#cfe8ff;text-decoration:none;font-size:11px;font-weight:bold;padding:4px 8px;border-radius:4px;margin:0 4px 4px 0;";
+      card(
+        "<div style='font-size:13px;font-weight:bold;color:#fff;'>" + esc(at.SITEADDRESS || 'Parcel ' + at.PARCELID) + '</div>' +
+        "<div style='color:#8fa3ba;margin:1px 0 6px 0;'>PID " + esc(at.PARCELID) + ' · ' + esc(at.OWNERNME1 || '') + '</div>' +
+        "<table style='width:100%;border-collapse:collapse;'>" +
+        row('Zoning', esc(zoning)) + row('Floodplain', esc(flood)) + row('Future use', esc(flu)) + row('Growth tier', esc(tier)) +
+        row('Area', ac + ' ac') + row('Class', esc(at.CLASSDSCRP)) + row('Built', built) + row('Floor area', flr) + row('Assessed', money) +
+        row('Area planner', esc(planner)) +
+        '</table>' +
+        (apps.length ? "<div style='color:#6f8bb0;font-size:10px;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;margin:7px 0 3px 0;'>APPLICATIONS</div><div style='line-height:1.7;'>" + apps.join('<br/>') + '</div>' : '') +
+        (hoa.length ? "<div style='color:#6f8bb0;font-size:10px;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;margin:7px 0 3px 0;'>HOA / NEIGHBORHOOD ASSOC.</div><div style='line-height:1.6;font-size:11px;'>" + hoa.join('<br/>') + '</div>' : '') +
+        "<div style='margin-top:8px;border-top:1px solid #2c3a4d;padding-top:7px;'>" +
+        "<a style='" + B + "' target='_blank' rel='noopener noreferrer' href='https://orion.lancaster.ne.gov/appraisal/publicaccess/PropertyDetail.aspx?PropertyNumber=" + esc(at.PARCELID) + "'>Assessor</a>" +
+        "<a style='" + B + "' target='_blank' rel='noopener noreferrer' href='https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent((at.SITEADDRESS || '') + ', Lancaster County, NE') + "'>Google Maps</a>" +
+        "<a style='" + B + "' target='_blank' rel='noopener noreferrer' href='https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=" + lat.toFixed(6) + ',' + lon.toFixed(6) + "'>Street View</a>" +
+        '</div>' +
+        "<div style='color:#6f8bb0;font-size:10px;margin-top:6px;'>Parcel is highlighted on the map - click it for the full Development Information popup." + (matchCount > 1 ? ' (' + matchCount + ' parcels matched this search.)' : '') + '</div>'
+      );
+    }).catch(function (e) { card('<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e)); });
+  }
+  window.__qbFindParcel = findParcel;
+
+  function toast(msg) {
+    var e = document.createElement('div');
+    e.setAttribute('role', 'status');
+    e.textContent = msg;
+    e.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:99999;background:#1b5e20;color:#fff;padding:8px 14px;border-radius:6px;font:13px sans-serif';
+    document.body.appendChild(e);
+    setTimeout(function () { e.remove(); }, 2200);
+  }
+  toast('Quick Bar ready - popup applied, locators paused');
+  try { cqbApplyIncomingLink(); } catch (e) { /* a malformed shared link must never break the bar */ }
+
+  /* ---- 7. startup self-check (v3.7) ----
+   * The popup's Arcade returns a bare em-dash when a lookup layer is absent, which is how the
+   * V1.1 Inspector regression hid for a week: no error, no console message, just five rows that
+   * quietly said nothing. If a layer this toolkit is responsible for is missing after startup,
+   * say so out loud rather than letting the popup shrug. */
+  setTimeout(function () {
+    try {
+      var missing = CQB_LOOKUP_LAYERS.filter(function (spec) {
+        return !v.map.allLayers.some(function (l) { return l.title === spec.title; });
+      }).map(function (spec) { return spec.title; });
+      if (!missing.length) return;
+      console.warn('[Quick Bar] ' + missing.length + ' hidden lookup layer(s) missing - the popup rows that need them will show an em-dash: ' + missing.join(', '));
+      toast('Quick Bar: ' + missing.length + ' lookup layer(s) unavailable - some popup rows will be blank');
+    } catch (e) { /* a self-check must never be the thing that breaks */ }
+  }, 4000);
+}
+})();
