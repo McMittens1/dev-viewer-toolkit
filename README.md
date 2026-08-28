@@ -18,6 +18,16 @@ By default it talks only to `gis.lincoln.ne.gov`. One optional feature is the ex
   Everything the county serves is Web Mercator, which is not a survey projection: at Lincoln's latitude it stretches distance by about 32%, so a lot taken straight from those coordinates is a third too big. Measured on parcel `1435300004000`: **338,050 sq ft raw against a true 195,121**. Every request here asks for NAD83 Nebraska State Plane in US survey feet instead, which returned **195,023 against the Assessor's own 195,121 — 0.05%**.
 - **FEMA Zone A counted as floodplain.** Every flood test in the viewer asked only whether the FEMA zone was `AE`. The layer also carries 81 Zone A polygons — Zone A is a Special Flood Hazard Area too, the same 100-year floodplain, differing only in having no determined base flood elevation. Measured 2026-08-28: 1,506 parcels intersect Zone A, and 39 of a 40-parcel spread sample touch Zone A **only**, so roughly 1,460 parcels were being told "None mapped" while sitting in the regulatory floodplain. The toolkit now reports them, and Find Parcel adds how much of the parcel is in the floodplain, computed with the county's own public geometry service. The same assumption is present in the stock app configuration and has been flagged for the GIS team.
 
+## Settings
+
+The **⚙** chip on the Quick Bar holds:
+
+- which layers appear as chips, and a reset to defaults
+- **Parcels in the search box** — on/off
+- **Recalibrate** the layer baseline used by shared links
+
+The **contours opt-in** is not here — it lives in the Site DXF dialog, on the contour checkbox itself, because that is the moment it matters. Hiding the unusable "DATS Report" menu item has no button; set `__claude_qb_nodats` to `1` in local storage to leave that menu alone.
+
 ## Contours and the one external call
 
 The Site DXF export can drape ground contours over a lot. The county has no elevation data to draw them from — every one of its 26 public service folders was checked, and there is no contour, DEM, lidar, terrain or survey-control layer anywhere. So contours come from the **USGS 3D Elevation Program** (`elevation.nationalmap.gov`), 1 m lidar-derived bare earth.
@@ -45,6 +55,15 @@ Updates install themselves from then on — this script declares an `@updateURL`
 
 The `extension/` folder in the release package is an unpacked Chrome/Edge extension that requests **no permissions at all**, only a host match for the viewer. Note that an unpacked extension does **not** auto-update — you replace the folder by hand for each release.
 
+## Performance
+
+Measured on the live viewer, comparing the same pan and zoom interactions with the toolkit's background work running and switched off:
+
+- Time to ready is unchanged — the toolkit finishes in the same instant the map view becomes ready, because it waits for the app and then takes milliseconds.
+- At rest it issues no network requests and does no DOM work.
+- Its one repeating timer costs about **0.008 ms every 1.5 seconds**, roughly 0.0005% of a core.
+- During panning and zooming it added **no long tasks and no measurable main-thread blocking** over a 26-second window.
+
 ## Uninstall
 
 Remove the script from Tampermonkey, then run this in the browser console on the viewer and reload:
@@ -61,6 +80,9 @@ The browser is back to the stock viewer. Nothing server-side was ever changed, s
 ## Notes
 
 - This is an unofficial, personal tool. It is not produced or endorsed by the City of Lincoln, Lancaster County, or their GIS department.
-- It reads only public REST endpoints that the viewer itself already uses. It contains no credentials and collects nothing.
+- **What it talks to.** Public ArcGIS REST services on `gis.lincoln.ne.gov`. Most are layers the viewer already loads, but not all — the site export additionally queries Soils, Assessor Encumbrances, Building Line Districts, the 2024 building footprints and the public `Utilities/Geometry` service, which the viewer does not use on its own. All are anonymous, read-only, public endpoints.
+- **One request sends your existing session cookie.** To decide whether to hide the “DATS Report” menu item, the toolkit asks the portal whether *this* session can open that workflow item (`portal/sharing/rest/content/items/…`, with `credentials: 'include'`). That is deliberate: it is the only way to tell a signed-in user who can use the feature from an anonymous visitor for whom it silently does nothing. It reads one item's metadata and nothing else. Set `__claude_qb_nodats` to `1` to skip it entirely.
+- It contains no credentials of its own, sets no cookies, and collects, stores and transmits nothing about you.
+- The parcel card includes ordinary outbound **links** to the Lancaster County Assessor and Google Maps/Street View. Those are links you click, not background requests — nothing is sent to either until you choose to open one.
 - The file is readable, unminified source — no build step, no minification, no code fetched at runtime. Everything it executes is in the file you are reading.
 - Two known problems belong to the vendor and the app configuration rather than to this toolkit, and are documented in the release package: the VertiGIS Arcade paging defect behind `#INVALID`, and a "DATS Report" menu item that is not shared publicly.
