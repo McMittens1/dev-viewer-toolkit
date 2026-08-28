@@ -26,7 +26,7 @@ The **⚙** chip on the Quick Bar holds:
 - **Parcels in the search box** — on/off
 - **Recalibrate** the layer baseline used by shared links
 
-The **contours opt-in** is not here — it lives in the Site DXF dialog, on the contour checkbox itself, because that is the moment it matters. Hiding the unusable "DATS Report" menu item has no button; set `__claude_qb_nodats` to `1` in local storage to leave that menu alone.
+The **contours opt-in** is not here — it lives in the Site DXF dialog, on the contour checkbox itself, because that is the moment it matters. Leaving the “DATS Report” menu item unlabelled has no button; set `__claude_qb_nodats` to `1` in local storage.
 
 ## Contours and the one external call
 
@@ -47,7 +47,7 @@ That is the only time this toolkit contacts anything other than `gis.lincoln.ne.
 2. Click **[DV_Toolkit.user.js](DV_Toolkit.user.js)** → **Raw**. Tampermonkey will offer to install it.
 3. Open the Development Viewer. The Quick Bar appears near the bottom of the map once the map finishes loading (this can take 30–45 seconds on a slow connection).
 
-If you install while the viewer is already open, **reload the page** — userscripts only inject at page load. To check it is running, press F12 and type `window.__dvToolkit`; you should get `{version: "1.8.0", ready: true}`.
+If you install while the viewer is already open, **reload the page** — userscripts only inject at page load. To check it is running, press F12 and type `window.__dvToolkit`; you should get `{version: "1.8.1", ready: true}`.
 
 Updates install themselves from then on — this script declares an `@updateURL`, so Tampermonkey checks this repository and upgrades in place.
 
@@ -81,8 +81,10 @@ The browser is back to the stock viewer. Nothing server-side was ever changed, s
 
 - This is an unofficial, personal tool. It is not produced or endorsed by the City of Lincoln, Lancaster County, or their GIS department.
 - **What it talks to.** Public ArcGIS REST services on `gis.lincoln.ne.gov`. Most are layers the viewer already loads, but not all — the site export additionally queries Soils, Assessor Encumbrances, Building Line Districts, the 2024 building footprints and the public `Utilities/Geometry` service, which the viewer does not use on its own. All are anonymous, read-only, public endpoints.
-- **One request sends your existing session cookie.** To decide whether to hide the “DATS Report” menu item, the toolkit asks the portal whether *this* session can open that workflow item (`portal/sharing/rest/content/items/…`, with `credentials: 'include'`). That is deliberate: it is the only way to tell a signed-in user who can use the feature from an anonymous visitor for whom it silently does nothing. It reads one item's metadata and nothing else. Set `__claude_qb_nodats` to `1` to skip it entirely.
-- It contains no credentials of its own, sets no cookies, and collects, stores and transmits nothing about you.
+- **No authenticated requests, and no cookies sent anywhere.** It contains no credentials, sends none, sets no cookies, and collects, stores and transmits nothing about you.
+- **The “DATS Report” menu item is labelled, not hidden.** That workflow is not shared publicly, so for an anonymous visitor it loads and then does nothing at all — no message, no error. The toolkit appends “User Authentication Required.” to its description, matching the wording the app already uses on its own two secure items.
+
+  Versions 1.6–1.8.0 instead tried to *detect* entitlement by probing the portal with `credentials: 'include'`. This app authenticates with **OAuth** — the credential lives in `localStorage` under `esriJSAPIOAuth`, and the only cookies on the domain are Google Analytics — so that request carried no authentication and returned 403 for every session. It therefore hid the menu item from exactly the signed-in staff entitled to run it. Confirmed live while signed in as a real portal user, then removed in 1.8.1. Set `__claude_qb_nodats` to `1` to leave the item completely untouched.
 - The parcel card includes ordinary outbound **links** to the Lancaster County Assessor and Google Maps/Street View. Those are links you click, not background requests — nothing is sent to either until you choose to open one.
 - The file is readable, unminified source — no build step, no minification, no code fetched at runtime. Everything it executes is in the file you are reading.
-- Two known problems belong to the vendor and the app configuration rather than to this toolkit, and are documented in the release package: the VertiGIS Arcade paging defect behind `#INVALID`, and a "DATS Report" menu item that is not shared publicly.
+- The `#INVALID` fields are a defect in the vendor's own bundle (a paged Arcade query that throws), not something this toolkit caused — it happens on the untouched stock viewer too. The real fix has to come from VertiGIS; this works around it.
