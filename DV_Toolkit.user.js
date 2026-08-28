@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.8.0
+// @version      1.8.1
 // @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar (v3.9) to the public Development Viewer: a CAD site-plan export (DXF) for Home Designer/Chief Architect/AutoCAD with optional USGS contours, building line and soils, FEMA Zone A, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
@@ -34,7 +34,7 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.8.0 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.8.1 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -52,7 +52,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.8.0', ready: false };
+  window.__dvToolkit = { version: '1.8.1', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -2995,33 +2995,53 @@ function cqbSiteExportDialog() {
   }
 
 
-  /* ---- 5d. the DATS Report menu item (v3.6) ----------------------------------------------
-   * "I want to... > DATS Report" runs VertiGIS workflow item e40e25c0d0d74553b81c041160672b58,
-   * which is not shared publicly. For an anonymous visitor the workflow runtime loads and then
-   * nothing happens at all -- no message, no error, just a menu item that does nothing.
+  /* ---- 5d. the DATS Report menu item (v3.10) -------------------------------------------
+   * "I want to... > DATS Report" runs VertiGIS workflow item
+   * e40e25c0d0d74553b81c041160672b58, which is not shared publicly. For an anonymous
+   * visitor the workflow runtime loads and then nothing happens at all -- no message, no
+   * error, just a menu item that does nothing.
    *
-   * This does NOT blanket-hide it. It asks the portal whether this session can actually reach
-   * the item, and hides it only when the answer is no, so anyone signed in keeps the feature.
-   * Note the check: ArcGIS reports the refusal as {"error":{"code":403}} in the BODY of an
-   * HTTP 200 response, so testing response.ok would report success -- verified live. */
-  var CQB_DATS_ITEM = 'e40e25c0d0d74553b81c041160672b58';
-  var cqbDatsBlocked = null;            /* null = not known yet; true = unusable; false = fine */
-  function cqbProbeDats() {
-    if (window.__cqbDatsProbed) return;
-    window.__cqbDatsProbed = true;
-    fetch('https://gis.lincoln.ne.gov/portal/sharing/rest/content/items/' + CQB_DATS_ITEM + '?f=json',
-      { credentials: 'include' })
-      .then(function (r) { return r.json(); })
-      .then(function (j) { cqbDatsBlocked = !!(j && j.error); })
-      .catch(function () { cqbDatsBlocked = null; });   /* unknown -> leave the menu alone */
-  }
-  function gateDatsMenuItem() {
+   * v3.6 through v3.9 tried to detect that by asking the portal whether this session could
+   * reach the item, sending cookies with credentials:'include', and hiding the item on a
+   * 403. THAT WAS WRONG, and it did the opposite of what it intended.
+   *
+   * This app authenticates with OAuth: the credential lives in localStorage under
+   * esriJSAPIOAuth, keyed to gis.lincoln.ne.gov/portal, and the only cookies on the domain
+   * are Google Analytics (_ga*). A credentials:'include' request therefore carries no
+   * authentication whatsoever -- it forwards analytics cookies and nothing else -- so the
+   * probe returned 403 for EVERY session. Measured live 2026-08-28 while signed in as a
+   * real portal user: the probe still returned 403 and the menu item was hidden from the
+   * very person entitled to run it.
+   *
+   * So: no request, no session-dependent logic, no hard-coded item id to go stale. The app
+   * already has a convention for this -- "Add Secure Data" and "Add Secure Data - Address
+   * Grid" both read "User Authentication Required.  Internal Use Only." -- and DATS Report
+   * simply was not given one. Saying so is honest for both audiences and costs nothing: a
+   * signed-in user keeps the item, and an anonymous visitor gets an explanation instead of
+   * a control that silently does nothing.
+   *
+   * localStorage __claude_qb_nodats = "1" leaves the menu item completely untouched. */
+  var CQB_DATS_NOTE = 'User Authentication Required.';
+  function labelDatsMenuItem() {
     if (localStorage.getItem('__claude_qb_nodats') === '1') return;
-    cqbProbeDats();
-    if (cqbDatsBlocked !== true) return;                /* usable, or not yet known: never hide */
     document.querySelectorAll('[role="menuitem"]').forEach(function (mi) {
       if ((mi.textContent || '').indexOf('DATS Report') !== 0) return;
-      if (mi.style.display !== 'none') mi.style.display = 'none';
+
+      /* Undo the v3.6-v3.9 behaviour if an older build hid this node in this page. */
+      if (mi.style && mi.style.display === 'none') mi.style.display = '';
+
+      /* Idempotent by content rather than by a flag: the observer sweeps often, and the
+       * app may re-render the row and wipe the note, in which case it must come back. */
+      var sec = mi.querySelector ? mi.querySelector('.MuiListItemText-secondary') : null;
+      if (sec && (sec.textContent || '').indexOf(CQB_DATS_NOTE) === -1) {
+        sec.textContent = (sec.textContent || '').trim() + '  ' + CQB_DATS_NOTE;
+      }
+      if (mi.getAttribute && mi.setAttribute) {
+        var t = mi.getAttribute('title') || '';
+        if (t.indexOf(CQB_DATS_NOTE) === -1) {
+          mi.setAttribute('title', (t.trim() + '  ' + CQB_DATS_NOTE).trim());
+        }
+      }
     });
   }
 
@@ -3031,7 +3051,7 @@ function cqbSiteExportDialog() {
       try { repairInvalidValues(p); } catch (e) { /* never let a repair break the bar */ }
     });
     try { maintainSearchGroup(); } catch (e) { /* the search box must survive our mistakes */ }
-    try { gateDatsMenuItem(); } catch (e) { /* nor must the "I want to..." menu */ }
+    try { labelDatsMenuItem(); } catch (e) { /* nor must the "I want to..." menu */ }
   }
   var featureObsTimer = null;
   if (window.MutationObserver) {
