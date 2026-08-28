@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.8.1
-// @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar (v3.9) to the public Development Viewer: a CAD site-plan export (DXF) for Home Designer/Chief Architect/AutoCAD with optional USGS contours, building line and soils, FEMA Zone A, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
+// @version      1.9.0
+// @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar (v3.10) to the public Development Viewer: Site tools (a CAD site-plan export to DXF for Home Designer/Chief Architect/AutoCAD, and a Salt Creek flood-storage and allowable-fill calculator) with optional USGS ground elevations, building line and soils, FEMA Zone A, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
 // @updateURL    https://raw.githubusercontent.com/McMittens1/dev-viewer-toolkit/main/DV_Toolkit.user.js
@@ -34,7 +34,7 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.8.1 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.9.0 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -52,7 +52,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.8.1', ready: false };
+  window.__dvToolkit = { version: '1.9.0', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -1187,7 +1187,6 @@ function cqbLevels(min, max, interval) {
   return out;
 }
 
-
 /* ------------------------------------------------------------------ *
  * 4. Data sources
  * ------------------------------------------------------------------ */
@@ -1281,13 +1280,17 @@ function cqbQs(o) {
   }).join('&');
 }
 
-function cqbGetJson(url, timeoutMs) {
+function cqbGetJson(url, timeoutMs, postBody) {
   return new Promise(function (resolve, reject) {
     var done = false;
     var t = setTimeout(function () {
       if (!done) { done = true; reject(new Error('timeout')); }
     }, timeoutMs || 30000);
-    fetch(url)
+    fetch(url, postBody == null ? undefined : {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: postBody
+    })
       .then(function (r) { return r.json(); })
       .then(function (j) {
         if (done) return;
@@ -1370,7 +1373,12 @@ var CQB_M_TO_FT = 3.280839895013123;
  * exactly as asked for. */
 function cqbSampleElevation(points, onProgress, batchSize) {
   var BATCH = batchSize || 400;
+  /* Filled, not sparse. A bare new Array(n) has holes, and holes are SKIPPED by
+   * every/some/forEach -- so a check like "every sample came back" passes
+   * vacuously when nothing came back at all. An explicit null means "asked, no
+   * answer", which is what callers test for. */
   var results = new Array(points.length);
+  for (var f = 0; f < points.length; f++) results[f] = null;
   var batches = [];
   for (var i = 0; i < points.length; i += BATCH) {
     batches.push({ start: i, pts: points.slice(i, i + BATCH) });
@@ -1382,7 +1390,15 @@ function cqbSampleElevation(points, onProgress, batchSize) {
      * service. The conversion is local (section 8) and agrees with the county's
      * own reprojection to 4 mm, so it costs nothing and removes a dependency. */
     var wm = b.pts.map(function (p) { return cqbSpFtToWm(p[0], p[1]); });
-    var url = CQB_3DEP + '/getSamples?' + cqbQs({
+    /* POST, not GET. A multipoint geometry in a query string is roughly 24
+     * characters per point, so a 200-point batch builds a ~9,800-character URL
+     * and the request dies at the server's 8 KB request-line limit -- as a bare
+     * "Failed to fetch", with no status and no error body to explain it.
+     * Measured live 2026-08-28 against this service: 150 points (7,413 chars)
+     * succeeded, 200 points (9,806 chars) failed, and a POST of all 740 points
+     * of a real lot succeeded in one request. The same parameters go in the
+     * body instead, and locationId still indexes within the batch. */
+    var body = cqbQs({
       geometry: JSON.stringify({
         points: wm, spatialReference: { wkid: 102100 }
       }),
@@ -1390,7 +1406,7 @@ function cqbSampleElevation(points, onProgress, batchSize) {
       returnFirstValueOnly: 'true',
       f: 'json'
     });
-    return cqbGetJson(url, 45000).then(function (j) {
+    return cqbGetJson(CQB_3DEP + '/getSamples', 45000, body).then(function (j) {
       (j.samples || []).forEach(function (s) {
         var idx = b.start + (s.locationId || 0);
         var v = parseFloat(s.value);
@@ -1473,7 +1489,6 @@ function cqbDrawLot(doc, ring, opts) {
       h, bearing + '  ' + len.toFixed(2) + "'", rot);
   }
 }
-
 
 /* ------------------------------------------------------------------ *
  * 7. The export itself
@@ -1795,7 +1810,6 @@ function cqbSiteExport(pid, opts, deps) {
   });
 }
 
-
 /* Bilinear lookup into the sampled grid, in grid coordinates (state plane feet).
  * Returns null if any of the four surrounding nodes failed, rather than
  * quietly interpolating across a hole. */
@@ -1853,7 +1867,6 @@ function cqbElevationCsv(grid, gspec, origin, opts) {
   }
   return { text: out.join('\r\n') + '\r\n', count: out.length, stride: stride };
 }
-
 
 /* ------------------------------------------------------------------ *
  * 8. Projection: NAD83 Nebraska State Plane <-> Web Mercator
@@ -1954,7 +1967,6 @@ function cqbWmToSpFt(x, y) {
   var ll = cqbWmToLonLat(x, y);
   return CQB_LCC.fromLonLat(ll[0], ll[1]);
 }
-
 
 /* ------------------------------------------------------------------ *
  * 10. Building line setback
@@ -2099,6 +2111,210 @@ function cqbSoilText(rows, maxParts) {
   }).join(', ');
 }
 
+/* ------------------------------------------------------------------ *
+ * 12. Salt Creek storage / allowable-fill
+ * ------------------------------------------------------------------ *
+ *
+ * Volume between existing ground and the FEMA base flood elevation over
+ * parcel INTERSECT Salt Creek Storage Area, times the storage area's FILL_PRCNT
+ * allowance. Reference only -- see the caveats emitted with the result.
+ *
+ * This replaces the standalone bookmarklet prototype. Three things changed:
+ *
+ *  - It works in State Plane feet like everything else. The prototype worked in
+ *    Web Mercator and corrected for it with a cos(latitude) factor applied to
+ *    the cell size. That is approximately right and was validated, but it is the
+ *    same trap the site export exists to avoid, and it left cell area subtly
+ *    dependent on where in the county you were.
+ *  - Elevation samples are matched by the locationId the service returns rather
+ *    than by hunting for the nearest returned point. The prototype compared
+ *    every returned sample against every requested point -- 62,500 distance
+ *    computations per 250-point batch -- to answer a question the response
+ *    already answers exactly.
+ *  - It is behind the same USGS opt-in as contours. The prototype called
+ *    elevation.nationalmap.gov with no gate at all, which is precisely what the
+ *    opt-in was built to prevent.
+ *
+ * The method itself is unchanged, because it was validated: SA #8 at
+ * 1015 W O St (PID 1027100002000) gave 18,550 sq ft, 623 CY below BFE and
+ * 218 CY at the 35% allowance, with a 10 ft vs 5 ft grid differing by 1.8%.
+ */
+
+var CQB_SA_URL  = CQB_PUB + 'LTUWatershed/FEMEFloodDetails/MapServer/3';
+var CQB_BFE_URL = CQB_PUB + 'LTUWatershed/FEMEFloodDetails/MapServer/1';
+
+/* Flatten BFE polylines into elevation-tagged segments. */
+function cqbBfeSegments(features) {
+  var segs = [];
+  (features || []).forEach(function (f) {
+    /* Number(null) is 0, so a null ELEV would otherwise become a sea-level BFE
+     * line and drag every interpolation near it. Reject the empty cases first. */
+    var raw = f.attributes ? f.attributes.ELEV : null;
+    if (raw === null || raw === undefined || raw === '') return;
+    var e = Number(raw);
+    if (!isFinite(e)) return;
+    ((f.geometry && f.geometry.paths) || []).forEach(function (path) {
+      for (var i = 0; i < path.length - 1; i++) segs.push({ e: e, a: path[i], b: path[i + 1] });
+    });
+  });
+  var elevs = [];
+  segs.forEach(function (s) { if (elevs.indexOf(s.e) < 0) elevs.push(s.e); });
+  elevs.sort(function (a, b) { return a - b; });
+  return { segs: segs, elevs: elevs };
+}
+
+/* BFE at a point: inverse-distance blend of the two nearest distinct contour
+ * elevations, which is what puts a point sitting between the 1152 and 1153 lines
+ * at 1152.x rather than snapping it to whichever line happens to be closer. */
+function cqbBfeAt(bfe, p) {
+  if (!bfe || !bfe.elevs.length) return null;
+  var per = bfe.elevs.map(function (e) {
+    var m = Infinity;
+    bfe.segs.forEach(function (s) {
+      if (s.e !== e) return;
+      var d = cqbPtSegDist(p, s.a, s.b);
+      if (d < m) m = d;
+    });
+    return { e: e, d: m };
+  }).filter(function (x) { return isFinite(x.d); });
+  if (!per.length) return null;
+  per.sort(function (a, b) { return a.d - b.d; });
+  if (per.length === 1) return per[0].e;
+  var d0 = per[0].d, d1 = per[1].d;
+  /* Standing exactly on a line means that line's elevation, not a divide by zero. */
+  if (d0 + d1 === 0) return per[0].e;
+  return (per[0].e * d1 + per[1].e * d0) / (d0 + d1);
+}
+
+function cqbStorageCalc(pid, opts, deps) {
+  opts = opts || {};
+  deps = deps || {};
+  var getJson = deps.getJson || cqbGetJson;
+  var post    = deps.geoPost || cqbGeoPost;
+  var sample  = deps.sample  || cqbSampleElevation;
+  var say = opts.onStatus || function () {};
+  var rep = { warnings: [] };
+
+  return getJson(CQB_SITE_SOURCES[0].url + '/query?' + cqbQs({
+    where: "PARCELID='" + String(pid).replace(/'/g, "''") + "'",
+    outFields: 'PARCELID,SITEADDRESS,GIS_AREA', returnGeometry: 'true', outSR: CQB_SP_FT, f: 'json'
+  })).then(function (j) {
+    var f = (j.features || [])[0];
+    if (!f || !f.geometry || !f.geometry.rings) throw new Error('Parcel ' + pid + ' not found, or it has no mapped boundary.');
+    rep.pid = f.attributes.PARCELID;
+    rep.address = f.attributes.SITEADDRESS || '';
+    rep._parcel = f.geometry;
+
+    say('Finding the storage area...');
+    return getJson(CQB_SA_URL + '/query?' + cqbQs({
+      geometry: JSON.stringify({ rings: f.geometry.rings, spatialReference: { wkid: CQB_SP_FT } }),
+      geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT, outSR: CQB_SP_FT,
+      spatialRel: 'esriSpatialRelIntersects', outFields: 'SA_NUMBER,FILL_PRCNT',
+      returnGeometry: 'true', f: 'json'
+    }));
+  }).then(function (j) {
+    var fs = j.features || [];
+    if (!fs.length) { rep.noStorageArea = true; return null; }
+    rep.storageAreas = fs.length;
+    var sa = fs[0];
+    rep.saNumber = sa.attributes.SA_NUMBER;
+    rep.fillPercent = Number(sa.attributes.FILL_PRCNT);
+    if (fs.length > 1) {
+      rep.warnings.push('This parcel touches ' + fs.length + ' storage areas; only SA #' +
+        rep.saNumber + ' (' + rep.fillPercent + '%) is computed here.');
+    }
+
+    say('Clipping to the storage area...');
+    return post('intersect', {
+      sr: CQB_SP_FT,
+      geometries: JSON.stringify({ geometryType: 'esriGeometryPolygon', geometries: [rep._parcel] }),
+      geometry: JSON.stringify({ geometryType: 'esriGeometryPolygon', geometry: sa.geometry })
+    });
+  }).then(function (ix) {
+    if (rep.noStorageArea) return null;
+    if (!ix || ix.error) throw new Error('The geometry service could not clip the parcel to the storage area.');
+    var clip = (ix.geometries || []).filter(function (g) { return g && g.rings && g.rings.length; })[0];
+    if (!clip) { rep.emptyClip = true; return null; }
+    rep._clip = clip;
+
+    say('Reading the BFE lines...');
+    var b = cqbExpand(cqbBounds(clip.rings), opts.bfeSearchFt || 2000);
+    return getJson(CQB_BFE_URL + '/query?' + cqbQs({
+      geometry: JSON.stringify({ xmin: b.minx, ymin: b.miny, xmax: b.maxx, ymax: b.maxy,
+                                 spatialReference: { wkid: CQB_SP_FT } }),
+      geometryType: 'esriGeometryEnvelope', inSR: CQB_SP_FT, outSR: CQB_SP_FT,
+      spatialRel: 'esriSpatialRelIntersects', outFields: 'ELEV,V_DATUM',
+      returnGeometry: 'true', f: 'json'
+    }));
+  }).then(function (j) {
+    if (rep.noStorageArea || rep.emptyClip) return null;
+    var fs = (j && j.features) || [];
+    if (!fs.length) { rep.noBfe = true; return null; }
+    /* Datum has to match 3DEP or the subtraction is meaningless. */
+    var datums = {};
+    fs.forEach(function (f) { var d = f.attributes && f.attributes.V_DATUM; if (d) datums[String(d).trim()] = 1; });
+    rep.bfeDatums = Object.keys(datums);
+    if (rep.bfeDatums.length && rep.bfeDatums.indexOf('NAVD88') === -1) {
+      rep.warnings.push('BFE lines report vertical datum ' + rep.bfeDatums.join('/') +
+        ', but the elevation model is NAVD88. The depths below are not trustworthy.');
+    }
+    var bfe = cqbBfeSegments(fs);
+    if (!bfe.elevs.length) { rep.noBfe = true; return null; }
+    rep.bfeLineCount = fs.length;
+
+    var gspec = cqbGridSpec(cqbBounds(rep._clip.rings), opts.maxPoints || 3000, opts.gridStep || 5);
+    rep.gridStep = gspec.step;
+    /* Sample at cell CENTRES, not cell corners. The shared grid is corner-aligned
+     * because that is what marching squares wants, but here each sample stands for
+     * the cell around it, and a corner-aligned grid puts a whole row and a whole
+     * column exactly on the boundary of an axis-aligned lot -- which most platted
+     * lots are. Point-in-polygon has to resolve those one way or the other, so the
+     * error is a systematic ~one-cell-wide strip off two sides, not noise: on a
+     * 100 ft lot at a 5 ft grid it cost 9% of the area. Half a cell fixes it. */
+    var all = cqbGridPoints({
+      step: gspec.step, cols: gspec.cols, rows: gspec.rows,
+      x0: gspec.x0 + gspec.step / 2, y0: gspec.y0 + gspec.step / 2
+    });
+    var inside = all.filter(function (p) { return cqbPointInRings(p[0], p[1], rep._clip.rings); });
+    if (!inside.length) { rep.tooSmall = true; return null; }
+    rep.cells = inside.length;
+
+    say('Sampling ground elevations...');
+    return sample(inside, function (i, n) { say('Sampling ground elevations... ' + i + '/' + n); })
+      .then(function (zs) { return { bfe: bfe, pts: inside, zs: zs, step: gspec.step }; });
+  }).then(function (d) {
+    /* Ring geometry is working state, not part of the report the user is shown. */
+    delete rep._parcel; delete rep._clip;
+    if (!d) return rep;
+    var cellArea = d.step * d.step;
+    var vol = 0, wet = 0, miss = 0;
+    var zmin = Infinity, zmax = -Infinity, bmin = Infinity, bmax = -Infinity;
+    d.pts.forEach(function (p, i) {
+      var z = d.zs[i];
+      if (z == null || !isFinite(z)) { miss++; return; }
+      if (z < zmin) zmin = z;
+      if (z > zmax) zmax = z;
+      var b = cqbBfeAt(d.bfe, p);
+      if (b == null) { miss++; return; }
+      if (b < bmin) bmin = b;
+      if (b > bmax) bmax = b;
+      var depth = b - z;
+      if (depth > 0) { vol += depth * cellArea; wet++; }
+    });
+    rep.noData = miss;
+    if (miss === d.pts.length) { rep.noElevation = true; return rep; }
+    rep.areaSqFt = d.pts.length * cellArea;
+    rep.groundMin = zmin; rep.groundMax = zmax;
+    rep.bfeMin = bmin;    rep.bfeMax = bmax;
+    rep.volumeCF = vol;
+    rep.volumeCY = vol / 27;
+    rep.wetCells = wet;
+    if (isFinite(rep.fillPercent)) rep.allowableCY = rep.volumeCY * rep.fillPercent / 100;
+    if (miss) rep.warnings.push(miss + ' of ' + d.pts.length + ' sample points had no elevation and were skipped.');
+    if (!wet) rep.warnings.push('No part of the clipped area sits below the base flood elevation, so there is no storage to fill.');
+    return rep;
+  });
+}
 
 
 /* ------------------------------------------------------------------ *
@@ -2175,8 +2391,8 @@ function cqbSiteExportDialog() {
   try { optedIn = localStorage.getItem(CQB_SE_OPTIN) === '1'; } catch (e) {}
 
   back.innerHTML =
-    '<div class="cqb-se" role="dialog" aria-modal="true" aria-label="Export site plan">' +
-      '<h2>Export site plan (DXF)</h2>' +
+    '<div class="cqb-se" role="dialog" aria-modal="true" aria-label="Site tools">' +
+      '<h2>Site tools</h2>' +
       '<div class="bd">' +
         '<label for="cqb-se-pid">Parcel ID</label>' +
         '<input type="text" id="cqb-se-pid" placeholder="10 to 14 digits">' +
@@ -2194,35 +2410,48 @@ function cqbSiteExportDialog() {
           '<label for="cqb-se-int">Contour interval</label>' +
           '<select id="cqb-se-int"><option value="1">1 ft</option>' +
             '<option value="2" selected>2 ft</option></select>' +
-          '<div class="warn" id="cqb-se-optin">' +
-            '<b>This is the one thing that leaves the county server.</b><br>' +
-            'The county publishes no elevation data, so contours come from the USGS 3D ' +
-            'Elevation Program. Your browser sends the lot outline (public parcel ' +
-            'coordinates, nothing about you) to elevation.nationalmap.gov and gets ground ' +
-            'heights back.<br><br>' +
-            'It is bare-earth lidar, <b>not a survey</b>: it predates recent grading and fill, ' +
-            'omits structures, and must not be used for finished floor elevations, drainage ' +
-            'design, or floodplain compliance.' +
-            '<div class="row" style="margin-top:9px"><input type="checkbox" id="cqb-se-ok">' +
-              '<span>Understood, fetch elevations</span></div>' +
-          '</div>' +
+        '</div>' +
+        /* The opt-in sits outside the contour block because two different
+         * actions need it now -- contours and the fill-capacity calculation --
+         * and it is the same consent either way. */
+        '<div class="warn" id="cqb-se-optin" style="display:none">' +
+          '<b>This is the one thing that leaves the county server.</b><br>' +
+          'The county publishes no elevation data, so ground heights come from the USGS ' +
+          '3D Elevation Program. Your browser sends the lot outline (public parcel ' +
+          'coordinates, nothing about you) to elevation.nationalmap.gov and gets ground ' +
+          'heights back.<br><br>' +
+          'It is bare-earth lidar, <b>not a survey</b>: it predates recent grading and fill, ' +
+          'omits structures, and must not be used for finished floor elevations, drainage ' +
+          'design, or floodplain compliance.' +
+          '<div class="row" style="margin-top:9px"><input type="checkbox" id="cqb-se-ok">' +
+            '<span>Understood, fetch elevations</span></div>' +
         '</div>' +
       '</div>' +
       '<div class="st" id="cqb-se-st"></div>' +
       '<div class="res" id="cqb-se-res"></div>' +
       '<div class="ft">' +
         '<button id="cqb-se-x">Close</button>' +
-        '<button class="go" id="cqb-se-run">Export</button>' +
+        '<button id="cqb-se-fill">Fill capacity</button>' +
+        '<button class="go" id="cqb-se-run">Export DXF</button>' +
       '</div>' +
     '</div>';
   document.body.appendChild(back);
 
   var $ = function (id) { return back.querySelector('#' + id); };
   $('cqb-se-pid').value = cqbSeGuessPid();
-  if (optedIn) { $('cqb-se-ok').checked = true; $('cqb-se-optin').style.display = 'none'; }
+  if (optedIn) { $('cqb-se-ok').checked = true; }
 
+  /* Shown whenever something on this dialog is about to reach outside the
+   * county server, and never once the user has already agreed. */
+  function needElevation(on) {
+    $('cqb-se-optin').style.display = (on && !$('cqb-se-ok').checked) ? 'block' : 'none';
+  }
   $('cqb-se-cont').addEventListener('change', function () {
     $('cqb-se-elev').style.display = this.checked ? 'block' : 'none';
+    needElevation(this.checked);
+  });
+  $('cqb-se-ok').addEventListener('change', function () {
+    if (this.checked) $('cqb-se-optin').style.display = 'none';
   });
 
   function close() { back.remove(); }
@@ -2240,6 +2469,7 @@ function cqbSiteExportDialog() {
 
     var wantContours = $('cqb-se-cont').checked;
     if (wantContours && !$('cqb-se-ok').checked) {
+      needElevation(true);
       st.textContent = 'Tick the elevation box to confirm, or switch contours off.';
       return;
     }
@@ -2297,6 +2527,92 @@ function cqbSiteExportDialog() {
         (r.statedArea ? ' (Assessor: ' + Math.round(r.statedArea).toLocaleString() + ')' : '') +
         (r.reliefFt != null ? '<br>Relief ' + r.reliefFt.toFixed(1) + ' ft over the sampled area' : '') +
         extra + '</div>';
+      if (r.warnings.length) {
+        html += '<div class="warn">' + r.warnings.map(function (w) {
+          return w.replace(/</g, '&lt;');
+        }).join('<br><br>') + '</div>';
+      }
+      res.innerHTML = html;
+    }).catch(function (e) {
+      btn.disabled = false;
+      st.textContent = '';
+      res.innerHTML = '<div class="warn">' + String(e.message || e).replace(/</g, '&lt;') + '</div>';
+    });
+  });
+
+  /* ---- Fill capacity (Salt Creek flood storage) --------------------------
+   * Same parcel field, same USGS consent, different answer: instead of a file
+   * this returns a volume. It only means anything inside one of the county's
+   * mapped Salt Creek storage areas, so the honest outcomes are "here is the
+   * number" and "this parcel is not in one" -- never a quiet zero. */
+  $('cqb-se-fill').addEventListener('click', function () {
+    var pid = ($('cqb-se-pid').value || '').replace(/\D/g, '');
+    var st = $('cqb-se-st'), res = $('cqb-se-res');
+    res.innerHTML = '';
+    if (!/^\d{8,16}$/.test(pid)) { st.textContent = 'Enter a parcel ID first.'; return; }
+    if (!$('cqb-se-ok').checked) {
+      needElevation(true);
+      st.textContent = 'Fill capacity needs ground elevations. Tick the box to confirm.';
+      return;
+    }
+    try { localStorage.setItem(CQB_SE_OPTIN, '1'); } catch (e) {}
+
+    var btn = this;
+    btn.disabled = true;
+    st.textContent = 'Reading the parcel...';
+
+    cqbStorageCalc(pid, { onStatus: function (t) { st.textContent = t; } }).then(function (r) {
+      btn.disabled = false;
+      st.textContent = 'Done.';
+      var head = '<b>' + (r.address || ('PID ' + r.pid)) + '</b>';
+
+      if (r.noStorageArea) {
+        res.innerHTML = head + '<div style="margin-top:6px;color:#c2d4e6">This parcel is not ' +
+          'inside a mapped Salt Creek flood storage area, so no fill allowance applies here. ' +
+          'That is not the same as "no floodplain rules apply" &mdash; check the FEMA layers.</div>';
+        return;
+      }
+      if (r.emptyClip) {
+        res.innerHTML = head + '<div style="margin-top:6px;color:#c2d4e6">The parcel only touches ' +
+          'the edge of storage area #' + r.saNumber + '; none of its area falls inside.</div>';
+        return;
+      }
+      if (r.noBfe) {
+        res.innerHTML = head + '<div class="warn">Storage area #' + r.saNumber + ' was found, but ' +
+          'no base flood elevation lines were mapped within 2,000 ft, so there is nothing to ' +
+          'measure depth against.</div>';
+        return;
+      }
+      if (r.tooSmall || r.noElevation) {
+        res.innerHTML = head + '<div class="warn">' + (r.tooSmall
+          ? 'The part of this parcel inside the storage area is too small to grid.'
+          : 'The elevation service returned no ground heights for this parcel.') + '</div>';
+        return;
+      }
+
+      var f = function (n) { return Math.round(n).toLocaleString(); };
+      var html = head +
+        '<table>' +
+          '<tr><td>Storage area</td><td class="n">#' + r.saNumber +
+            ' (fill allowance ' + r.fillPercent + '%)</td></tr>' +
+          '<tr><td>Parcel inside it</td><td class="n">' + f(r.areaSqFt) + ' sq ft</td></tr>' +
+          '<tr><td>Ground</td><td class="n">' + r.groundMin.toFixed(1) + ' &ndash; ' +
+            r.groundMax.toFixed(1) + ' ft</td></tr>' +
+          '<tr><td>Base flood elevation</td><td class="n">' + r.bfeMin.toFixed(2) + ' &ndash; ' +
+            r.bfeMax.toFixed(2) + ' ft</td></tr>' +
+          '<tr><td>Storage below BFE</td><td class="n"><b>' + f(r.volumeCF) + ' cu ft = ' +
+            f(r.volumeCY) + ' CY</b></td></tr>' +
+          (r.allowableCY != null
+            ? '<tr><td>Allowable fill at ' + r.fillPercent + '%</td><td class="n"><b>' +
+              f(r.allowableCY) + ' CY</b></td></tr>' : '') +
+        '</table>' +
+        '<div style="margin-top:8px;color:#9fb4c8">Method: USGS 3DEP bare-earth lidar sampled on ' +
+        'a ' + r.gridStep + ' ft grid over the parcel inside the storage area (' + r.cells +
+        ' cells, ' + r.wetCells + ' below the BFE); the BFE surface is interpolated between the ' +
+        'county\u2019s ' + r.bfeLineCount + ' mapped BFE lines. Both are NAVD88.<br>' +
+        '<b>Preliminary.</b> It ignores floodway rules, existing structures and permits, and ' +
+        'compensatory-storage design requirements, and the lidar predates recent grading. ' +
+        'Verify against an engineering study before relying on it.</div>';
       if (r.warnings.length) {
         html += '<div class="warn">' + r.warnings.map(function (w) {
           return w.replace(/</g, '&lt;');
@@ -2439,7 +2755,7 @@ function cqbSiteExportDialog() {
   bar.appendChild(lk);
 
   /* Settings: reconfigure which layers appear as chips */
-  var se = chip('Site DXF', 'Export this parcel as a CAD site plan (DXF) for Home Designer, Chief Architect, AutoCAD and similar');
+  var se = chip('Site tools', 'For one parcel: export a CAD site plan (DXF) for Home Designer, Chief Architect or AutoCAD, and compute Salt Creek flood storage and the allowable fill');
   se.addEventListener('click', function () { try { cqbSiteExportDialog(); } catch (e) { toast('Site export failed to open: ' + (e && e.message ? e.message : e)); } });
   bar.appendChild(se);
 
