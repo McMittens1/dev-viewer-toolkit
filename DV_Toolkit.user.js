@@ -2,7 +2,7 @@
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
 // @version      1.10.0
-// @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar (v3.10) to the public Development Viewer: Site tools (a CAD site-plan export to DXF for Home Designer/Chief Architect/AutoCAD, and a Salt Creek flood-storage and allowable-fill calculator) with optional USGS ground elevations, building line and soils, FEMA Zone A, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
+// @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools (Salt Creek flood-storage and allowable-fill calculator, behind a USGS ground-elevation opt-in), FEMA Zone A, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
 // @updateURL    https://raw.githubusercontent.com/McMittens1/dev-viewer-toolkit/main/DV_Toolkit.user.js
@@ -19,16 +19,16 @@
 // NETWORK. By default this script talks only to gis.lincoln.ne.gov, and stores
 // nothing beyond a few localStorage keys in your own browser.
 //
-// There is exactly one exception, and it is off until you turn it on. The Site
-// DXF export can add ground contours, and the county publishes no elevation
-// data anywhere in its public GIS -- all 26 service folders were checked. Those
-// contours come from the USGS 3D Elevation Program at elevation.nationalmap.gov.
-// If you enable them, your browser sends that parcel's outline (public parcel
-// coordinates, nothing identifying you) to that federal service and receives
-// ground heights back. The export dialog says so and makes you confirm before
-// the first request; clear the localStorage key __claude_qb_elev_optin to be
-// asked again. Leave contours off and nothing but gis.lincoln.ne.gov is
-// contacted.
+// There is exactly one exception, and it is off until you turn it on. The Salt
+// Creek fill-capacity calculation needs ground elevations, and the county
+// publishes no elevation data anywhere in its public GIS -- all 26 service
+// folders were checked. Ground heights come from the USGS 3D Elevation Program
+// at elevation.nationalmap.gov. If you agree, your browser sends that parcel's
+// outline (public parcel coordinates, nothing identifying you) to that federal
+// service and receives ground heights back. The Site tools dialog says so and
+// makes you confirm before the first request; clear the localStorage key
+// __claude_qb_elev_optin to be asked again. Never agree and nothing but
+// gis.lincoln.ne.gov is contacted.
 
 (function () {
   'use strict';
@@ -747,10 +747,12 @@ function runQuickBar() {
   bar.setAttribute('aria-label', 'Quick layer controls');
   bar.style.cssText = 'position:fixed;bottom:100px;left:50%;transform:translateX(-50%);width:max-content;z-index:9999;display:flex;gap:4px;align-items:center;background:rgba(15,20,28,.94);border:1px solid #2c3a4d;border-radius:16px;padding:4px 8px;font:11px "Segoe UI",sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.5);flex-wrap:wrap;justify-content:center;max-width:min(680px,86vw);';
 
-  /* ===================== section 4d: site export (DXF) =====================
-   * Everything below is the only part of this toolkit that can contact a server
-   * other than gis.lincoln.ne.gov, and only when the user switches contours on.
-   * See cqbSiteToolsDialog for the opt-in gate.
+  /* ====================== site modules (build-time) =======================
+   * The site analysis modules from src/ are spliced in here by build.py --
+   * always site_core + site_ui_core; plus the private export modules in the
+   * Pro build only. They are the only part of this toolkit that can contact a
+   * server other than gis.lincoln.ne.gov, and only behind the opt-in gate in
+   * cqbSiteToolsDialog.
    */
 /* Development Viewer -- site analysis core (shared).
  *
