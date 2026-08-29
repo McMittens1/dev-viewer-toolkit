@@ -4,7 +4,7 @@ A browser-side toolkit for the public [Lincoln/Lancaster County Development View
 
 It runs entirely in your own browser. Nothing is installed on the server, no GIS portal account is required, and no other user of the viewer is affected. It stores a handful of keys in your own browser's local storage.
 
-By default it talks only to `gis.lincoln.ne.gov`. One thing is the exception and it is **off until you switch it on**: anything needing ground elevation — contours in the DXF export, and the Salt Creek fill-capacity number — comes from the USGS 3D Elevation Program, because the county publishes no elevation data at all. See [Ground elevation and the one external call](#ground-elevation-and-the-one-external-call).
+By default it talks only to `gis.lincoln.ne.gov`. One thing is the exception and it is **off until you switch it on**: the Salt Creek fill-capacity number needs ground elevations, and those come from the USGS 3D Elevation Program, because the county publishes no elevation data at all. See [Ground elevation and the one external call](#ground-elevation-and-the-one-external-call).
 
 ## What it does
 
@@ -13,26 +13,25 @@ By default it talks only to `gis.lincoln.ne.gov`. One thing is the exception and
 - **Quick Bar** — one-click layer toggles, two saveable view snapshots, Declutter, and a Find Parcel search that actually returns parcels.
 - **Parcel results in the app's own search box** — type an address or a parcel ID and get the parcel, which is what the Help tab has always claimed the search box does.
 - **Shareable deep links** — copy a link that reopens your exact view, layers and parcel. People without the toolkit still land in the right place.
-- **Site plan export to CAD.** The "Site tools" chip exports the parcel as a DXF site plan for Home Designer, Chief Architect, AutoCAD, Civil 3D, SketchUp and Vectorworks, plus a comma-delimited XYZ elevation file for Home Designer's `File > Import > Terrain Data`. Lot boundary with grid bearings and distances, existing buildings, easements, curb lines and street centerlines, the FEMA boundary, the Building Line District setback, soils with real clipped percentages, and — if you switch it on — contours and corner spot elevations.
+- **Salt Creek fill capacity.** The "Site tools" chip: for a parcel inside one of the county's mapped Salt Creek flood storage areas, it clips the parcel to that area, samples bare-earth lidar on a 5 ft grid, interpolates a base flood elevation surface between the county's 1-ft BFE lines, and reports the storage volume below the BFE and the fill the area's `FILL_PRCNT` allows. Validated on 1015 W O St: **18,500 sq ft inside storage area #8, 624 CY of storage, 218 CY allowable at 35%** — within 0.3% of an independently built prototype.
 
-  Everything the county serves is Web Mercator, which is not a survey projection: at Lincoln's latitude it stretches distance by about 32%, so a lot taken straight from those coordinates is a third too big. Measured on parcel `1435300004000`: **338,050 sq ft raw against a true 195,121**. Every request here asks for NAD83 Nebraska State Plane in US survey feet instead, which returned **195,023 against the Assessor's own 195,121 — 0.05%**.
-- **Salt Creek fill capacity.** Same "Site tools" dialog: for a parcel inside one of the county's mapped Salt Creek flood storage areas, it clips the parcel to that area, samples bare-earth lidar on a 5 ft grid, interpolates a base flood elevation surface between the county's 1-ft BFE lines, and reports the storage volume below the BFE and the fill the area's `FILL_PRCNT` allows. Validated on 1015 W O St: **18,500 sq ft inside storage area #8, 624 CY of storage, 218 CY allowable at 35%** — within 0.3% of an independently built prototype.
+  Every measurement is made in NAD83 Nebraska State Plane, US survey feet — not the Web Mercator the county serves by default, which stretches distance about 32% at Lincoln's latitude. Measured on parcel `1435300004000`: **338,050 sq ft raw against a true 195,121**; State Plane returned **195,023 — 0.05%**.
 
   **Preliminary, and the panel says so.** It ignores floodway no-fill rules, existing structures and permits, and compensatory-storage design, and the lidar predates recent grading. A parcel outside every storage area is told so explicitly rather than being handed a zero.
 - **FEMA Zone A counted as floodplain.** Every flood test in the viewer asked only whether the FEMA zone was `AE`. The layer also carries 81 Zone A polygons — Zone A is a Special Flood Hazard Area too, the same 100-year floodplain, differing only in having no determined base flood elevation. Measured 2026-08-28: 1,506 parcels intersect Zone A, and 39 of a 40-parcel spread sample touch Zone A **only**, so roughly 1,460 parcels were being told "None mapped" while sitting in the regulatory floodplain. The toolkit now reports them, and Find Parcel adds how much of the parcel is in the floodplain, computed with the county's own public geometry service. The same assumption is present in the stock app configuration and has been flagged for the GIS team.
 
 ## Ground elevation and the one external call
 
-Two things here need ground heights: contours on the DXF export, and the fill-capacity calculation. The county has no elevation data to draw them from — every one of its 26 public service folders was checked, and there is no contour, DEM, lidar, terrain or survey-control layer anywhere. So contours come from the **USGS 3D Elevation Program** (`elevation.nationalmap.gov`), 1 m lidar-derived bare earth.
+The fill-capacity calculation needs ground heights. The county has no elevation data to supply them — every one of its 26 public service folders was checked, and there is no contour, DEM, lidar, terrain or survey-control layer anywhere. So they come from the **USGS 3D Elevation Program** (`elevation.nationalmap.gov`), 1 m lidar-derived bare earth.
 
 That is the only time this toolkit contacts anything other than `gis.lincoln.ne.gov`, so it is opt-in:
 
-- The contour checkbox is off by default, and Fill capacity refuses to run until you have agreed.
-- The first time either one asks, the dialog explains what is sent (the lot outline — public parcel coordinates, nothing about you) and where, and you have to confirm.
+- Fill capacity refuses to run until you have agreed.
+- The first time it asks, the dialog explains what is sent (the lot outline — public parcel coordinates, nothing about you) and where, and you have to confirm.
 - The choice is remembered in `__claude_qb_elev_optin`. Remove that key to be asked again.
-- Leave contours off and never press Fill capacity, and nothing leaves the county server.
+- Never press Fill capacity and nothing leaves the county server.
 
-**Bare earth is not a survey.** It predates recent grading, fill and retaining walls and does not include structures. Fine for siting and massing; not for finished floor elevations, drainage design or floodplain compliance. That warning is written into the DXF itself, not just shown in the dialog, because the drawing is what gets emailed onward.
+**Bare earth is not a survey.** It predates recent grading, fill and retaining walls and does not include structures. Not for finished floor elevations, drainage design or floodplain compliance — the result panel says so every time.
 
 ## Install
 
@@ -40,7 +39,7 @@ That is the only time this toolkit contacts anything other than `gis.lincoln.ne.
 2. Click **[DV_Toolkit.user.js](DV_Toolkit.user.js)** → **Raw**. Tampermonkey will offer to install it.
 3. Open the Development Viewer. The Quick Bar appears near the bottom of the map once the map finishes loading (this can take 30–45 seconds on a slow connection).
 
-If you install while the viewer is already open, **reload the page** — userscripts only inject at page load. To check it is running, press F12 and type `window.__dvToolkit`; you should get `{version: "1.9.0", ready: true}`.
+If you install while the viewer is already open, **reload the page** — userscripts only inject at page load. To check it is running, press F12 and type `window.__dvToolkit`; you should get `{version: "1.10.0", ready: true}`.
 
 Updates install themselves from then on — this script declares an `@updateURL`, so Tampermonkey checks this repository and upgrades in place.
 
@@ -64,7 +63,7 @@ The browser is back to the stock viewer. Nothing server-side was ever changed, s
 ## Notes
 
 - This is an unofficial, personal tool. It is not produced or endorsed by the City of Lincoln, Lancaster County, or their GIS department.
-- **What it talks to.** Public ArcGIS REST services on `gis.lincoln.ne.gov`. Most are layers the viewer already loads, but not all — the site export additionally queries Soils, Assessor Encumbrances, Building Line Districts, the 2024 building footprints and the public `Utilities/Geometry` service, and fill capacity adds the FEMA flood-detail storage areas and BFE lines. None of those are loaded by the viewer on its own. All are anonymous, read-only, public endpoints. Ground elevations are the one thing that leaves the county server, and only after you opt in — see above.
+- **What it talks to.** Public ArcGIS REST services on `gis.lincoln.ne.gov`. Most are layers the viewer already loads; fill capacity additionally queries the public `Utilities/Geometry` service and the FEMA flood-detail storage areas and BFE lines, which the viewer does not load on its own. All are anonymous, read-only, public endpoints. Ground elevations are the one thing that leaves the county server, and only after you opt in — see above.
 - **No authenticated requests, and no cookies sent anywhere.** Up to 1.8.0 the toolkit asked the portal whether your session could open the “DATS Report” workflow item, sending cookies with `credentials: 'include'`, and hid the menu item on a refusal. That was removed in 1.8.1 because it did the opposite of what it intended — see below.
 - It contains no credentials, sends none, sets no cookies, and collects, stores and transmits nothing about you.
 - **The “DATS Report” menu item is labelled, not hidden.** That workflow is not shared publicly, so for an anonymous visitor it loads and then does nothing at all — no message, no error. The toolkit appends “User Authentication Required.” to its description, matching the wording the app already uses on its own two secure items.
