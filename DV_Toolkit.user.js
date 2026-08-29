@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.9.0
+// @version      1.10.0
 // @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar (v3.10) to the public Development Viewer: Site tools (a CAD site-plan export to DXF for Home Designer/Chief Architect/AutoCAD, and a Salt Creek flood-storage and allowable-fill calculator) with optional USGS ground elevations, building line and soils, FEMA Zone A, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
@@ -34,7 +34,7 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.9.0 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.10.0 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -52,7 +52,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.9.0', ready: false };
+  window.__dvToolkit = { version: '1.10.0', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -750,237 +750,17 @@ function runQuickBar() {
   /* ===================== section 4d: site export (DXF) =====================
    * Everything below is the only part of this toolkit that can contact a server
    * other than gis.lincoln.ne.gov, and only when the user switches contours on.
-   * See cqbSiteExportDialog for the opt-in gate.
+   * See cqbSiteToolsDialog for the opt-in gate.
    */
-/* Development Viewer -- Site Export (DXF). Section 4d of the Quick Bar.
+/* Development Viewer -- site analysis core (shared).
  *
- * Produces an ASCII DXF R12 site plan for one parcel, for use in Chief Architect,
- * AutoCAD, Civil 3D, SketchUp, Vectorworks and anything else that reads DXF.
+ * Everything here ships to every user: county REST access in NAD83 State Plane
+ * Nebraska feet (wkid 102704), the local Lambert projection, grid sampling of
+ * USGS 3DEP ground elevations (behind the user opt-in), soils aggregation,
+ * frontage detection, and the Salt Creek flood-storage calculation.
  *
- * Why R12 ASCII and not DWG: DWG is a closed binary format with no practical
- * browser-side writer. DXF is plain text, and R12 is the dialect every reader
- * still accepts -- no handles, no OBJECTS section, no class table to get wrong.
- * Chief Architect imports it directly (File > Import > Import Drawing (DWG, DXF)).
- *
- * COORDINATES. Everything the county serves is Web Mercator (EPSG:3857). Web
- * Mercator is not a survey projection: at Lincoln's latitude its scale factor is
- * about 1/cos(40.8deg) = 1.32, so a lot drawn straight from those numbers comes
- * out ~32% too long on each side. Measured live on parcel 1435300004000: raw Web
- * Mercator shoelace gave 31,406 m2 (338,050 sq ft) against a true 195,121 sq ft.
- * So every geometry request asks for outSR=102704 -- NAD83 State Plane Nebraska,
- * US survey feet -- which returned 195,023 sq ft for the same parcel against the
- * Assessor's own GIS_AREA of 195,121, a 0.05% agreement.
- *
- * State Plane coordinates near Lincoln are ~2,584,000 ft east and ~271,000 ft
- * north. Handing a CAD package numbers that large costs single-precision display
- * accuracy and makes some site tools misbehave, so the drawing is translated to a
- * local origin at the parcel's southwest corner. The offset is written into the
- * drawing (header comment + a text entity) so the drawing can be put back on the
- * grid exactly.
- *
- * BEARINGS are computed from State Plane grid north, so they are GRID bearings.
- * They are not record bearings off a plat and not geodetic bearings; the grid
- * convergence at Lincoln is under a degree but it is real. Every bearing label
- * says GRID for that reason.
- */
-
-/* ------------------------------------------------------------------ *
- * 1. DXF R12 emitter
- * ------------------------------------------------------------------ */
-
-/* A DXF file is a flat sequence of (group code, value) pairs, one per line.
- * Nearly every malformed DXF in the wild is an odd number of lines -- a code
- * without its value -- so all writing goes through pair() and nothing else
- * touches the output array. */
-function cqbDxfDoc() {
-  var out = [];
-  var layers = {};
-  var ext = { minx: Infinity, miny: Infinity, minz: Infinity,
-              maxx: -Infinity, maxy: -Infinity, maxz: -Infinity };
-
-  function pair(code, value) {
-    out.push(String(code));
-    out.push(String(value));
-  }
-
-  /* DXF reals: fixed notation only. Exponential notation ("1e-7") is legal in
-   * some readers and rejected by others, and toString() will produce it for
-   * small numbers. Six decimals is ~1/1000 inch at these magnitudes. */
-  function real(n) {
-    if (!isFinite(n)) n = 0;
-    var s = n.toFixed(6);
-    if (s === '-0.000000') s = '0.000000';
-    return s;
-  }
-
-  function grow(x, y, z) {
-    if (x < ext.minx) ext.minx = x;
-    if (y < ext.miny) ext.miny = y;
-    if (z < ext.minz) ext.minz = z;
-    if (x > ext.maxx) ext.maxx = x;
-    if (y > ext.maxy) ext.maxy = y;
-    if (z > ext.maxz) ext.maxz = z;
-  }
-
-  /* DXF text is single-byte; anything outside ASCII is unreliable across
-   * readers. Degree signs and primes in bearing labels are spelled out. */
-  function clean(s) {
-    return String(s == null ? '' : s).replace(/[^\x20-\x7E]/g, '?');
-  }
-
-  var api = {
-    /* Home Designer discards layer identity on import -- the 2026 Reference
-     * Manual (p.862) states that "all drawing file layers are mapped to the
-     * 'CAD, Default' layer. Original layer attributes are lost, but line color,
-     * styles, and weight are preserved on a per-object basis." So layer names
-     * only survive long enough to be picked in the import wizard, and COLOUR
-     * and LINETYPE are the only things that distinguish content afterwards.
-     * They are chosen deliberately for that reason, not decoratively. */
-    layer: function (name, color, ltype) {
-      if (!layers[name]) {
-        layers[name] = { name: name, color: color || 7, ltype: ltype || 'CONTINUOUS' };
-      }
-      return api;
-    },
-
-    /* closed=true emits flag 1; a closed polyline is what Chief Architect
-     * requires before it will convert a boundary into a Terrain Perimeter. */
-    polyline: function (layer, pts, closed) {
-      if (!pts || pts.length < 2) return api;
-      api.layer(layer);
-      pair(0, 'POLYLINE'); pair(8, layer); pair(6, (layers[layer] || {}).ltype || 'CONTINUOUS');
-      pair(66, 1); pair(70, closed ? 1 : 0);
-      pair(10, real(0)); pair(20, real(0)); pair(30, real(0));
-      pts.forEach(function (p) {
-        grow(p[0], p[1], 0);
-        pair(0, 'VERTEX'); pair(8, layer);
-        pair(10, real(p[0])); pair(20, real(p[1])); pair(30, real(0));
-      });
-      pair(0, 'SEQEND'); pair(8, layer);
-      return api;
-    },
-
-    /* Flag 8 marks the polyline itself as 3D; flag 32 marks each vertex as a
-     * 3D polyline vertex. Both are required -- a 3D polyline whose vertices
-     * are not flagged 32 reads back as a flat polyline at Z=0, which is
-     * exactly the failure mode where contours import but carry no elevation. */
-    polyline3d: function (layer, pts, closed) {
-      if (!pts || pts.length < 2) return api;
-      api.layer(layer);
-      pair(0, 'POLYLINE'); pair(8, layer); pair(6, (layers[layer] || {}).ltype || 'CONTINUOUS');
-      pair(66, 1); pair(70, 8 | (closed ? 1 : 0));
-      pair(10, real(0)); pair(20, real(0)); pair(30, real(0));
-      pts.forEach(function (p) {
-        var z = p[2] || 0;
-        grow(p[0], p[1], z);
-        pair(0, 'VERTEX'); pair(8, layer);
-        pair(10, real(p[0])); pair(20, real(p[1])); pair(30, real(z));
-        pair(70, 32);
-      });
-      pair(0, 'SEQEND'); pair(8, layer);
-      return api;
-    },
-
-    text: function (layer, x, y, height, str, rotation) {
-      api.layer(layer);
-      grow(x, y, 0);
-      pair(0, 'TEXT'); pair(8, layer);
-      pair(10, real(x)); pair(20, real(y)); pair(30, real(0));
-      pair(40, real(height));
-      pair(1, clean(str));
-      if (rotation) pair(50, real(rotation));
-      return api;
-    },
-
-    point: function (layer, x, y, z) {
-      api.layer(layer);
-      grow(x, y, z || 0);
-      pair(0, 'POINT'); pair(8, layer);
-      pair(10, real(x)); pair(20, real(y)); pair(30, real(z || 0));
-      return api;
-    },
-
-    build: function () {
-      if (!isFinite(ext.minx)) {
-        ext = { minx: 0, miny: 0, minz: 0, maxx: 0, maxy: 0, maxz: 0 };
-      }
-      var head = [];
-      var body = out;
-      out = head;
-
-      pair(0, 'SECTION'); pair(2, 'HEADER');
-      pair(9, '$ACADVER');  pair(1, 'AC1009');
-      pair(9, '$INSBASE');  pair(10, real(0)); pair(20, real(0)); pair(30, real(0));
-      pair(9, '$EXTMIN');   pair(10, real(ext.minx)); pair(20, real(ext.miny)); pair(30, real(ext.minz));
-      pair(9, '$EXTMAX');   pair(10, real(ext.maxx)); pair(20, real(ext.maxy)); pair(30, real(ext.maxz));
-      /* 1 = scientific? no: 1 = inches, 2 = feet. The drawing is in US survey
-       * feet, so 2. Readers that predate INSUNITS ignore it harmlessly. */
-      pair(9, '$INSUNITS'); pair(70, 2);
-      pair(9, '$MEASUREMENT'); pair(70, 0);
-      pair(0, 'ENDSEC');
-
-      pair(0, 'SECTION'); pair(2, 'TABLES');
-      pair(0, 'TABLE'); pair(2, 'LTYPE'); pair(70, 2);
-      pair(0, 'LTYPE'); pair(2, 'CONTINUOUS'); pair(70, 0);
-      pair(3, 'Solid line'); pair(72, 65); pair(73, 0); pair(40, real(0));
-      /* Dashed, for easements and the flood boundary -- both are conventionally
-       * dashed on a site plan, and linetype is one of the three attributes that
-       * survives Home Designer's import. */
-      pair(0, 'LTYPE'); pair(2, 'DASHED'); pair(70, 0);
-      pair(3, 'Dashed __ __ __'); pair(72, 65); pair(73, 2);
-      pair(40, real(3)); pair(49, real(2)); pair(49, real(-1));
-      pair(0, 'ENDTAB');
-
-      var names = Object.keys(layers);
-      pair(0, 'TABLE'); pair(2, 'LAYER'); pair(70, names.length);
-      names.forEach(function (n) {
-        pair(0, 'LAYER'); pair(2, n); pair(70, 0);
-        pair(62, layers[n].color); pair(6, layers[n].ltype || 'CONTINUOUS');
-      });
-      pair(0, 'ENDTAB');
-      pair(0, 'ENDSEC');
-
-      pair(0, 'SECTION'); pair(2, 'BLOCKS'); pair(0, 'ENDSEC');
-      pair(0, 'SECTION'); pair(2, 'ENTITIES');
-
-      var text = head.concat(body);
-      text.push('0'); text.push('ENDSEC');
-      text.push('0'); text.push('EOF');
-      out = body;
-      return text.join('\r\n') + '\r\n';
-    },
-
-    _extent: function () { return ext; },
-    _layers: function () { return layers; }
-  };
-  return api;
-}
-
-/* ------------------------------------------------------------------ *
- * 2. Geometry: area, local origin, quadrant bearings
- * ------------------------------------------------------------------ */
-
-function cqbRingArea(ring) {
-  var a = 0;
-  for (var i = 0, n = ring.length; i < n - 1; i++) {
-    a += ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1];
-  }
-  return Math.abs(a / 2);
-}
-
-/* Esri polygons put the outer ring clockwise and holes counter-clockwise, so a
- * signed sum over all rings nets the holes out. */
-function cqbPolyArea(rings) {
-  var total = 0;
-  rings.forEach(function (ring) {
-    var a = 0;
-    for (var i = 0, n = ring.length; i < n - 1; i++) {
-      a += ring[i][0] * ring[i + 1][1] - ring[i + 1][0] * ring[i][1];
-    }
-    total += a / 2;
-  });
-  return Math.abs(total);
-}
+ * This file must stand alone: it may not reference anything defined in
+ * site_export.js. The build fails if it does. */
 
 function cqbBounds(rings) {
   var b = { minx: Infinity, miny: Infinity, maxx: -Infinity, maxy: -Infinity };
@@ -995,205 +775,10 @@ function cqbBounds(rings) {
   return b;
 }
 
-/* Round the origin down to a whole foot so the offset written into the drawing
- * is exact and a user can type it back in without transcribing decimals. */
-function cqbLocalOrigin(rings) {
-  var b = cqbBounds(rings);
-  return [Math.floor(b.minx), Math.floor(b.miny)];
-}
-
-function cqbShift(rings, origin) {
-  return rings.map(function (r) {
-    return r.map(function (p) { return [p[0] - origin[0], p[1] - origin[1]]; });
-  });
-}
-
-/* Quadrant bearing, the form used on plats and site plans: N 45d30'12" E.
- * Grid north is +Y. Due north/south/east/west are spelled out rather than
- * emitted as "N 0d00'00" E", which reads as an error to a surveyor. */
-function cqbBearing(dx, dy) {
-  var EPS = 1e-9;
-  if (Math.abs(dx) < EPS && Math.abs(dy) < EPS) return null;
-  if (Math.abs(dx) < EPS) return dy > 0 ? 'NORTH' : 'SOUTH';
-  if (Math.abs(dy) < EPS) return dx > 0 ? 'EAST' : 'WEST';
-
-  var ns = dy > 0 ? 'N' : 'S';
-  var ew = dx > 0 ? 'E' : 'W';
-  var deg = Math.atan2(Math.abs(dx), Math.abs(dy)) * 180 / Math.PI;
-
-  var d = Math.floor(deg);
-  var mFloat = (deg - d) * 60;
-  var m = Math.floor(mFloat);
-  var s = Math.round((mFloat - m) * 60);
-  /* Carry seconds and minutes rather than emitting 60. */
-  if (s === 60) { s = 0; m += 1; }
-  if (m === 60) { m = 0; d += 1; }
-  /* 90 degrees in a quadrant bearing is a cardinal direction. */
-  if (d === 90 && m === 0 && s === 0) return dx > 0 ? 'EAST' : 'WEST';
-
-  return ns + ' ' + d + 'd' + (m < 10 ? '0' : '') + m + "'" +
-         (s < 10 ? '0' : '') + s + '" ' + ew;
-}
-
-function cqbDist(a, b) {
-  var dx = b[0] - a[0], dy = b[1] - a[1];
-  return Math.sqrt(dx * dx + dy * dy);
-}
-
-/* ------------------------------------------------------------------ *
- * 3. Contours: marching squares over a regular grid
- * ------------------------------------------------------------------ */
-
-/* Grid is row-major, grid[r][c], with r increasing northward. Cells whose
- * corners are all null (outside the parcel, or a failed sample) are skipped
- * entirely rather than treated as zero -- treating a gap as elevation 0 draws
- * a cliff around every hole. */
-function cqbMarchingSquares(grid, x0, y0, step, level) {
-  var segs = [];
-  var rows = grid.length;
-  if (!rows) return segs;
-  var cols = grid[0].length;
-
-  /* A sample sitting exactly on the contour level makes that cell's case index
-   * ambiguous, so the level has to be nudged off it. The nudge MUST be decided
-   * once for the whole grid, not per cell: two neighbouring cells interpolating
-   * their shared edge at levels differing by 1e-6 land on points that differ in
-   * the last bits, the chainer sees two distinct keys, and one closed contour
-   * comes back as several fragments. That is what a ring broken into four
-   * pieces looks like. */
-  var lv = level;
-  for (var sr = 0; sr < rows && lv === level; sr++) {
-    var row = grid[sr];
-    for (var sc = 0; sc < row.length; sc++) {
-      if (row[sc] === level) { lv = level + 1e-6; break; }
-    }
-  }
-
-  function interp(pa, va, pb, vb) {
-    var t = (lv - va) / (vb - va);
-    if (!isFinite(t)) t = 0.5;
-    if (t < 0) t = 0;
-    if (t > 1) t = 1;
-    return [pa[0] + (pb[0] - pa[0]) * t, pa[1] + (pb[1] - pa[1]) * t];
-  }
-
-  for (var r = 0; r < rows - 1; r++) {
-    for (var c = 0; c < cols - 1; c++) {
-      var v = [grid[r][c], grid[r][c + 1], grid[r + 1][c + 1], grid[r + 1][c]];
-      if (v[0] == null || v[1] == null || v[2] == null || v[3] == null) continue;
-
-      var p = [
-        [x0 + c * step,       y0 + r * step],
-        [x0 + (c + 1) * step, y0 + r * step],
-        [x0 + (c + 1) * step, y0 + (r + 1) * step],
-        [x0 + c * step,       y0 + (r + 1) * step]
-      ];
-
-      var idx = (v[0] > lv ? 8 : 0) | (v[1] > lv ? 4 : 0) |
-                (v[2] > lv ? 2 : 0) | (v[3] > lv ? 1 : 0);
-      if (idx === 0 || idx === 15) continue;
-
-      /* Edge midpoints, in the order top, right, bottom, left. */
-      var e = [
-        interp(p[0], v[0], p[1], v[1]),
-        interp(p[1], v[1], p[2], v[2]),
-        interp(p[3], v[3], p[2], v[2]),
-        interp(p[0], v[0], p[3], v[3])
-      ];
-
-      /* Saddles (5 and 10) are genuinely ambiguous: the cell centre decides
-       * which way the two branches connect. Averaging the four corners is the
-       * standard resolution and keeps contours from crossing each other. */
-      var mid = (v[0] + v[1] + v[2] + v[3]) / 4;
-      switch (idx) {
-        case 1:  case 14: segs.push([e[3], e[2]]); break;
-        case 2:  case 13: segs.push([e[2], e[1]]); break;
-        case 3:  case 12: segs.push([e[3], e[1]]); break;
-        case 4:  case 11: segs.push([e[0], e[1]]); break;
-        case 6:  case 9:  segs.push([e[0], e[2]]); break;
-        case 7:  case 8:  segs.push([e[3], e[0]]); break;
-        case 5:
-          if (mid > lv) { segs.push([e[3], e[0]]); segs.push([e[2], e[1]]); }
-          else          { segs.push([e[3], e[2]]); segs.push([e[0], e[1]]); }
-          break;
-        case 10:
-          if (mid > lv) { segs.push([e[3], e[2]]); segs.push([e[0], e[1]]); }
-          else          { segs.push([e[3], e[0]]); segs.push([e[2], e[1]]); }
-          break;
-      }
-    }
-  }
-  return segs;
-}
-
-/* Marching squares emits unordered segments; CAD wants polylines. Segments are
- * chained end-to-end on a quantised key so floating point noise does not break
- * a run into fragments. */
-function cqbChain(segs, tol) {
-  tol = tol || 1e-6;
-  var key = function (p) {
-    return Math.round(p[0] / tol) + ',' + Math.round(p[1] / tol);
-  };
-  var ends = {};
-  segs.forEach(function (s, i) {
-    [key(s[0]), key(s[1])].forEach(function (k) {
-      (ends[k] || (ends[k] = [])).push(i);
-    });
-  });
-
-  var used = new Array(segs.length);
-  var lines = [];
-
-  /* Extend a run of points from its tail, consuming unused segments. Returns
-   * the same array, grown in place. */
-  function extend(pts) {
-    for (;;) {
-      var tail = pts[pts.length - 1];
-      var cand = ends[key(tail)] || [];
-      var nxt = -1;
-      for (var i = 0; i < cand.length; i++) {
-        if (!used[cand[i]]) { nxt = cand[i]; break; }
-      }
-      if (nxt < 0) return pts;
-      used[nxt] = true;
-      var s = segs[nxt];
-      pts.push(key(s[0]) === key(tail) ? s[1] : s[0]);
-    }
-  }
-
-  for (var i = 0; i < segs.length; i++) {
-    if (used[i]) continue;
-    used[i] = true;
-    /* Grow forward from the seed's end, then reverse and grow again so a run
-     * seeded in its middle still comes out as one polyline rather than two. */
-    var pts = extend([segs[i][0], segs[i][1]]);
-    pts.reverse();
-    pts = extend(pts);
-    if (pts.length >= 2) lines.push(pts);
-  }
-  return lines;
-}
-
-/* Contour levels on whole multiples of the interval, which is what a reader
- * expects: 1102, 1104, 1106 -- not 1101.7, 1103.7. */
-function cqbLevels(min, max, interval) {
-  var out = [];
-  if (!(interval > 0) || !isFinite(min) || !isFinite(max) || max < min) return out;
-  var first = Math.ceil(min / interval) * interval;
-  for (var v = first; v <= max; v += interval) {
-    out.push(Math.round(v / interval) * interval);
-    if (out.length > 5000) break;
-  }
-  return out;
-}
-
-/* ------------------------------------------------------------------ *
- * 4. Data sources
- * ------------------------------------------------------------------ */
-
 /* NAD83 State Plane Nebraska, US survey feet. Every county query asks for this
  * so nothing downstream ever handles Web Mercator. */
 var CQB_SP_FT = 102704;
+
 var CQB_PUB = 'https://gis.lincoln.ne.gov/public/rest/services/';
 
 /* Layer ids verified against the service directories 2026-08-28.
@@ -1223,7 +808,9 @@ var CQB_SITE_SOURCES = [
 /* Queried per parcel but not drawn like the others: the building line needs an
  * offset computed from it, and soils need clipped areas. */
 var CQB_BUILDING_LINE_URL = CQB_PUB + 'Planning/DevRevZoningandRegulations/MapServer/22';
+
 var CQB_SOILS_URL = CQB_PUB + 'CityCounty/Soils/MapServer/1';
+
 var CQB_GEOM_URL = CQB_PUB + 'Utilities/Geometry/GeometryServer';
 
 /* Clip a set of polygons to the parcel and measure the result, using the
@@ -1330,10 +917,6 @@ function cqbQuerySite(spec, env) {
   });
 }
 
-/* ------------------------------------------------------------------ *
- * 5. Elevation
- * ------------------------------------------------------------------ */
-
 /* Choose a sampling step that keeps the request count sane on a large parcel.
  * Doubling rather than solving keeps the step on a round number of feet, which
  * makes the grid legible if anyone inspects it. */
@@ -1426,23 +1009,6 @@ function cqbSampleElevation(points, onProgress, batchSize) {
   return chain.then(function () { return results; });
 }
 
-function cqbToGrid(values, spec) {
-  var grid = [];
-  for (var r = 0; r < spec.rows; r++) {
-    var row = [];
-    for (var c = 0; c < spec.cols; c++) {
-      var v = values[r * spec.cols + c];
-      row.push(v == null || !isFinite(v) ? null : v);
-    }
-    grid.push(row);
-  }
-  return grid;
-}
-
-/* ------------------------------------------------------------------ *
- * 6. Assembly
- * ------------------------------------------------------------------ */
-
 function cqbPointInRings(x, y, rings) {
   var inside = false;
   rings.forEach(function (ring) {
@@ -1460,438 +1026,6 @@ function cqbExpand(b, margin) {
   return { minx: b.minx - margin, miny: b.miny - margin,
            maxx: b.maxx + margin, maxy: b.maxy + margin };
 }
-
-/* Draw the lot with a bearing/distance label on each segment. Labels are placed
- * at the segment midpoint, rotated to the segment, and flipped when the segment
- * runs right-to-left so no label reads upside down. */
-function cqbDrawLot(doc, ring, opts) {
-  doc.layer('LOT-BOUNDARY', 7);
-  doc.polyline('LOT-BOUNDARY', ring, true);
-  if (!opts || !opts.bearings) return;
-
-  doc.layer('LOT-ANNOTATION', 2);
-  var h = opts.textHeight || 2.5;
-  for (var i = 0; i < ring.length; i++) {
-    var a = ring[i], b = ring[(i + 1) % ring.length];
-    var dx = b[0] - a[0], dy = b[1] - a[1];
-    var len = Math.sqrt(dx * dx + dy * dy);
-    if (len < (opts.minSegment || 1)) continue;
-    var bearing = cqbBearing(dx, dy);
-    if (!bearing) continue;
-
-    var rot = Math.atan2(dy, dx) * 180 / Math.PI;
-    if (rot > 90 || rot < -90) rot += 180;
-    /* Offset the label off the line, on the outside of the segment. */
-    var nx = -dy / len, ny = dx / len;
-    var off = h * 0.6;
-    doc.text('LOT-ANNOTATION',
-      (a[0] + b[0]) / 2 + nx * off, (a[1] + b[1]) / 2 + ny * off,
-      h, bearing + '  ' + len.toFixed(2) + "'", rot);
-  }
-}
-
-/* ------------------------------------------------------------------ *
- * 7. The export itself
- * ------------------------------------------------------------------ */
-
-/* opts:
- *   contours   false by default -- see cqbSiteExport's caller. Turning this on
- *              is the ONLY thing that causes a request to leave gis.lincoln.ne.gov.
- *   interval   contour interval in feet (1 or 2)
- *   margin     feet of context to pull around the lot
- *   bearings   label each lot line with a grid bearing and distance
- *   onStatus   fn(text) for progress
- */
-function cqbSiteExport(pid, opts, deps) {
-  opts = opts || {};
-  deps = deps || {};
-  var queryFn  = deps.query   || cqbQuerySite;
-  var sampleFn = deps.sample  || cqbSampleElevation;
-  var say = opts.onStatus || function () {};
-  var margin = opts.margin == null ? 100 : opts.margin;
-
-  var lotSpec = CQB_SITE_SOURCES[0];
-  var url = lotSpec.url + '/query?' + cqbQs({
-    where: "PARCELID='" + String(pid).replace(/'/g, "''") + "'",
-    outFields: 'PARCELID,SITEADDRESS,OWNERNME1,GIS_AREA',
-    returnGeometry: 'true', outSR: CQB_SP_FT, f: 'json'
-  });
-
-  var lot, origin, env, doc, report = { warnings: [], layers: {} };
-
-  return cqbGetJson(url).then(function (j) {
-    var f = (j.features || [])[0];
-    if (!f || !f.geometry || !f.geometry.rings) throw new Error('Parcel ' + pid + ' not found, or it has no mapped boundary.');
-    lot = f;
-    origin = cqbLocalOrigin(f.geometry.rings);
-    var b = cqbBounds(f.geometry.rings);
-    env = cqbExpand(b, margin);
-
-    report.pid = f.attributes.PARCELID;
-    report.address = f.attributes.SITEADDRESS || '';
-    report.owner = f.attributes.OWNERNME1 || '';
-    report.statedArea = f.attributes.GIS_AREA;
-    report.computedArea = cqbPolyArea(f.geometry.rings);
-    report.origin = origin;
-
-    /* A disagreement here means the projection went wrong and every dimension
-     * in the drawing is suspect, so it is surfaced rather than swallowed. */
-    if (report.statedArea > 0) {
-      var diff = Math.abs(report.computedArea - report.statedArea) / report.statedArea;
-      report.areaAgreement = diff;
-      if (diff > 0.02) {
-        report.warnings.push('Computed area (' + Math.round(report.computedArea) +
-          ' sq ft) disagrees with the Assessor value (' + Math.round(report.statedArea) +
-          ' sq ft) by ' + (diff * 100).toFixed(1) + '%. Check the drawing before using it.');
-      }
-    }
-
-    doc = cqbDxfDoc();
-    var rings = cqbShift(lot.geometry.rings, origin);
-    /* Esri repeats the first vertex to close a ring; DXF closes with a flag, so
-     * the duplicate is dropped or the boundary gets a zero-length segment. */
-    rings.forEach(function (r, i) {
-      var pts = r.slice();
-      if (pts.length > 1) {
-        var a = pts[0], z = pts[pts.length - 1];
-        if (a[0] === z[0] && a[1] === z[1]) pts.pop();
-      }
-      if (i === 0) cqbDrawLot(doc, pts, opts);
-      else doc.polyline('LOT-BOUNDARY', pts, true);
-    });
-    report.layers['LOT-BOUNDARY'] = rings.length;
-
-    say('Pulling site context...');
-    var others = CQB_SITE_SOURCES.slice(1);
-    return Promise.all(others.map(function (spec) {
-      return queryFn(spec, env).then(function (rows) { return { spec: spec, rows: rows }; })
-        .catch(function (e) {
-          report.warnings.push(spec.layer + ' could not be read (' + e.message + '); it is missing from the drawing.');
-          return { spec: spec, rows: [] };
-        });
-    }));
-  }).then(function (sets) {
-    sets.forEach(function (s) {
-      var n = 0;
-      /* Kept in state plane so frontage detection can measure against them. */
-      if (s.spec.key === 'cl') {
-        report._streetPaths = [];
-        s.rows.forEach(function (row) {
-          row.parts.forEach(function (p) { report._streetPaths.push(p); });
-        });
-      }
-      s.rows.forEach(function (row) {
-        cqbShift(row.parts, origin).forEach(function (part) {
-          var pts = part.slice();
-          if (s.spec.poly && pts.length > 1) {
-            var a = pts[0], z = pts[pts.length - 1];
-            if (a[0] === z[0] && a[1] === z[1]) pts.pop();
-          }
-          doc.layer(s.spec.layer, s.spec.color, s.spec.ltype);
-          doc.polyline(s.spec.layer, pts, !!s.spec.poly);
-          n++;
-        });
-      });
-      report.layers[s.spec.layer] = n;
-    });
-
-    say('Checking building line and soils...');
-    var extras = [];
-
-    /* Building line district: a mapped DISTANCE in feet, offset inward from the
-     * frontage. Not the zoning setback envelope -- a different thing entirely. */
-    extras.push(
-      cqbGetJson(CQB_BUILDING_LINE_URL + '/query?' + cqbQs({
-        geometry: JSON.stringify({ rings: lot.geometry.rings, spatialReference: { wkid: CQB_SP_FT } }),
-        geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT, outSR: CQB_SP_FT,
-        spatialRel: 'esriSpatialRelIntersects', outFields: 'DISTANCE', returnGeometry: 'false', f: 'json'
-      })).then(function (j) {
-        var fs = j.features || [];
-        if (!fs.length) return;
-        var dists = fs.map(function (f) { return Number(f.attributes.DISTANCE); })
-                      .filter(function (d) { return isFinite(d) && d > 0; });
-        if (!dists.length) return;
-        /* Overlapping districts: the largest setback governs. */
-        var d = Math.max.apply(null, dists);
-        report.buildingLineFt = d;
-
-        var ring = lot.geometry.rings[0];
-        var interior = cqbCentroid(ring);
-        var paths = [];
-        (report._streetPaths || []).forEach(function (p) { paths.push(p); });
-        var edges = cqbFrontageEdges(ring, paths, opts.frontageSearch || 60, 10);
-        report.frontageEdges = edges.length;
-        if (!edges.length) {
-          report.warnings.push('This parcel is in a Building Line District requiring ' + d +
-            ' ft, but no street centerline was found near any lot line, so the building line ' +
-            'could not be placed. The distance is noted in the drawing.');
-          return;
-        }
-        doc.layer('BUILDING-LINE', 2, 'DASHED');
-        doc.layer('BUILDING-LINE-TEXT', 2);
-        edges.forEach(function (i) {
-          var seg = cqbOffsetEdge(ring[i], ring[i + 1], interior, d);
-          if (!seg) return;
-          doc.polyline('BUILDING-LINE',
-            [[seg[0][0] - origin[0], seg[0][1] - origin[1]],
-             [seg[1][0] - origin[0], seg[1][1] - origin[1]]], false);
-          doc.text('BUILDING-LINE-TEXT',
-            (seg[0][0] + seg[1][0]) / 2 - origin[0], (seg[0][1] + seg[1][1]) / 2 - origin[1] + 3,
-            2.5, 'BUILDING LINE ' + d + " ft (DERIVED)");
-        });
-      }).catch(function (e) {
-        report.warnings.push('Building Line Districts could not be read (' + e.message + ').');
-      })
-    );
-
-    /* Soils, with real clipped areas per class. */
-    extras.push(
-      cqbGetJson(CQB_SOILS_URL + '/query?' + cqbQs({
-        geometry: JSON.stringify({ rings: lot.geometry.rings, spatialReference: { wkid: CQB_SP_FT } }),
-        geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT, outSR: CQB_SP_FT,
-        spatialRel: 'esriSpatialRelIntersects', outFields: CQB_SOIL_FIELDS.join(','),
-        returnGeometry: 'true', f: 'json'
-      })).then(function (j) {
-        var fs = j.features || [];
-        if (!fs.length) return;
-        doc.layer('SOILS', 52, 'DASHED');
-        fs.forEach(function (f) {
-          cqbShift((f.geometry && f.geometry.rings) || [], origin).forEach(function (r) {
-            var pts = r.slice();
-            if (pts.length > 1) {
-              var a = pts[0], z = pts[pts.length - 1];
-              if (a[0] === z[0] && a[1] === z[1]) pts.pop();
-            }
-            doc.polyline('SOILS', pts, true);
-          });
-        });
-        var clip = function (geoms) {
-          return cqbClipArea(lot.geometry, geoms, deps.geoPost);
-        };
-        return Promise.all(['HYDROGROUP', 'DRAINCLASS', 'HYDRICRATE'].map(function (fld) {
-          return cqbSoilSummary(fs, fld, report.computedArea, clip)
-            .then(function (rows) { return { field: fld, rows: rows }; });
-        })).then(function (sets) {
-          report.soils = {};
-          sets.forEach(function (s2) {
-            var txt = cqbSoilText(s2.rows);
-            if (txt) report.soils[s2.field] = txt;
-          });
-          /* If the clip failed everywhere, say which soils are present rather
-           * than inventing shares. */
-          if (!Object.keys(report.soils).length) {
-            var names = {};
-            fs.forEach(function (f) {
-              var t = f.attributes && (f.attributes.SOILTYPE || f.attributes.SOILDESC);
-              if (t) names[String(t).trim()] = 1;
-            });
-            var list = Object.keys(names);
-            if (list.length) {
-              report.soilsUnmeasured = list.slice(0, 6).join('; ');
-              report.warnings.push('Soil areas could not be measured, so no percentages are given. ' +
-                'Units present: ' + report.soilsUnmeasured + '.');
-            }
-          }
-        });
-      }).catch(function (e) {
-        report.warnings.push('Soils could not be read (' + e.message + ').');
-      })
-    );
-
-    return Promise.all(extras).then(function () {
-      if (!opts.contours) return null;
-
-      say('Sampling elevations...');
-      var gspec = cqbGridSpec(env, opts.maxPoints || 6000, opts.gridStep || 5);
-      report.gridStep = gspec.step;
-      report.gridPoints = gspec.cols * gspec.rows;
-      return sampleFn(cqbGridPoints(gspec), function (i, n) {
-        say('Sampling elevations... ' + i + '/' + n);
-      }).then(function (vals) { return { gspec: gspec, vals: vals }; })
-        .catch(function (e) {
-          report.warnings.push('Elevation data could not be retrieved (' + e.message +
-            '). The drawing has no contours.');
-          return null;
-        });
-    });
-  }).then(function (elev) {
-    if (elev) {
-      var grid = cqbToGrid(elev.vals, elev.gspec);
-      var csv = cqbElevationCsv(grid, elev.gspec, origin, { maxPoints: opts.csvMaxPoints });
-      if (csv.count) { report.csv = csv.text; report.csvPoints = csv.count; }
-      var flat = [];
-      grid.forEach(function (r) { r.forEach(function (v) { if (v != null) flat.push(v); }); });
-      if (!flat.length) {
-        report.warnings.push('No elevation values were returned for this area; the drawing has no contours.');
-      } else {
-        var lo = Math.min.apply(null, flat), hi = Math.max.apply(null, flat);
-        report.reliefFt = hi - lo;
-        report.minElevFt = lo;
-        report.maxElevFt = hi;
-        var interval = opts.interval || 2;
-        var levels = cqbLevels(lo, hi, interval);
-        if (!levels.length) {
-          report.warnings.push('The site rises only ' + (hi - lo).toFixed(1) +
-            ' ft, less than one ' + interval + ' ft contour interval. No contours were drawn.');
-        }
-        var nLines = 0;
-        levels.forEach(function (lv) {
-          /* Index contours every fifth interval, the usual convention, so the
-           * reader can label them separately. */
-          var major = Math.abs(lv / (interval * 5) - Math.round(lv / (interval * 5))) < 1e-9;
-          var layer = major ? 'CONTOUR-INDEX' : 'CONTOUR-INTERMEDIATE';
-          doc.layer(layer, major ? 30 : 33);
-          cqbChain(cqbMarchingSquares(grid, 0, 0, elev.gspec.step, lv)).forEach(function (line) {
-            if (line.length < 2) return;
-            var shifted = line.map(function (p) {
-              return [p[0] + elev.gspec.x0 - origin[0], p[1] + elev.gspec.y0 - origin[1], lv];
-            });
-            doc.polyline3d(layer, shifted, false);
-            nLines++;
-          });
-        });
-        report.contourLines = nLines;
-        report.contourInterval = interval;
-
-        /* Corner spot elevations. The manual (p.905) says "Imported points are
-         * converted to Elevation Points", so these can be brought in as terrain
-         * data too -- but they are mainly here because "what is the grade at
-         * each corner of my lot" is the question a designer actually asks, and
-         * a contour map answers it only by eye. The label text is on its own
-         * layer so converting the points to Elevation Data does not drag text
-         * along with it. */
-        doc.layer('SPOT-ELEVATION', 5);
-        doc.layer('SPOT-ELEVATION-TEXT', 5);
-        var spots = 0;
-        lot.geometry.rings[0].forEach(function (p, i, arr) {
-          if (i === arr.length - 1) return;
-          var z = cqbSampleAt(grid, elev.gspec, p[0], p[1]);
-          if (z == null) return;
-          var lx = p[0] - origin[0], ly = p[1] - origin[1];
-          doc.point('SPOT-ELEVATION', lx, ly, z);
-          doc.text('SPOT-ELEVATION-TEXT', lx + 2, ly + 2, 2.5, z.toFixed(1));
-          spots++;
-        });
-        report.spotElevations = spots;
-      }
-    }
-
-    /* The provenance block goes in the drawing, not just in a dialog, because
-     * the drawing is what gets emailed on. */
-    doc.layer('_SOURCE-NOTES', 9);
-    var b = cqbBounds([[[0, 0]]]);
-    var ex = doc._extent();
-    var ty = (isFinite(ex.miny) ? ex.miny : 0) - 30;
-    var tx = isFinite(ex.minx) ? ex.minx : 0;
-    var h = 3;
-    var notes = [
-      'PARCEL ' + report.pid + (report.address ? '   ' + report.address : ''),
-      'NOT A SURVEY. Boundary is county GIS parcel mapping, not a boundary survey.',
-      'Coordinates: NAD83 Nebraska State Plane, US survey feet, translated to a local origin.',
-      'To restore state plane coordinates add E ' + origin[0] + '  N ' + origin[1] + '.',
-      'Bearings are GRID bearings from state plane north, not record or geodetic bearings.'
-    ];
-    if (report.contourLines) {
-      notes.push('Contours: USGS 3DEP bare-earth lidar, ' + report.contourInterval +
-                 ' ft interval, NAVD88, sampled on a ' + report.gridStep + ' ft grid.');
-      notes.push('Bare earth predates recent grading, fill and retaining walls, and does not');
-      notes.push('include structures. Do NOT use for finished floor elevations, drainage design,');
-      notes.push('or floodplain compliance. Those require a licensed survey.');
-    }
-    notes.push('Generated ' + new Date().toISOString().slice(0, 10) + ' by the Development Viewer Toolkit.');
-    notes.forEach(function (line, i) {
-      doc.text('_SOURCE-NOTES', tx, ty - i * h * 1.6, h, line);
-    });
-
-    report.dxf = doc.build();
-    report.bytes = report.dxf.length;
-    delete report._streetPaths;
-    return report;
-  });
-}
-
-/* Bilinear lookup into the sampled grid, in grid coordinates (state plane feet).
- * Returns null if any of the four surrounding nodes failed, rather than
- * quietly interpolating across a hole. */
-function cqbSampleAt(grid, gspec, x, y) {
-  var fc = (x - gspec.x0) / gspec.step;
-  var fr = (y - gspec.y0) / gspec.step;
-  var c0 = Math.floor(fc), r0 = Math.floor(fr);
-  if (c0 < 0 || r0 < 0 || c0 + 1 >= gspec.cols || r0 + 1 >= gspec.rows) return null;
-  var q11 = grid[r0][c0], q21 = grid[r0][c0 + 1];
-  var q12 = grid[r0 + 1][c0], q22 = grid[r0 + 1][c0 + 1];
-  if (q11 == null || q21 == null || q12 == null || q22 == null) return null;
-  var tx = fc - c0, ty = fr - r0;
-  return q11 * (1 - tx) * (1 - ty) + q21 * tx * (1 - ty) +
-         q12 * (1 - tx) * ty + q22 * tx * ty;
-}
-
-/* ------------------------------------------------------------------ *
- * 7b. Elevation points as comma-delimited XYZ
- * ------------------------------------------------------------------ *
- *
- * Home Designer has a second, more direct route for terrain than DXF:
- *   File > Import > Terrain Data
- * which takes a comma-delimited X,Y,Z text file. Confirmed by Chief Architect
- * staff on their own Home Designer forum, and it avoids a documented defect in
- * the DXF route where imported elevation lines land on the "CAD, Default" layer
- * instead of "Terrain, Elevation Data" -- which Chief support acknowledged as
- * "not really a bug, but an oversight".
- *
- * The coordinates here MUST share the DXF's local origin, or the terrain and
- * the lot boundary will not line up. They are also plain feet near zero, which
- * is what stops the failure reported repeatedly on Chief's forums where people
- * feed in latitude and longitude and every point stacks up in one spot because
- * the values differ only in their decimals.
- */
-function cqbElevationCsv(grid, gspec, origin, opts) {
-  opts = opts || {};
-  var maxPoints = opts.maxPoints || 2500;
-  var rows = grid.length;
-  var cols = rows ? grid[0].length : 0;
-
-  /* Thin evenly rather than truncating, so a large lot keeps coverage over the
-   * whole site instead of a dense patch in one corner. */
-  var stride = 1;
-  while (Math.ceil(rows / stride) * Math.ceil(cols / stride) > maxPoints) stride++;
-
-  var out = [];
-  for (var r = 0; r < rows; r += stride) {
-    for (var c = 0; c < cols; c += stride) {
-      var z = grid[r][c];
-      if (z == null || !isFinite(z)) continue;
-      var x = gspec.x0 + c * gspec.step - origin[0];
-      var y = gspec.y0 + r * gspec.step - origin[1];
-      out.push(x.toFixed(2) + ',' + y.toFixed(2) + ',' + z.toFixed(2));
-    }
-  }
-  return { text: out.join('\r\n') + '\r\n', count: out.length, stride: stride };
-}
-
-/* ------------------------------------------------------------------ *
- * 8. Projection: NAD83 Nebraska State Plane <-> Web Mercator
- * ------------------------------------------------------------------ *
- *
- * The county serves geometry in whatever outSR is asked for, so the drawing
- * itself never needs this. The elevation service does: 3DEP is a federal
- * service and only Web Mercator input is verified against it, so the sample
- * grid -- which is generated in State Plane feet, because that is what the
- * drawing is in -- has to be converted before it is sent.
- *
- * Doing the conversion here rather than asking a projection service keeps the
- * export to one external dependency instead of two, and makes the maths
- * testable offline. It is checked against a control point measured live from
- * the county's own service on 2026-08-28, where one parcel corner came back as
- * both (-10753777.97, 4943045.94) Web Mercator and (2584370.09, 271786.10)
- * State Plane feet.
- *
- * Nebraska is a single-zone Lambert Conformal Conic (2SP) on GRS80:
- *   standard parallels 40 N and 43 N, false origin 39 50' N / 100 W,
- *   false easting 500000 m, false northing 0.
- * NAD83 and WGS84 differ by about a metre here, which is well inside the
- * accuracy of both the parcel mapping and the lidar, and is noted in the
- * drawing rather than corrected for.
- */
 
 var CQB_LCC = (function () {
   var a = 6378137.0;                  /* GRS80 semi-major axis, metres */
@@ -1968,27 +1102,6 @@ function cqbWmToSpFt(x, y) {
   return CQB_LCC.fromLonLat(ll[0], ll[1]);
 }
 
-/* ------------------------------------------------------------------ *
- * 10. Building line setback
- * ------------------------------------------------------------------ *
- *
- * Lincoln's Building Line Districts carry a literal DISTANCE in feet. That is
- * NOT the zoning setback envelope -- it is one specific mapped overlay -- and
- * the drawing says so, because conflating the two would be a permitting error
- * rather than a cosmetic one.
- *
- * A building line runs parallel to the street right of way, so it only applies
- * to the frontage edges of a lot. The parcel boundary IS the right of way line
- * (parcels end where the ROW begins), so frontage is found by asking which lot
- * edges run near a street centerline, then offsetting those inward.
- *
- * This is a heuristic. It is right for ordinary lots and can be wrong on flag
- * lots, corner lots with an ambiguous front, and parcels fronting an unmapped
- * private drive. The line is drawn dashed, on its own layer, labelled with the
- * district distance and marked derived, so it reads as a guide and not as a
- * surveyed control line.
- */
-
 function cqbCentroid(ring) {
   var a = 0, cx = 0, cy = 0;
   for (var i = 0, n = ring.length; i < n - 1; i++) {
@@ -2007,6 +1120,11 @@ function cqbCentroid(ring) {
     return m ? [sx / m, sy / m] : [0, 0];
   }
   return [cx / (6 * a), cy / (6 * a)];
+}
+
+function cqbDist(a, b) {
+  var dx = b[0] - a[0], dy = b[1] - a[1];
+  return Math.sqrt(dx * dx + dy * dy);
 }
 
 function cqbPtSegDist(p, a, b) {
@@ -2045,30 +1163,6 @@ function cqbFrontageEdges(ring, paths, maxDist, minLen) {
   }
   return out;
 }
-
-/* Offset a segment perpendicular, toward whichever side the interior point is
- * on. Returns null for a degenerate segment rather than dividing by zero. */
-function cqbOffsetEdge(a, b, interior, dist) {
-  var dx = b[0] - a[0], dy = b[1] - a[1];
-  var len = Math.sqrt(dx * dx + dy * dy);
-  if (len < 1e-9) return null;
-  var nx = -dy / len, ny = dx / len;
-  var mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
-  var side = (interior[0] - mid[0]) * nx + (interior[1] - mid[1]) * ny;
-  var s = side < 0 ? -1 : 1;
-  return [[a[0] + nx * dist * s, a[1] + ny * dist * s],
-          [b[0] + nx * dist * s, b[1] + ny * dist * s]];
-}
-
-/* ------------------------------------------------------------------ *
- * 11. Soils, aggregated over the parcel
- * ------------------------------------------------------------------ *
- *
- * Percentages come from real clipped areas computed by the county's own public
- * geometry service, not from counting polygons or from bounding boxes. A soil
- * unit that clips a corner of the lot must not read the same as one covering
- * half of it.
- */
 
 var CQB_SOIL_FIELDS = ['HYDROGROUP', 'DRAINCLASS', 'HYDRICRATE', 'SOILTYPE', 'SOILDESC', 'FARMCLASS'];
 
@@ -2111,36 +1205,8 @@ function cqbSoilText(rows, maxParts) {
   }).join(', ');
 }
 
-/* ------------------------------------------------------------------ *
- * 12. Salt Creek storage / allowable-fill
- * ------------------------------------------------------------------ *
- *
- * Volume between existing ground and the FEMA base flood elevation over
- * parcel INTERSECT Salt Creek Storage Area, times the storage area's FILL_PRCNT
- * allowance. Reference only -- see the caveats emitted with the result.
- *
- * This replaces the standalone bookmarklet prototype. Three things changed:
- *
- *  - It works in State Plane feet like everything else. The prototype worked in
- *    Web Mercator and corrected for it with a cos(latitude) factor applied to
- *    the cell size. That is approximately right and was validated, but it is the
- *    same trap the site export exists to avoid, and it left cell area subtly
- *    dependent on where in the county you were.
- *  - Elevation samples are matched by the locationId the service returns rather
- *    than by hunting for the nearest returned point. The prototype compared
- *    every returned sample against every requested point -- 62,500 distance
- *    computations per 250-point batch -- to answer a question the response
- *    already answers exactly.
- *  - It is behind the same USGS opt-in as contours. The prototype called
- *    elevation.nationalmap.gov with no gate at all, which is precisely what the
- *    opt-in was built to prevent.
- *
- * The method itself is unchanged, because it was validated: SA #8 at
- * 1015 W O St (PID 1027100002000) gave 18,550 sq ft, 623 CY below BFE and
- * 218 CY at the 35% allowance, with a 10 ft vs 5 ft grid differing by 1.8%.
- */
-
 var CQB_SA_URL  = CQB_PUB + 'LTUWatershed/FEMEFloodDetails/MapServer/3';
+
 var CQB_BFE_URL = CQB_PUB + 'LTUWatershed/FEMEFloodDetails/MapServer/1';
 
 /* Flatten BFE polylines into elevation-tagged segments. */
@@ -2316,12 +1382,23 @@ function cqbStorageCalc(pid, opts, deps) {
   });
 }
 
-
-/* ------------------------------------------------------------------ *
- * 9. UI shim -- standalone bookmarklet entry point
- * ------------------------------------------------------------------ */
+/* Development Viewer -- Site tools dialog (shared).
+ *
+ * The dialog every user gets: one parcel field, the USGS elevation opt-in, and
+ * Fill capacity. Extra tools plug in at build time: a private module may push a
+ * function onto CQB_SITE_PLUGINS and it will be called with a small API when
+ * the dialog opens. The standard build ships with the array empty, so there is
+ * no dormant export code in it -- the private controls simply do not exist. */
 
 var CQB_SE_OPTIN = '__claude_qb_elev_optin';
+
+/* Chip tooltip. A build that adds tools overwrites this with a fuller wording. */
+var CQB_SITE_TOOLS_TIP = 'For one parcel: compute Salt Creek flood storage and the allowable fill';
+
+/* Build-time extension point. Each entry is a function (api) that may add
+ * controls and buttons to the dialog. Populated only in builds that include
+ * extra modules; never at runtime. */
+var CQB_SITE_PLUGINS = [];
 
 function cqbSeCss() {
   if (document.getElementById('cqb-se-css')) return;
@@ -2356,15 +1433,6 @@ function cqbSeCss() {
   document.head.appendChild(s);
 }
 
-function cqbSeDownload(name, text) {
-  var blob = new Blob([text], { type: 'application/dxf' });
-  var url = URL.createObjectURL(blob);
-  var a = document.createElement('a');
-  a.href = url; a.download = name;
-  document.body.appendChild(a); a.click();
-  setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(url); }, 2000);
-}
-
 /* Best effort at the parcel the user is already looking at, so the common case
  * is one click. Falls back to asking. */
 function cqbSeGuessPid() {
@@ -2383,7 +1451,7 @@ function cqbSeGuessPid() {
   return '';
 }
 
-function cqbSiteExportDialog() {
+function cqbSiteToolsDialog() {
   cqbSeCss();
   var back = document.createElement('div');
   back.className = 'cqb-se-back';
@@ -2396,24 +1464,9 @@ function cqbSiteExportDialog() {
       '<div class="bd">' +
         '<label for="cqb-se-pid">Parcel ID</label>' +
         '<input type="text" id="cqb-se-pid" placeholder="10 to 14 digits">' +
-        '<label for="cqb-se-margin">Context around the lot</label>' +
-        '<select id="cqb-se-margin">' +
-          '<option value="50">50 ft</option>' +
-          '<option value="100" selected>100 ft</option>' +
-          '<option value="250">250 ft</option>' +
-        '</select>' +
-        '<div class="row"><input type="checkbox" id="cqb-se-bear" checked>' +
-          '<span>Label each lot line with a grid bearing and distance</span></div>' +
-        '<div class="row"><input type="checkbox" id="cqb-se-cont"' + (optedIn ? '' : '') + '>' +
-          '<span>Include contours and spot elevations</span></div>' +
-        '<div id="cqb-se-elev" style="display:none">' +
-          '<label for="cqb-se-int">Contour interval</label>' +
-          '<select id="cqb-se-int"><option value="1">1 ft</option>' +
-            '<option value="2" selected>2 ft</option></select>' +
-        '</div>' +
-        /* The opt-in sits outside the contour block because two different
-         * actions need it now -- contours and the fill-capacity calculation --
-         * and it is the same consent either way. */
+        /* Build-time extras (a private module's controls) land here. */
+        '<div id="cqb-se-ext"></div>' +
+        /* The one consent that gates every use of ground elevations. */
         '<div class="warn" id="cqb-se-optin" style="display:none">' +
           '<b>This is the one thing that leaves the county server.</b><br>' +
           'The county publishes no elevation data, so ground heights come from the USGS ' +
@@ -2431,8 +1484,7 @@ function cqbSiteExportDialog() {
       '<div class="res" id="cqb-se-res"></div>' +
       '<div class="ft">' +
         '<button id="cqb-se-x">Close</button>' +
-        '<button id="cqb-se-fill">Fill capacity</button>' +
-        '<button class="go" id="cqb-se-run">Export DXF</button>' +
+        '<button class="go" id="cqb-se-fill">Fill capacity</button>' +
       '</div>' +
     '</div>';
   document.body.appendChild(back);
@@ -2446,10 +1498,6 @@ function cqbSiteExportDialog() {
   function needElevation(on) {
     $('cqb-se-optin').style.display = (on && !$('cqb-se-ok').checked) ? 'block' : 'none';
   }
-  $('cqb-se-cont').addEventListener('change', function () {
-    $('cqb-se-elev').style.display = this.checked ? 'block' : 'none';
-    needElevation(this.checked);
-  });
   $('cqb-se-ok').addEventListener('change', function () {
     if (this.checked) $('cqb-se-optin').style.display = 'none';
   });
@@ -2461,90 +1509,10 @@ function cqbSiteExportDialog() {
     if (e.key === 'Escape') { close(); document.removeEventListener('keydown', esc); }
   });
 
-  $('cqb-se-run').addEventListener('click', function () {
-    var pid = ($('cqb-se-pid').value || '').replace(/\D/g, '');
-    var st = $('cqb-se-st'), res = $('cqb-se-res');
-    res.innerHTML = '';
-    if (!/^\d{8,16}$/.test(pid)) { st.textContent = 'Enter a parcel ID first.'; return; }
-
-    var wantContours = $('cqb-se-cont').checked;
-    if (wantContours && !$('cqb-se-ok').checked) {
-      needElevation(true);
-      st.textContent = 'Tick the elevation box to confirm, or switch contours off.';
-      return;
-    }
-    if (wantContours) { try { localStorage.setItem(CQB_SE_OPTIN, '1'); } catch (e) {} }
-
-    var btn = this;
-    btn.disabled = true;
-    st.textContent = 'Reading the parcel...';
-
-    cqbSiteExport(pid, {
-      contours: wantContours,
-      interval: parseInt($('cqb-se-int').value, 10) || 2,
-      margin: parseInt($('cqb-se-margin').value, 10) || 100,
-      bearings: $('cqb-se-bear').checked,
-      onStatus: function (t) { st.textContent = t; }
-    }).then(function (r) {
-      btn.disabled = false;
-      st.textContent = 'Done.';
-      cqbSeDownload('parcel_' + r.pid + '_site.dxf', r.dxf);
-      /* Home Designer's File > Import > Terrain Data takes a comma delimited
-       * XYZ file and puts the points straight onto the terrain layer, which is
-       * more reliable than the DXF route. Both are offered; they share one
-       * origin so they line up. */
-      if (r.csv) {
-        setTimeout(function () {
-          cqbSeDownload('parcel_' + r.pid + '_elevations.txt', r.csv);
-        }, 700);
-      }
-
-      var rows = Object.keys(r.layers).map(function (k) {
-        return '<tr><td>' + k + '</td><td class="n">' + r.layers[k] + '</td></tr>';
-      }).join('');
-      if (r.contourLines) {
-        rows += '<tr><td>contour lines</td><td class="n">' + r.contourLines + '</td></tr>';
-      }
-      if (r.csvPoints) {
-        rows += '<tr><td>elevation points (.txt)</td><td class="n">' + r.csvPoints + '</td></tr>';
-      }
-      var extra = '';
-      if (r.buildingLineFt) {
-        extra += '<br>Building Line District: <b>' + r.buildingLineFt + ' ft</b>' +
-          (r.frontageEdges ? ' (drawn on ' + r.frontageEdges +
-            ' frontage edge' + (r.frontageEdges > 1 ? 's' : '') + ')' : '') +
-          ' &mdash; this is the mapped building line, not the zoning setback envelope';
-      }
-      if (r.soils) {
-        if (r.soils.HYDROGROUP) extra += '<br>Soils, hydrologic group: ' + r.soils.HYDROGROUP;
-        if (r.soils.DRAINCLASS) extra += '<br>Drainage: ' + r.soils.DRAINCLASS;
-        if (r.soils.HYDRICRATE) extra += '<br>Hydric: ' + r.soils.HYDRICRATE;
-      }
-      var html = '<b>parcel_' + r.pid + '_site.dxf</b> (' + Math.round(r.bytes / 1024) + ' KB)' +
-        '<table>' + rows + '</table>' +
-        '<div style="margin-top:8px;color:#9fb4c8">Lot area ' +
-        Math.round(r.computedArea).toLocaleString() + ' sq ft' +
-        (r.statedArea ? ' (Assessor: ' + Math.round(r.statedArea).toLocaleString() + ')' : '') +
-        (r.reliefFt != null ? '<br>Relief ' + r.reliefFt.toFixed(1) + ' ft over the sampled area' : '') +
-        extra + '</div>';
-      if (r.warnings.length) {
-        html += '<div class="warn">' + r.warnings.map(function (w) {
-          return w.replace(/</g, '&lt;');
-        }).join('<br><br>') + '</div>';
-      }
-      res.innerHTML = html;
-    }).catch(function (e) {
-      btn.disabled = false;
-      st.textContent = '';
-      res.innerHTML = '<div class="warn">' + String(e.message || e).replace(/</g, '&lt;') + '</div>';
-    });
-  });
-
   /* ---- Fill capacity (Salt Creek flood storage) --------------------------
-   * Same parcel field, same USGS consent, different answer: instead of a file
-   * this returns a volume. It only means anything inside one of the county's
-   * mapped Salt Creek storage areas, so the honest outcomes are "here is the
-   * number" and "this parcel is not in one" -- never a quiet zero. */
+   * It only means anything inside one of the county's mapped Salt Creek
+   * storage areas, so the honest outcomes are "here is the number" and "this
+   * parcel is not in one" -- never a quiet zero. */
   $('cqb-se-fill').addEventListener('click', function () {
     var pid = ($('cqb-se-pid').value || '').replace(/\D/g, '');
     var st = $('cqb-se-st'), res = $('cqb-se-res');
@@ -2624,6 +1592,26 @@ function cqbSiteExportDialog() {
       st.textContent = '';
       res.innerHTML = '<div class="warn">' + String(e.message || e).replace(/</g, '&lt;') + '</div>';
     });
+  });
+
+  /* Let build-time extras add their controls and buttons. A broken extra must
+   * not take the core dialog down with it. */
+  var api = {
+    root: back,
+    $: $,
+    ext: $('cqb-se-ext'),
+    foot: back.querySelector('.ft'),
+    statusEl: $('cqb-se-st'),
+    resultEl: $('cqb-se-res'),
+    needElevation: needElevation,
+    optKey: CQB_SE_OPTIN,
+    getPid: function () { return ($('cqb-se-pid').value || '').replace(/\D/g, ''); },
+    close: close
+  };
+  CQB_SITE_PLUGINS.forEach(function (p) {
+    try { p(api); } catch (e) {
+      if (typeof console !== 'undefined' && console.warn) console.warn('site-tools plugin failed', e);
+    }
   });
 }
 
@@ -2755,8 +1743,8 @@ function cqbSiteExportDialog() {
   bar.appendChild(lk);
 
   /* Settings: reconfigure which layers appear as chips */
-  var se = chip('Site tools', 'For one parcel: export a CAD site plan (DXF) for Home Designer, Chief Architect or AutoCAD, and compute Salt Creek flood storage and the allowable fill');
-  se.addEventListener('click', function () { try { cqbSiteExportDialog(); } catch (e) { toast('Site export failed to open: ' + (e && e.message ? e.message : e)); } });
+  var se = chip('Site tools', CQB_SITE_TOOLS_TIP);
+  se.addEventListener('click', function () { try { cqbSiteToolsDialog(); } catch (e) { toast('Site tools failed to open: ' + (e && e.message ? e.message : e)); } });
   bar.appendChild(se);
 
   var gear = chip('\u2699', 'Configure which layers appear as chips on this bar');
