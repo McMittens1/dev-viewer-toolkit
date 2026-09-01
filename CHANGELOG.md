@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.12.0 — freeboard
+
+The flood review gained a fourth check, run from the same single parcel fetch:
+
+- **Flood prone areas counted at last.** Freeboard applies over "the floodplain or floodprone area" (LMC 27.52/27.53), and the second half appears on no FEMA map. The review now checks the county's 86 mapped flood prone areas alongside the FEMA zones.
+- **Both freeboard heights, always.** 1 ft where the flood study is based on NOAA Atlas 14 rainfall, 2 ft otherwise (Ord. 21393), a flat 1 ft under County Art. 11.017. No public layer records the Atlas 14 basis, so the panel computes the required lowest floor at both heights against the highest base flood elevation mapped within 2,000 ft and never picks one.
+- **Chapter facts, no chapter verdict.** Whether Existing Urban (27.52), New Growth (27.53), or the county article applies is decided per application. The panel shows the map evidence — inside or outside the 2004 city limits, current zoning and whether its effective date precedes the 2004-05-10 freeze — and leaves the call to staff.
+- Same fail-shut rules as the rest of the review: a blank elevation is dropped rather than read as sea level, an undated zoning polygon is "not knowable" rather than presumed pre-2004, and every failed lookup says "not an all-clear".
+
 ## 1.11.0 — flood review
 
 The "Site tools" fill-capacity button now runs a three-part flood review from one parcel fetch:
