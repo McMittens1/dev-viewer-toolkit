@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.12.0
-// @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools (Salt Creek flood-storage and allowable-fill calculator, behind a USGS ground-elevation opt-in), FEMA Zone A, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
+// @version      1.13.0
+// @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools flood review (Salt Creek flood-storage and allowable-fill calculator, freeboard facts, FEMA Zone A, recorded flood documents, and FEMA letters of map change -- the USGS and FEMA services behind one opt-in), floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
 // @updateURL    https://raw.githubusercontent.com/McMittens1/dev-viewer-toolkit/main/DV_Toolkit.user.js
@@ -19,22 +19,26 @@
 // NETWORK. By default this script talks only to gis.lincoln.ne.gov, and stores
 // nothing beyond a few localStorage keys in your own browser.
 //
-// There is exactly one exception, and it is off until you turn it on. The Salt
-// Creek fill-capacity calculation needs ground elevations, and the county
-// publishes no elevation data anywhere in its public GIS -- all 26 service
-// folders were checked. Ground heights come from the USGS 3D Elevation Program
-// at elevation.nationalmap.gov. If you agree, your browser sends that parcel's
-// outline (public parcel coordinates, nothing identifying you) to that federal
-// service and receives ground heights back. The Site tools dialog says so and
-// makes you confirm before the first request; clear the localStorage key
-// __claude_qb_elev_optin to be asked again. Never agree and nothing but
-// gis.lincoln.ne.gov is contacted.
+// There are exactly two exceptions, and both are off until you turn them on
+// with one confirmation in the Site tools dialog. (1) The Salt Creek
+// fill-capacity calculation needs ground elevations, and the county publishes
+// no elevation data anywhere in its public GIS -- all 26 service folders were
+// checked. Ground heights come from the USGS 3D Elevation Program at
+// elevation.nationalmap.gov. (2) The flood review lists FEMA letters of map
+// change (LOMA/LOMR) on or near the parcel, from FEMA's National Flood Hazard
+// Layer at hazards.fema.gov. In both cases your browser sends that parcel's
+// outline (public parcel coordinates, nothing identifying you) to the federal
+// service. The dialog names both and makes you confirm before the first
+// request; clear the localStorage key __claude_qb_ext_optin to be asked again
+// (through 1.12.0 the key was __claude_qb_elev_optin and covered USGS only --
+// it is deliberately not honored for the wider consent). Never agree and
+// nothing but gis.lincoln.ne.gov is contacted.
 
 (function () {
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.12.0 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.13.0 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -52,7 +56,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.12.0', ready: false };
+  window.__dvToolkit = { version: '1.13.0', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -849,8 +853,23 @@ var CQB_REG = {
    * Geovanni (2026-08-31) the chapter call is made per application -- the map
    * facts below are evidence for staff, never a determination. */
   chapterFreezeDate: '2004-05-10',
+  /* How far beyond the parcel to look for LOMA points. Their coordinates are
+   * approximate ("LOMA LOGIC" geocoding, verified on the letters themselves),
+   * so a strict point-in-parcel test would miss letters sitting a lot line
+   * away. Matches within this reach are reported with their distance. */
+  lomcSearchFt: 500,
   sqFtPerAcre: 43560
 };
+
+/* FEMA National Flood Hazard Layer -- the ONLY endpoints in the toolkit that
+ * are neither gis.lincoln.ne.gov nor the USGS elevation service. Both are
+ * behind the same external-services consent as the elevations; nothing here
+ * runs before the user has agreed. Layer schemas and cross-origin access
+ * verified live from the viewer's own origin 2026-09-01. */
+var CQB_NFHL = 'https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer';
+var CQB_NFHL_LOMA_URL = CQB_NFHL + '/34'; /* points: CASENUMBER, STATUS, PROJECTCATEGORY,
+  DATEENDED, CID, COMMUNITYNAME, PDFHYPERLINKID, REVAL_STAT, LOTTYPE, OUTCOME, PROJECTNAME */
+var CQB_NFHL_LOMR_URL = CQB_NFHL + '/1';  /* polygons: CASE_NO, EFF_DATE, STATUS, LOMR_ID */
 
 /* Freeboard-fact layers (verified live 2026-09-01).
  * FloodProneAreas/0: 86 polygons, fields are just ID/GRIDCODE (GRIDCODE is 1
@@ -1696,8 +1715,70 @@ function cqbFreeboardAssess(parcelGeom, deps) {
   });
 }
 
+/* FEMA letters of map change touching or near the parcel, from the live
+ * National Flood Hazard Layer. External service: runs ONLY when the caller
+ * passes the parcel in, which cqbFloodReview does only after the external-
+ * services consent. LOMA points carry approximate coordinates, so the search
+ * reaches CQB_REG.lomcSearchFt beyond the parcel and every match reports
+ * whether it is on the parcel or how far away it landed. LOMRs are polygons
+ * revising whole reaches, so those are a straight intersection. Each source
+ * fails alone -- a FEMA outage renders as unchecked, never as "no letters". */
+function cqbLomcLookup(parcelGeom, deps) {
+  deps = deps || {};
+  var getJson = deps.getJson || cqbGetJson;
+  var b = cqbExpand(cqbBounds(parcelGeom.rings), CQB_REG.lomcSearchFt);
+  var lomaQ = getJson(CQB_NFHL_LOMA_URL + '/query?' + cqbQs({
+    geometry: JSON.stringify({ xmin: b.minx, ymin: b.miny, xmax: b.maxx, ymax: b.maxy,
+                               spatialReference: { wkid: CQB_SP_FT } }),
+    geometryType: 'esriGeometryEnvelope', inSR: CQB_SP_FT, outSR: CQB_SP_FT,
+    spatialRel: 'esriSpatialRelIntersects',
+    outFields: 'CASENUMBER,STATUS,PROJECTCATEGORY,DATEENDED,CID,COMMUNITYNAME,' +
+               'PDFHYPERLINKID,REVAL_STAT,LOTTYPE,OUTCOME,PROJECTNAME',
+    returnGeometry: 'true', f: 'json'
+  })).then(function (j) {
+    if (j && j.error) throw new Error('layer error');
+    var items = ((j && j.features) || []).map(function (f) {
+      var a = f.attributes || {};
+      var g = f.geometry || {};
+      var onParcel = null, distFt = null;
+      if (isFinite(g.x) && isFinite(g.y)) {
+        onParcel = cqbPointInRings(g.x, g.y, parcelGeom.rings);
+        if (!onParcel) {
+          var pb = cqbBounds(parcelGeom.rings);
+          var dx = g.x < pb.minx ? pb.minx - g.x : (g.x > pb.maxx ? g.x - pb.maxx : 0);
+          var dy = g.y < pb.miny ? pb.miny - g.y : (g.y > pb.maxy ? g.y - pb.maxy : 0);
+          distFt = Math.round(Math.sqrt(dx * dx + dy * dy));
+        }
+      }
+      a._onParcel = onParcel;
+      a._distFt = distFt;
+      return a;
+    });
+    return { ok: true, items: items };
+  }).catch(function () { return { ok: false, items: [] }; });
+  var lomrQ = getJson(CQB_NFHL_LOMR_URL + '/query?' + cqbQs({
+    geometry: JSON.stringify({ rings: parcelGeom.rings,
+                               spatialReference: { wkid: CQB_SP_FT } }),
+    geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT,
+    spatialRel: 'esriSpatialRelIntersects',
+    outFields: 'CASE_NO,EFF_DATE,STATUS,LOMR_ID',
+    returnGeometry: 'false', f: 'json'
+  })).then(function (j) {
+    if (j && j.error) throw new Error('layer error');
+    return { ok: true, items: ((j && j.features) || []).map(function (f) {
+      return f.attributes || {};
+    }) };
+  }).catch(function () { return { ok: false, items: [] }; });
+  return Promise.all([lomaQ, lomrQ]).then(function (r) {
+    return { loma: r[0], lomr: r[1] };
+  });
+}
+
 /* The orchestrator behind the Site tools button. Fetches the parcel once,
- * then runs the four checks concurrently. The storage calculation may throw
+ * then runs the checks concurrently -- four county-only, plus the FEMA
+ * letters when opts.includeFema is true (the UI sets it only after the
+ * external-services consent; letters: null means "not checked", which the
+ * renderer must say out loud). The storage calculation may throw
  * (its established behaviour, which its own tests pin); here that failure is
  * caught and carried as storage.failed so the Zone A flag and the recorded
  * documents still reach the screen. Only an unknown parcel rejects outright,
@@ -1720,7 +1801,12 @@ function cqbFloodReview(pid, opts, deps) {
       cqbRecordedFlood(pf.geometry, deps),
       cqbFreeboardAssess(pf.geometry, deps).catch(function () {
         return null; /* renderer treats null as "freeboard facts unavailable" */
-      })
+      }),
+      opts.includeFema
+        ? cqbLomcLookup(pf.geometry, deps).catch(function () {
+            return { loma: { ok: false, items: [] }, lomr: { ok: false, items: [] } };
+          })
+        : Promise.resolve(null) /* not consented: never touch FEMA */
     ]).then(function (r) {
       return {
         pid: pf.attributes.PARCELID,
@@ -1728,7 +1814,8 @@ function cqbFloodReview(pid, opts, deps) {
         zone: r[0],
         storage: r[1],
         records: r[2],
-        freeboard: r[3]
+        freeboard: r[3],
+        letters: r[4]
       };
     });
   });
@@ -1742,7 +1829,11 @@ function cqbFloodReview(pid, opts, deps) {
  * the dialog opens. The standard build ships with the array empty, so there is
  * no dormant export code in it -- the private controls simply do not exist. */
 
-var CQB_SE_OPTIN = '__claude_qb_elev_optin';
+/* External-services consent. v1.13.0 widened the consent from USGS elevations
+ * alone to USGS + FEMA NFHL, so this is a NEW key: the old __claude_qb_elev_optin
+ * consent covered one service and must NOT silently carry over to two. Users
+ * who agreed before are asked once more, with both services named. */
+var CQB_SE_OPTIN = '__claude_qb_ext_optin';
 
 /* Chip tooltip. A build that adds tools overwrites this with a fuller wording. */
 var CQB_SITE_TOOLS_TIP = 'For one parcel: compute Salt Creek flood storage and the allowable fill';
@@ -2057,6 +2148,80 @@ function cqbSeStorageHtml(r) {
   return html;
 }
 
+/* MSC download link for one letter. The Map Service Center files letters by
+ * product subtype, which tracks the case-number suffix: ...A cases (LOMA and
+ * LOMR-F determinations) are filed under LOMA, ...P under LOMR, ...V under
+ * REVAL -- the pattern verified against the MSC's own manifest CSVs
+ * (2026-09-01). An unrecognized suffix gets no link rather than a wrong one. */
+function cqbSeMscUrl(pdfId) {
+  if (cqbBlank(pdfId)) return null;
+  var id = String(pdfId).trim();
+  var m = id.match(/^\d{2}-\d{2}-\d+([APV])-\d+$/);
+  if (!m) return null;
+  var sub = { A: 'LOMA', P: 'LOMR', V: 'REVAL' }[m[1]];
+  return 'https://msc.fema.gov/portal/downloadProduct?productTypeID=LOMC' +
+         '&productSubTypeID=' + sub + '&productID=' + encodeURIComponent(id);
+}
+
+/* FEMA letters of map change. l is a cqbLomcLookup report, or null when the
+ * lookup was not run (no consent, or a direct county-only call) -- and "not
+ * checked" must be said, because on this panel silence reads as "no letters".
+ * Every county/FEMA text field is escaped; the MSC link is the only anchor. */
+function cqbSeLettersHtml(l) {
+  var esc = cqbSeEsc;
+  if (!l) {
+    return '<div style="margin-top:6px;color:#9fb4c8">FEMA letters of map change were not ' +
+      'checked (external service; runs only with the external-services box ticked).</div>';
+  }
+  var bits = [];
+  (l.loma.items || []).forEach(function (a) {
+    var line = '<b>' + esc(a.PROJECTCATEGORY || 'Letter of map change') +
+      (cqbBlank(a.CASENUMBER) ? '' : ' ' + esc(a.CASENUMBER)) + '.</b>';
+    if (!cqbBlank(a.PROJECTNAME)) line += ' ' + esc(a.PROJECTNAME) + '.';
+    var parts = [];
+    if (a._onParcel === true) parts.push('point falls on this parcel (location approximate)');
+    if (a._onParcel === false && a._distFt != null) {
+      parts.push('point about ' + a._distFt + ' ft away (location approximate)');
+    }
+    if (!cqbBlank(a.OUTCOME)) parts.push('outcome: ' + esc(a.OUTCOME));
+    var d = cqbDateStr(a.DATEENDED);
+    if (d) parts.push('determined ' + d);
+    if (!cqbBlank(a.REVAL_STAT) && /supersed/i.test(String(a.REVAL_STAT))) {
+      parts.push('<b>marked superseded &mdash; no longer in effect</b>');
+    }
+    if (parts.length) line += ' ' + parts.join('; ') + '.';
+    var url = cqbSeMscUrl(a.PDFHYPERLINKID);
+    if (url) {
+      line += ' <a href="' + esc(url) + '" target="_blank" rel="noopener">Letter PDF (FEMA)</a>';
+    }
+    bits.push('<div class="warn">' + line + '</div>');
+  });
+  (l.lomr.items || []).forEach(function (a) {
+    var line = '<b>LOMR' + (cqbBlank(a.CASE_NO) ? '' : ' ' + esc(a.CASE_NO)) +
+      '.</b> A map revision area covers part of this parcel.';
+    var parts = [];
+    var d = cqbDateStr(a.EFF_DATE);
+    if (d) parts.push('effective ' + d);
+    if (!cqbBlank(a.STATUS)) parts.push('status ' + esc(a.STATUS));
+    if (parts.length) line += ' ' + parts.join('; ') + '.';
+    bits.push('<div class="warn">' + line + '</div>');
+  });
+  var fails = [];
+  if (!l.loma.ok) fails.push('LOMA letters');
+  if (!l.lomr.ok) fails.push('LOMR revision areas');
+  if (fails.length) {
+    bits.push('<div class="warn">Could not check ' + fails.join(' or ') +
+      ' at FEMA just now. That is a lookup failure, not an all-clear.</div>');
+  }
+  if (!bits.length) {
+    return '<div style="margin-top:6px;color:#9fb4c8">No FEMA letters of map change are ' +
+      'recorded on or within ' + CQB_REG.lomcSearchFt + ' ft of this parcel.</div>';
+  }
+  return '<div style="margin-top:6px"><b>FEMA letters of map change.</b> Letter locations ' +
+    'are approximate; the letter itself governs, and only the FEMA determination text is ' +
+    'authoritative.</div>' + bits.join('');
+}
+
 function cqbSiteToolsDialog() {
   cqbSeCss();
   var back = document.createElement('div');
@@ -2072,18 +2237,24 @@ function cqbSiteToolsDialog() {
         '<input type="text" id="cqb-se-pid" placeholder="10 to 14 digits">' +
         /* Build-time extras (a private module's controls) land here. */
         '<div id="cqb-se-ext"></div>' +
-        /* The one consent that gates every use of ground elevations. */
+        /* The one consent that gates everything leaving the county server:
+         * USGS ground elevations and the FEMA letters lookup. One box, both
+         * services named, nothing sent before it is ticked. */
         '<div class="warn" id="cqb-se-optin" style="display:none">' +
-          '<b>This is the one thing that leaves the county server.</b><br>' +
-          'The county publishes no elevation data, so ground heights come from the USGS ' +
-          '3D Elevation Program. Your browser sends the lot outline (public parcel ' +
-          'coordinates, nothing about you) to elevation.nationalmap.gov and gets ground ' +
-          'heights back.<br><br>' +
-          'It is bare-earth lidar, <b>not a survey</b>: it predates recent grading and fill, ' +
+          '<b>These are the only things that leave the county server.</b><br>' +
+          'Two external services, both federal, both receiving only the lot outline ' +
+          '(public parcel coordinates, nothing about you):<br><br>' +
+          '<b>1. USGS 3D Elevation Program</b> (elevation.nationalmap.gov) &mdash; ground ' +
+          'heights for the fill-capacity number, because the county publishes no elevation ' +
+          'data. Bare-earth lidar, <b>not a survey</b>: it predates recent grading and fill, ' +
           'omits structures, and must not be used for finished floor elevations, drainage ' +
-          'design, or floodplain compliance.' +
+          'design, or floodplain compliance.<br><br>' +
+          '<b>2. FEMA National Flood Hazard Layer</b> (hazards.fema.gov) &mdash; letters of ' +
+          'map change (LOMA/LOMR) on or near the parcel: FEMA determinations that removed ' +
+          'property from, or revised, the mapped floodplain. Letter locations are ' +
+          'approximate; the letter itself governs.' +
           '<div class="row" style="margin-top:9px"><input type="checkbox" id="cqb-se-ok">' +
-            '<span>Understood, fetch elevations</span></div>' +
+            '<span>Understood, use both services</span></div>' +
         '</div>' +
       '</div>' +
       '<div class="st" id="cqb-se-st"></div>' +
@@ -2135,7 +2306,8 @@ function cqbSiteToolsDialog() {
     btn.disabled = true;
     st.textContent = 'Reading the parcel...';
 
-    cqbFloodReview(pid, { onStatus: function (t) { st.textContent = t; } }).then(function (rv) {
+    cqbFloodReview(pid, { includeFema: true,
+                          onStatus: function (t) { st.textContent = t; } }).then(function (rv) {
       btn.disabled = false;
       st.textContent = 'Done.';
       var head = '<b>' + (rv.address || ('PID ' + rv.pid)) + '</b>';
@@ -2143,7 +2315,8 @@ function cqbSiteToolsDialog() {
         cqbSeZoneHtml(rv.zone) +
         cqbSeFreeboardHtml(rv.zone, rv.freeboard) +
         cqbSeStorageHtml(rv.storage) +
-        cqbSeRecordsHtml(rv.records);
+        cqbSeRecordsHtml(rv.records) +
+        cqbSeLettersHtml(rv.letters);
     }).catch(function (e) {
       btn.disabled = false;
       st.textContent = '';
