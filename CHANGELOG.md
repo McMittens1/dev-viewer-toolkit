@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.13.0 — FEMA letters of map change
+
+The flood review now asks FEMA's National Flood Hazard Layer, live, for letters of map change on or within 500 ft of the parcel:
+
+- **LOMAs and LOMR-F determinations** as points — case number, project, outcome, determination date, whether the point falls on the parcel or how far away (letter locations are approximate; the letter itself governs), and a direct link to the letter PDF at FEMA's Map Service Center. Letters FEMA has marked **superseded** are flagged as no longer in effect — something the letter PDFs alone cannot tell you.
+- **LOMR revision areas** as polygons where one overlaps the parcel, with effective date and status.
+- A FEMA outage renders as "could not check — not an all-clear", per source, never as "no letters".
+
+**The consent changed shape.** External calls are now two federal services behind one opt-in: USGS ground elevations and the FEMA letters lookup. The dialog names both and shows what is sent (the lot outline, nothing about you). Because the old consent covered one service, it does not carry over — the choice now lives in `__claude_qb_ext_optin`, and everyone is asked once more the first time they run Fill capacity.
+
 ## 1.12.0 — freeboard
 
 The flood review gained a fourth check, run from the same single parcel fetch:
