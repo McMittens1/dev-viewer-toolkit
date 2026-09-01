@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.11.0 — flood review
+
+The "Site tools" fill-capacity button now runs a three-part flood review from one parcel fetch:
+
+- **FEMA zones and the Zone A study rule.** A parcel touching Zone A gets a notice showing both measurements — the parcel total and the acres inside Zone A, clipped with the county's own geometry service — against the greater-than-either-five-acres-or-fifty-lots engineered base flood elevation study rule (LMC 27.52.040(g)/27.53.040(g); County Art. 11.007(h) uses the acreage test only). Which figure the five acres is measured against is a staff determination made case by case, so the panel shows both and renders no verdict.
+- **Recorded flood documents.** Building restriction agreements and watershed encumbrances mapped on the parcel, with EO/instrument numbers, parties and dates. An outage reports itself as unchecked, never as "none recorded".
+- **Fill capacity caveats.** The result panel now states the ordinance limits of the number: LMC 27.52.035 assesses the whole development area, the storage baseline is 2007-03-05 (Ord. 18893) while lidar shows current ground, and "fill" includes buildings (27.52.020) — so the figure is a floor, not a ceiling.
+
+Also hardened against the county's blank-data shapes: a null, empty or single-space `FILL_PRCNT`, `GIS_AREA`, `ELEV`, `V_DATUM` or date now reports "not recorded" instead of a confident 0, NaN, or 1970-01-01.
+
 ## 1.6.1
 
 - Userscript now declares `@updateURL` / `@downloadURL`, so Tampermonkey updates itself from this repository. This is the last version that has to be installed by hand.
