@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.10.0
+// @version      1.11.0
 // @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools (Salt Creek flood-storage and allowable-fill calculator, behind a USGS ground-elevation opt-in), FEMA Zone A, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
@@ -34,7 +34,7 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.10.0 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.11.0 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -52,7 +52,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.10.0', ready: false };
+  window.__dvToolkit = { version: '1.11.0', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -815,6 +815,32 @@ var CQB_SOILS_URL = CQB_PUB + 'CityCounty/Soils/MapServer/1';
 
 var CQB_GEOM_URL = CQB_PUB + 'Utilities/Geometry/GeometryServer';
 
+/* Flood-review layers (verified live 2026-08-29; see 2_REFERENCE/DATA_CATALOG.md).
+ * FEMAFlood/1: FLD_ZONE is 'AE' or 'A' and nothing else in this county;
+ * FLOODWAY is the string 'FLOODWAY' or a single space, never null. */
+var CQB_FEMA_URL = CQB_PUB + 'LTUWatershed/FEMAFlood/MapServer/1';
+var CQB_BRA_URL  = CQB_PUB + 'LTUWatershed/BuildRestrictionAgreement/MapServer/0';
+var CQB_WSE_URL  = CQB_PUB + 'LTUWatershed/WatershedEncumbrances/MapServer/0';
+
+/* Regulatory constants, with their citations. These are the numbers the panel
+ * turns into flags, so each carries where it comes from; do not change one
+ * without re-reading the cited section. All were extracted from the LLM-
+ * optimized code texts on 2026-08-28 and recorded in HANDOFF section 4. */
+var CQB_REG = {
+  /* LMC 27.52.040(g) / 27.53.040(g): developments larger than this many acres
+   * in FEMA Zone A require an engineered base flood elevation study. */
+  zoneAStudyAcres: 5,
+  /* Same sections -- both chapters read "greater than either five acres or
+   * fifty lots", so the lot alternative applies in Existing Urban AND New
+   * Growth. County Art. 11.007(h) is acres-only, no lot trigger. No public
+   * layer counts proposed lots, so this stays a caveat, never a computed flag. */
+  zoneAStudyLots: 50,
+  /* Ord. 18893 effective date: the storage-volume baseline for allowable fill
+   * under LMC 27.52.035. Lidar shows current ground, not this date's ground. */
+  storageBaselineDate: '2007-03-05',
+  sqFtPerAcre: 43560
+};
+
 /* Clip a set of polygons to the parcel and measure the result, using the
  * county's own public geometry service. Planar rather than geodesic because
  * State Plane is a projected system built for exactly this -- the parcel area
@@ -862,6 +888,20 @@ function cqbGeoPost(op, params) {
 }
 
 var CQB_3DEP = 'https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer';
+
+/* The empty shapes ArcGIS actually returns for a missing attribute: null,
+ * undefined, '' and -- on this county's data -- a single space. Number() turns
+ * the first three into 0 and isFinite(0) is true, which is how a value the
+ * county never published becomes a confident zero on the panel. Test with this
+ * BEFORE coercing anything a user will read as a regulatory number. */
+function cqbBlank(v) {
+  return v === null || v === undefined || String(v).trim() === '';
+}
+
+/* Storage areas are shown by number; an unnumbered one must not read "#null". */
+function cqbSaLabel(n) {
+  return cqbBlank(n) ? '(unnumbered)' : '#' + n;
+}
 
 function cqbQs(o) {
   return Object.keys(o).map(function (k) {
@@ -1263,12 +1303,13 @@ function cqbStorageCalc(pid, opts, deps) {
   var say = opts.onStatus || function () {};
   var rep = { warnings: [] };
 
-  return getJson(CQB_SITE_SOURCES[0].url + '/query?' + cqbQs({
-    where: "PARCELID='" + String(pid).replace(/'/g, "''") + "'",
-    outFields: 'PARCELID,SITEADDRESS,GIS_AREA', returnGeometry: 'true', outSR: CQB_SP_FT, f: 'json'
-  })).then(function (j) {
-    var f = (j.features || [])[0];
-    if (!f || !f.geometry || !f.geometry.rings) throw new Error('Parcel ' + pid + ' not found, or it has no mapped boundary.');
+  /* cqbFloodReview fetches the parcel once and passes it in, so the review's
+   * three checks share a single TaxParcels request. Called directly (tests,
+   * or the calculator on its own), the fetch happens here. */
+  var pfPromise = opts.parcelFeature
+    ? Promise.resolve(opts.parcelFeature)
+    : cqbParcelByPid(pid, 'PARCELID,SITEADDRESS,GIS_AREA', getJson);
+  return pfPromise.then(function (f) {
     rep.pid = f.attributes.PARCELID;
     rep.address = f.attributes.SITEADDRESS || '';
     rep._parcel = f.geometry;
@@ -1285,11 +1326,29 @@ function cqbStorageCalc(pid, opts, deps) {
     if (!fs.length) { rep.noStorageArea = true; return null; }
     rep.storageAreas = fs.length;
     var sa = fs[0];
-    rep.saNumber = sa.attributes.SA_NUMBER;
-    rep.fillPercent = Number(sa.attributes.FILL_PRCNT);
+    rep.saNumber = cqbBlank(sa.attributes.SA_NUMBER) ? null : sa.attributes.SA_NUMBER;
+    rep.saLabel = cqbSaLabel(rep.saNumber);
+    /* Same Number(null) === 0 trap cqbBfeSegments guards for ELEV, and it bit
+     * here: a null, empty or single-space FILL_PRCNT used to report a confident
+     * "fill allowance 0%" / "Allowable fill: 0 CY" with no warning, and a
+     * non-numeric one "fill allowance NaN%". Blank-not-null is a real shape in
+     * this county's data -- the FLOODWAY field on a sibling layer is a single
+     * space 1,527 times. Refuse to state an allowance we do not have. */
+    var rawPct = sa.attributes ? sa.attributes.FILL_PRCNT : null;
+    var pct = cqbBlank(rawPct) ? NaN : Number(rawPct);
+    if (isFinite(pct)) {
+      rep.fillPercent = pct;
+    } else {
+      rep.fillPercent = null;
+      rep.fillPercentUnknown = true;
+      rep.warnings.push('Storage area ' + rep.saLabel + ' has no usable fill allowance ' +
+        'percentage recorded' + (cqbBlank(rawPct) ? '' : ' (it reads "' + String(rawPct) + '")') +
+        ', so no allowable fill is shown. The storage volume below is unaffected.');
+    }
     if (fs.length > 1) {
-      rep.warnings.push('This parcel touches ' + fs.length + ' storage areas; only SA #' +
-        rep.saNumber + ' (' + rep.fillPercent + '%) is computed here.');
+      rep.warnings.push('This parcel touches ' + fs.length + ' storage areas; only SA ' +
+        rep.saLabel + ' (' + (rep.fillPercent == null ? 'allowance not recorded'
+          : rep.fillPercent + '%') + ') is computed here.');
     }
 
     say('Clipping to the storage area...');
@@ -1319,12 +1378,23 @@ function cqbStorageCalc(pid, opts, deps) {
     var fs = (j && j.features) || [];
     if (!fs.length) { rep.noBfe = true; return null; }
     /* Datum has to match 3DEP or the subtraction is meaningless. */
-    var datums = {};
-    fs.forEach(function (f) { var d = f.attributes && f.attributes.V_DATUM; if (d) datums[String(d).trim()] = 1; });
+    var datums = {}, undeclared = 0;
+    fs.forEach(function (f) {
+      var d = f.attributes && f.attributes.V_DATUM;
+      if (cqbBlank(d)) { undeclared++; return; }
+      datums[String(d).trim()] = 1;
+    });
     rep.bfeDatums = Object.keys(datums);
+    rep.bfeDatumMissing = undeclared;
     if (rep.bfeDatums.length && rep.bfeDatums.indexOf('NAVD88') === -1) {
       rep.warnings.push('BFE lines report vertical datum ' + rep.bfeDatums.join('/') +
         ', but the elevation model is NAVD88. The depths below are not trustworthy.');
+    } else if (!rep.bfeDatums.length) {
+      /* The empty-object case used to short-circuit the test above and be read
+       * as agreement. Not declaring a datum is not the same as declaring ours. */
+      rep.warnings.push('None of the ' + fs.length + ' BFE lines near this parcel declares a ' +
+        'vertical datum, so it cannot be confirmed they are on the same NAVD88 basis as the ' +
+        'ground elevations. Treat the depths below as unverified.');
     }
     var bfe = cqbBfeSegments(fs);
     if (!bfe.elevs.length) { rep.noBfe = true; return null; }
@@ -1377,10 +1447,186 @@ function cqbStorageCalc(pid, opts, deps) {
     rep.volumeCF = vol;
     rep.volumeCY = vol / 27;
     rep.wetCells = wet;
-    if (isFinite(rep.fillPercent)) rep.allowableCY = rep.volumeCY * rep.fillPercent / 100;
+    /* isFinite(null) is true (Number(null) === 0), so the null check is load-bearing. */
+    if (rep.fillPercent != null && isFinite(rep.fillPercent)) {
+      rep.allowableCY = rep.volumeCY * rep.fillPercent / 100;
+    }
     if (miss) rep.warnings.push(miss + ' of ' + d.pts.length + ' sample points had no elevation and were skipped.');
     if (!wet) rep.warnings.push('No part of the clipped area sits below the base flood elevation, so there is no storage to fill.');
     return rep;
+  });
+}
+
+
+/* ---- Flood review (v1.11.0) ------------------------------------------------
+ * One parcel fetch, then three independent checks run in parallel: the FEMA
+ * Zone A study flag, the Salt Creek fill capacity, and the recorded flood
+ * documents. Each check degrades alone: a dead layer reports itself as
+ * unchecked instead of taking the others down or -- worse -- reading as a
+ * clean answer. */
+
+/* The one place a parcel is fetched by PID. Throws (message must keep the
+ * words 'not found' -- the UI and tests rely on it) when the parcel does not
+ * exist or carries no polygon. The empty-rings case is real: a PARCELID can
+ * resolve to a record whose geometry has rings: []. */
+function cqbParcelByPid(pid, outFields, getJson) {
+  var g = getJson || cqbGetJson;
+  return g(CQB_SITE_SOURCES[0].url + '/query?' + cqbQs({
+    where: "PARCELID='" + String(pid).replace(/'/g, "''") + "'",
+    outFields: outFields || 'PARCELID,SITEADDRESS,GIS_AREA',
+    returnGeometry: 'true', outSR: CQB_SP_FT, f: 'json'
+  })).then(function (j) {
+    var f = (j.features || [])[0];
+    if (!f || !f.geometry || !f.geometry.rings || !f.geometry.rings.length) {
+      throw new Error('Parcel ' + pid + ' not found, or it has no mapped boundary.');
+    }
+    return f;
+  });
+}
+
+/* Epoch-milliseconds date to 'YYYY-MM-DD', or null. The guard order is the
+ * point: new Date(null) is 1970-01-01, NOT Invalid Date, so a null must be
+ * rejected before it reaches the Date constructor. Same family as the
+ * Number(null) === 0 trap cqbBlank exists for. */
+function cqbDateStr(raw) {
+  if (cqbBlank(raw)) return null;
+  var n = Number(raw);
+  if (!isFinite(n) || n <= 0) return null;
+  var d = new Date(n);
+  if (isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0, 10);
+}
+
+/* FEMA zones touching the parcel, and the Zone A acreage facts.
+ *
+ * LMC 27.52.040(g) / 27.53.040(g) require an engineered BFE study for
+ * developments larger than 5 acres in Zone A. Per Geovanni (2026-08-31),
+ * WHAT the 5 acres is measured against -- the whole development, or only the
+ * part of it in Zone A -- is a staff determination made case by case. So this
+ * never renders a verdict. It reports BOTH measurements, parcel total and the
+ * parcel's area inside Zone A, plus the threshold, and leaves the call to
+ * staff. A null total area is surfaced as unmeasurable ("cannot be ruled
+ * out"), never coerced: Number(null) is 0, 0 > 5 is false, and a coerced null
+ * would silently suppress a regulatory notice -- fail-open. rep.failed means
+ * the layer could not be asked, which the UI must render as unchecked, not as
+ * all-clear. The Zone A clip area comes from the county geometry service via
+ * cqbClipArea, which returns null rather than a guess when any step fails. */
+function cqbZoneAssess(parcelGeom, attrs, deps) {
+  deps = deps || {};
+  var getJson = deps.getJson || cqbGetJson;
+  var post = deps.geoPost || cqbGeoPost;
+  var rep = { zones: [], floodway: false, inZoneA: false };
+  var rawArea = attrs ? attrs.GIS_AREA : null;
+  var area = cqbBlank(rawArea) ? NaN : Number(rawArea);
+  if (isFinite(area) && area > 0) {
+    rep.acres = area / CQB_REG.sqFtPerAcre;
+  } else {
+    rep.acres = null;
+    rep.acresUnknown = true;
+  }
+  return getJson(CQB_FEMA_URL + '/query?' + cqbQs({
+    geometry: JSON.stringify({ rings: parcelGeom.rings, spatialReference: { wkid: CQB_SP_FT } }),
+    geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT,
+    spatialRel: 'esriSpatialRelIntersects', outFields: 'FLD_ZONE,FLOODWAY',
+    returnGeometry: 'false', f: 'json'
+  })).then(function (j) {
+    (j.features || []).forEach(function (f) {
+      var a = f.attributes || {};
+      var z = cqbBlank(a.FLD_ZONE) ? '' : String(a.FLD_ZONE).trim();
+      if (z && rep.zones.indexOf(z) < 0) rep.zones.push(z);
+      if (!cqbBlank(a.FLOODWAY) && String(a.FLOODWAY).trim() === 'FLOODWAY') rep.floodway = true;
+    });
+    rep.zones.sort();
+    rep.inZoneA = rep.zones.indexOf('A') >= 0;
+    if (!rep.inZoneA) return rep;
+    /* Second, geometry-carrying query only for Zone A parcels: fetch the Zone A
+     * polygons touching the parcel and measure the overlap. Zone A polygons are
+     * large rural reaches, so this response can be heavy -- which is why it is
+     * not part of the first query and only Zone A parcels pay for it. */
+    return getJson(CQB_FEMA_URL + '/query?' + cqbQs({
+      geometry: JSON.stringify({ rings: parcelGeom.rings, spatialReference: { wkid: CQB_SP_FT } }),
+      geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT, outSR: CQB_SP_FT,
+      spatialRel: 'esriSpatialRelIntersects', where: "FLD_ZONE='A'",
+      outFields: 'FLD_ZONE', returnGeometry: 'true', f: 'json'
+    })).then(function (jz) {
+      var geoms = (jz.features || []).map(function (f) { return f.geometry; });
+      return cqbClipArea(parcelGeom, geoms, post);
+    }).then(function (sqft) {
+      rep.zoneAAcres = (sqft === null || sqft === undefined)
+        ? null : sqft / CQB_REG.sqFtPerAcre;
+      rep.overOnTotal = rep.acres != null ? rep.acres > CQB_REG.zoneAStudyAcres : null;
+      rep.overOnZoneA = rep.zoneAAcres != null ? rep.zoneAAcres > CQB_REG.zoneAStudyAcres : null;
+      return rep;
+    }).catch(function () {
+      rep.zoneAAcres = null;
+      rep.overOnTotal = rep.acres != null ? rep.acres > CQB_REG.zoneAStudyAcres : null;
+      rep.overOnZoneA = null;
+      return rep;
+    });
+  }).catch(function () {
+    rep.failed = true;
+    return rep;
+  });
+}
+
+/* Recorded flood documents mapped on the parcel: building restriction
+ * agreements and watershed encumbrances, both county layers on the same host
+ * as everything else. Each source reports ok:false on failure -- an outage
+ * must never render as 'none recorded'. */
+function cqbRecordedFlood(parcelGeom, deps) {
+  deps = deps || {};
+  var getJson = deps.getJson || cqbGetJson;
+  function lookup(url, outFields) {
+    return getJson(url + '/query?' + cqbQs({
+      geometry: JSON.stringify({ rings: parcelGeom.rings, spatialReference: { wkid: CQB_SP_FT } }),
+      geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT,
+      spatialRel: 'esriSpatialRelIntersects', outFields: outFields,
+      returnGeometry: 'false', f: 'json'
+    })).then(function (j) {
+      return { ok: true, items: (j.features || []).map(function (f) { return f.attributes || {}; }) };
+    }).catch(function () {
+      return { ok: false, items: [] };
+    });
+  }
+  return Promise.all([
+    lookup(CQB_BRA_URL, 'EO_Number,Applicant,CurrentOwn,DateFiled,Final_Date,SubjectMat,Instrument'),
+    lookup(CQB_WSE_URL, 'ENCUMID,ENCUMTYPE,NAME,ENCUMBRANCEHOLDER,ProjectName,SRCREF,LEGALSTARTDATE')
+  ]).then(function (r) {
+    return { bra: r[0], wse: r[1] };
+  });
+}
+
+/* The orchestrator behind the Site tools button. Fetches the parcel once,
+ * then runs the three checks concurrently. The storage calculation may throw
+ * (its established behaviour, which its own tests pin); here that failure is
+ * caught and carried as storage.failed so the Zone A flag and the recorded
+ * documents still reach the screen. Only an unknown parcel rejects outright,
+ * because then there is nothing to review. */
+function cqbFloodReview(pid, opts, deps) {
+  opts = opts || {};
+  deps = deps || {};
+  var getJson = deps.getJson || cqbGetJson;
+  var say = opts.onStatus || function () {};
+  return cqbParcelByPid(pid, 'PARCELID,SITEADDRESS,GIS_AREA', getJson).then(function (pf) {
+    say('Checking flood layers...');
+    var storageOpts = {};
+    for (var k in opts) storageOpts[k] = opts[k];
+    storageOpts.parcelFeature = pf;
+    return Promise.all([
+      cqbZoneAssess(pf.geometry, pf.attributes, deps),
+      cqbStorageCalc(pid, storageOpts, deps).catch(function (e) {
+        return { failed: true, message: String((e && e.message) || e), warnings: [] };
+      }),
+      cqbRecordedFlood(pf.geometry, deps)
+    ]).then(function (r) {
+      return {
+        pid: pf.attributes.PARCELID,
+        address: pf.attributes.SITEADDRESS || '',
+        zone: r[0],
+        storage: r[1],
+        records: r[2]
+      };
+    });
   });
 }
 
@@ -1451,6 +1697,165 @@ function cqbSeGuessPid() {
     }
   } catch (e) {}
   return '';
+}
+
+/* Everything a county record hands back is free text headed for innerHTML,
+ * so it all goes through this first. */
+function cqbSeEsc(v) {
+  return String(v === null || v === undefined ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/* The Zone A block. Empty string when there is nothing regulatory to say
+ * (AE-only parcels are covered by the popup's floodplain rows already).
+ * Per staff practice (Geovanni, 2026-08-31), whether the 5-acre engineered-
+ * study threshold is measured against the whole development or only the Zone A
+ * portion is decided case by case -- so this block shows BOTH measurements and
+ * the rule, and never a verdict. A failed lookup is said out loud; silence
+ * would read as all-clear. */
+function cqbSeZoneHtml(z) {
+  if (!z) return '';
+  if (z.failed) {
+    return '<div class="warn">The FEMA flood layer could not be checked just now, so no ' +
+      'Zone A determination is shown. That is a lookup failure, not an all-clear.</div>';
+  }
+  if (!z.inZoneA) return '';
+  var ac2 = function (v) { return Math.round(v * 100) / 100; };
+  var totalTxt = z.acres != null ? ac2(z.acres) + ' acres total' : 'total area not recorded';
+  var zoneTxt = z.zoneAAcres != null
+    ? ac2(z.zoneAAcres) + ' acres of it inside Zone A'
+    : 'the area inside Zone A could not be measured just now';
+  var over = z.overOnTotal === true || z.overOnZoneA === true ||
+             z.overOnTotal === null || z.overOnZoneA === null;
+  var open = over ? '<div class="warn">' : '<div style="margin-top:6px;color:#c2d4e6">';
+  return open + '<b>FEMA Zone A' + (z.floodway ? ' (and floodway)' : '') + '.</b> ' +
+    'This parcel touches Zone A, which has no determined base flood elevation. ' +
+    'Measured: ' + totalTxt + '; ' + zoneTxt + '. ' +
+    'Developments greater than either ' + CQB_REG.zoneAStudyAcres + ' acres or ' +
+    CQB_REG.zoneAStudyLots + ' lots in Zone A require an engineered base flood elevation ' +
+    'study (LMC 27.52.040(g) / 27.53.040(g); the county code, Art. 11.007(h), uses the ' +
+    'acreage test only). Whether the ' + CQB_REG.zoneAStudyAcres + ' acres is measured against the whole ' +
+    'development or only its Zone A portion is a staff determination made case by case ' +
+    '&mdash; both figures are shown here and this tool does not decide it. A development ' +
+    'can also span multiple parcels, which parcel mapping alone cannot capture.</div>';
+}
+
+/* Recorded flood documents. Three honest shapes: the documents found, an
+ * explicit "none mapped" when both lookups answered, and a named failure when
+ * one did not. */
+function cqbSeRecordsHtml(rec) {
+  if (!rec) return '';
+  var esc = cqbSeEsc;
+  var bits = [];
+  (rec.bra.items || []).forEach(function (a) {
+    var line = '<b>Building restriction agreement' +
+      (cqbBlank(a.EO_Number) ? '' : ' EO ' + esc(a.EO_Number)) + '.</b>';
+    if (!cqbBlank(a.SubjectMat)) line += ' ' + esc(a.SubjectMat) + '.';
+    var parts = [];
+    if (!cqbBlank(a.Applicant)) parts.push('applicant ' + esc(a.Applicant));
+    if (!cqbBlank(a.CurrentOwn)) parts.push('current owner ' + esc(a.CurrentOwn));
+    var fd = cqbDateStr(a.DateFiled);
+    if (fd) parts.push('filed ' + fd);
+    if (!cqbBlank(a.Instrument)) parts.push('instrument ' + esc(a.Instrument));
+    if (parts.length) line += ' ' + parts.join('; ') + '.';
+    bits.push('<div class="warn">' + line + '</div>');
+  });
+  (rec.wse.items || []).forEach(function (a) {
+    var line = '<b>Watershed encumbrance' +
+      (cqbBlank(a.NAME) ? '' : ' &mdash; ' + esc(a.NAME)) + '.</b>';
+    var parts = [];
+    if (!cqbBlank(a.ENCUMTYPE)) parts.push('type ' + esc(a.ENCUMTYPE));
+    if (!cqbBlank(a.ENCUMBRANCEHOLDER)) parts.push('holder ' + esc(a.ENCUMBRANCEHOLDER));
+    if (!cqbBlank(a.ProjectName)) parts.push('project ' + esc(a.ProjectName));
+    if (!cqbBlank(a.SRCREF)) parts.push('recorded ref ' + esc(a.SRCREF));
+    var sd = cqbDateStr(a.LEGALSTARTDATE);
+    if (sd) parts.push('effective ' + sd);
+    if (parts.length) line += ' ' + parts.join('; ') + '.';
+    bits.push('<div class="warn">' + line + '</div>');
+  });
+  var fails = [];
+  if (!rec.bra.ok) fails.push('building restriction agreements');
+  if (!rec.wse.ok) fails.push('watershed encumbrances');
+  if (fails.length) {
+    bits.push('<div class="warn">Could not check ' + fails.join(' or ') +
+      ' just now. That is a lookup failure, not an all-clear.</div>');
+  }
+  if (!bits.length) {
+    return '<div style="margin-top:6px;color:#9fb4c8">No building restriction agreements or ' +
+      'watershed encumbrances are mapped on this parcel.</div>';
+  }
+  return bits.join('');
+}
+
+/* The fill-capacity block, one honest outcome at a time. r is a
+ * cqbStorageCalc report, or {failed,message} when the calculation itself
+ * fell over -- which must not hide the other blocks of the review. */
+function cqbSeStorageHtml(r) {
+  if (!r) return '';
+  if (r.failed) {
+    return '<div class="warn">The fill-capacity calculation failed: ' +
+      cqbSeEsc(r.message) + '</div>';
+  }
+  if (r.noStorageArea) {
+    return '<div style="margin-top:6px;color:#c2d4e6">This parcel is not ' +
+      'inside a mapped Salt Creek flood storage area, so no fill allowance applies here. ' +
+      'That is not the same as "no floodplain rules apply" &mdash; the FEMA check above ' +
+      'and the popup\u2019s floodplain rows cover the mapped zones.</div>';
+  }
+  if (r.emptyClip) {
+    return '<div style="margin-top:6px;color:#c2d4e6">The parcel only touches ' +
+      'the edge of storage area ' + r.saLabel + '; none of its area falls inside.</div>';
+  }
+  if (r.noBfe) {
+    return '<div class="warn">Storage area ' + r.saLabel + ' was found, but ' +
+      'no base flood elevation lines were mapped within 2,000 ft, so there is nothing to ' +
+      'measure depth against.</div>';
+  }
+  if (r.tooSmall || r.noElevation) {
+    return '<div class="warn">' + (r.tooSmall
+      ? 'The part of this parcel inside the storage area is too small to grid.'
+      : 'The elevation service returned no ground heights for this parcel.') + '</div>';
+  }
+
+  var f = function (n) { return Math.round(n).toLocaleString(); };
+  var html =
+    '<table>' +
+      '<tr><td>Storage area</td><td class="n">' + r.saLabel + ' (' +
+        (r.fillPercent == null ? 'fill allowance not recorded'
+                               : 'fill allowance ' + r.fillPercent + '%') + ')</td></tr>' +
+      '<tr><td>Parcel inside it</td><td class="n">' + f(r.areaSqFt) + ' sq ft</td></tr>' +
+      '<tr><td>Ground</td><td class="n">' + r.groundMin.toFixed(1) + ' &ndash; ' +
+        r.groundMax.toFixed(1) + ' ft</td></tr>' +
+      '<tr><td>Base flood elevation</td><td class="n">' + r.bfeMin.toFixed(2) + ' &ndash; ' +
+        r.bfeMax.toFixed(2) + ' ft</td></tr>' +
+      '<tr><td>Storage below BFE</td><td class="n"><b>' + f(r.volumeCF) + ' cu ft = ' +
+        f(r.volumeCY) + ' CY</b></td></tr>' +
+      (r.allowableCY != null
+        ? '<tr><td>Allowable fill at ' + r.fillPercent + '%</td><td class="n"><b>' +
+          f(r.allowableCY) + ' CY</b></td></tr>' : '') +
+    '</table>' +
+    '<div style="margin-top:8px;color:#9fb4c8">Method: USGS 3DEP bare-earth lidar sampled on ' +
+    'a ' + r.gridStep + ' ft grid over the parcel inside the storage area (' + r.cells +
+    ' cells, ' + r.wetCells + ' below the BFE); the BFE surface is interpolated between the ' +
+    'county\u2019s ' + r.bfeLineCount + ' mapped BFE lines. Both are NAVD88.<br>' +
+    '<b>Preliminary, and a floor rather than a ceiling.</b> LMC 27.52.035 assesses the whole ' +
+    'DEVELOPMENT AREA, which can span multiple parcels in one storage area and shift fill ' +
+    'between them by easement &mdash; the figure above is for this parcel alone. The ordinance ' +
+    'baseline is the storage that existed on ' + CQB_REG.storageBaselineDate + ' (Ord. 18893); ' +
+    'the lidar here is current ground, so any fill placed since then is already invisible to ' +
+    'it and the true remaining allowance may be smaller. "Fill" includes buildings (27.52.020), ' +
+    'which this calculation does not count. Two proposal-dependent exemptions ' +
+    '(wet-floodproofed single-family, shed or garage; single-family non-substantial ' +
+    'improvements) cannot be detected from mapping. It also ignores floodway rules and ' +
+    'compensatory-storage design requirements. Verify against an engineering study before ' +
+    'relying on it.</div>';
+  if (r.warnings.length) {
+    html += '<div class="warn">' + r.warnings.map(function (w) {
+      return cqbSeEsc(w);
+    }).join('<br><br>') + '</div>';
+  }
+  return html;
 }
 
 function cqbSiteToolsDialog() {
@@ -1531,68 +1936,18 @@ function cqbSiteToolsDialog() {
     btn.disabled = true;
     st.textContent = 'Reading the parcel...';
 
-    cqbStorageCalc(pid, { onStatus: function (t) { st.textContent = t; } }).then(function (r) {
+    cqbFloodReview(pid, { onStatus: function (t) { st.textContent = t; } }).then(function (rv) {
       btn.disabled = false;
       st.textContent = 'Done.';
-      var head = '<b>' + (r.address || ('PID ' + r.pid)) + '</b>';
-
-      if (r.noStorageArea) {
-        res.innerHTML = head + '<div style="margin-top:6px;color:#c2d4e6">This parcel is not ' +
-          'inside a mapped Salt Creek flood storage area, so no fill allowance applies here. ' +
-          'That is not the same as "no floodplain rules apply" &mdash; check the FEMA layers.</div>';
-        return;
-      }
-      if (r.emptyClip) {
-        res.innerHTML = head + '<div style="margin-top:6px;color:#c2d4e6">The parcel only touches ' +
-          'the edge of storage area #' + r.saNumber + '; none of its area falls inside.</div>';
-        return;
-      }
-      if (r.noBfe) {
-        res.innerHTML = head + '<div class="warn">Storage area #' + r.saNumber + ' was found, but ' +
-          'no base flood elevation lines were mapped within 2,000 ft, so there is nothing to ' +
-          'measure depth against.</div>';
-        return;
-      }
-      if (r.tooSmall || r.noElevation) {
-        res.innerHTML = head + '<div class="warn">' + (r.tooSmall
-          ? 'The part of this parcel inside the storage area is too small to grid.'
-          : 'The elevation service returned no ground heights for this parcel.') + '</div>';
-        return;
-      }
-
-      var f = function (n) { return Math.round(n).toLocaleString(); };
-      var html = head +
-        '<table>' +
-          '<tr><td>Storage area</td><td class="n">#' + r.saNumber +
-            ' (fill allowance ' + r.fillPercent + '%)</td></tr>' +
-          '<tr><td>Parcel inside it</td><td class="n">' + f(r.areaSqFt) + ' sq ft</td></tr>' +
-          '<tr><td>Ground</td><td class="n">' + r.groundMin.toFixed(1) + ' &ndash; ' +
-            r.groundMax.toFixed(1) + ' ft</td></tr>' +
-          '<tr><td>Base flood elevation</td><td class="n">' + r.bfeMin.toFixed(2) + ' &ndash; ' +
-            r.bfeMax.toFixed(2) + ' ft</td></tr>' +
-          '<tr><td>Storage below BFE</td><td class="n"><b>' + f(r.volumeCF) + ' cu ft = ' +
-            f(r.volumeCY) + ' CY</b></td></tr>' +
-          (r.allowableCY != null
-            ? '<tr><td>Allowable fill at ' + r.fillPercent + '%</td><td class="n"><b>' +
-              f(r.allowableCY) + ' CY</b></td></tr>' : '') +
-        '</table>' +
-        '<div style="margin-top:8px;color:#9fb4c8">Method: USGS 3DEP bare-earth lidar sampled on ' +
-        'a ' + r.gridStep + ' ft grid over the parcel inside the storage area (' + r.cells +
-        ' cells, ' + r.wetCells + ' below the BFE); the BFE surface is interpolated between the ' +
-        'county\u2019s ' + r.bfeLineCount + ' mapped BFE lines. Both are NAVD88.<br>' +
-        '<b>Preliminary.</b> It ignores floodway rules, existing structures and permits, and ' +
-        'compensatory-storage design requirements, and the lidar predates recent grading. ' +
-        'Verify against an engineering study before relying on it.</div>';
-      if (r.warnings.length) {
-        html += '<div class="warn">' + r.warnings.map(function (w) {
-          return w.replace(/</g, '&lt;');
-        }).join('<br><br>') + '</div>';
-      }
-      res.innerHTML = html;
+      var head = '<b>' + (rv.address || ('PID ' + rv.pid)) + '</b>';
+      res.innerHTML = head +
+        cqbSeZoneHtml(rv.zone) +
+        cqbSeStorageHtml(rv.storage) +
+        cqbSeRecordsHtml(rv.records);
     }).catch(function (e) {
       btn.disabled = false;
       st.textContent = '';
-      res.innerHTML = '<div class="warn">' + String(e.message || e).replace(/</g, '&lt;') + '</div>';
+      res.innerHTML = '<div class="warn">' + cqbSeEsc(String((e && e.message) || e)) + '</div>';
     });
   });
 
