@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.11.0
+// @version      1.12.0
 // @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools (Salt Creek flood-storage and allowable-fill calculator, behind a USGS ground-elevation opt-in), FEMA Zone A, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
@@ -34,7 +34,7 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.11.0 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.12.0 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -52,7 +52,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.11.0', ready: false };
+  window.__dvToolkit = { version: '1.12.0', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -838,8 +838,30 @@ var CQB_REG = {
   /* Ord. 18893 effective date: the storage-volume baseline for allowable fill
    * under LMC 27.52.035. Lidar shows current ground, not this date's ground. */
   storageBaselineDate: '2007-03-05',
+  /* Ord. 21393 (eff. 2023-01-09), in BOTH 27.52 and 27.53: freeboard is 1 ft
+   * where the floodplain/floodprone area is based on NOAA Atlas 14
+   * precipitation, else 2 ft. No public layer says which studies are Atlas 14
+   * based, so the panel always shows both heights. County Art. 11.017: flat 1 ft. */
+  freeboardAtlasFt: 1,
+  freeboardOtherFt: 2,
+  freeboardCountyFt: 1,
+  /* 27.52/27.53 both fix Existing Urban vs New Growth as of this date. Per
+   * Geovanni (2026-08-31) the chapter call is made per application -- the map
+   * facts below are evidence for staff, never a determination. */
+  chapterFreezeDate: '2004-05-10',
   sqFtPerAcre: 43560
 };
+
+/* Freeboard-fact layers (verified live 2026-09-01).
+ * FloodProneAreas/0: 86 polygons, fields are just ID/GRIDCODE (GRIDCODE is 1
+ * on all 86) -- there are no names to show, only "flood prone area #ID".
+ * CityLimits/6 "Lincoln City Limits - Historic": one polygon per YEAR;
+ * YEAR=2004 returns exactly one. ZoningAndRegulations/2 (Lincoln) and /3
+ * (County): ZONE, OVERLAY, EFFDATE (epoch date), same schema both layers. */
+var CQB_FPA_URL     = CQB_PUB + 'LTUWatershed/FloodProneAreas/MapServer/0';
+var CQB_LIMITS_URL  = CQB_PUB + 'CityCounty/CityLimits/MapServer/6';
+var CQB_ZONE_CITY_URL = CQB_PUB + 'Planning/ZoningAndRegulations/MapServer/2';
+var CQB_ZONE_CNTY_URL = CQB_PUB + 'Planning/ZoningAndRegulations/MapServer/3';
 
 /* Clip a set of polygons to the parcel and measure the result, using the
  * county's own public geometry service. Planar rather than geodesic because
@@ -1596,8 +1618,86 @@ function cqbRecordedFlood(parcelGeom, deps) {
   });
 }
 
+/* Freeboard facts for the review panel. Same-origin only -- no elevation
+ * sampling and so no external-service consent involved. FEMA zones are NOT
+ * re-queried here; the renderer combines this report with cqbZoneAssess's,
+ * which already ran in the same review. Five independent lookups, each
+ * degrading alone to ok:false -- a failed lookup must render as unchecked,
+ * never as "not in a flood prone area". */
+function cqbFreeboardAssess(parcelGeom, deps) {
+  deps = deps || {};
+  var getJson = deps.getJson || cqbGetJson;
+  var geomParam = JSON.stringify({ rings: parcelGeom.rings,
+                                   spatialReference: { wkid: CQB_SP_FT } });
+  function polyQuery(url, extra) {
+    var qs = { geometry: geomParam, geometryType: 'esriGeometryPolygon',
+               inSR: CQB_SP_FT, spatialRel: 'esriSpatialRelIntersects',
+               returnGeometry: 'false', f: 'json' };
+    for (var k in extra) qs[k] = extra[k];
+    return getJson(url + '/query?' + cqbQs(qs)).then(function (j) {
+      if (j && j.error) throw new Error('layer error');
+      return { ok: true, features: (j && j.features) || [] };
+    }).catch(function () { return { ok: false, features: [] }; });
+  }
+  /* BFE lines within 2,000 ft of the parcel box, same reach the storage
+   * calculation reads. Attribute-only: the range is what freeboard needs. */
+  var b = cqbExpand(cqbBounds(parcelGeom.rings), 2000);
+  var bfeQ = getJson(CQB_BFE_URL + '/query?' + cqbQs({
+    geometry: JSON.stringify({ xmin: b.minx, ymin: b.miny, xmax: b.maxx, ymax: b.maxy,
+                               spatialReference: { wkid: CQB_SP_FT } }),
+    geometryType: 'esriGeometryEnvelope', inSR: CQB_SP_FT,
+    spatialRel: 'esriSpatialRelIntersects', outFields: 'ELEV,V_DATUM',
+    returnGeometry: 'false', f: 'json'
+  })).then(function (j) {
+    if (j && j.error) throw new Error('layer error');
+    var elevs = [], datums = {}, undeclared = 0;
+    ((j && j.features) || []).forEach(function (f) {
+      var a = f.attributes || {};
+      /* Same Number(null)===0 trap as everywhere else in this file. */
+      if (!cqbBlank(a.ELEV) && isFinite(Number(a.ELEV))) elevs.push(Number(a.ELEV));
+      if (cqbBlank(a.V_DATUM)) undeclared++; else datums[String(a.V_DATUM).trim()] = 1;
+    });
+    return { ok: true, count: elevs.length,
+             min: elevs.length ? Math.min.apply(null, elevs) : null,
+             max: elevs.length ? Math.max.apply(null, elevs) : null,
+             datums: Object.keys(datums), datumMissing: undeclared };
+  }).catch(function () { return { ok: false, count: 0, min: null, max: null,
+                                  datums: [], datumMissing: 0 }; });
+  function zoningRows(res) {
+    return res.features.map(function (f) {
+      var a = f.attributes || {};
+      var eff = cqbDateStr(a.EFFDATE);
+      /* pre-freeze true/false only when a date exists; a blank date is an
+       * honest null, never coerced to 1970 (= falsely "pre-2004"). */
+      var pre = null;
+      if (eff !== null) pre = eff <= CQB_REG.chapterFreezeDate;
+      return { zone: cqbBlank(a.ZONE) ? null : String(a.ZONE).trim(),
+               overlay: cqbBlank(a.OVERLAY) ? null : String(a.OVERLAY).trim(),
+               effdate: eff, preFreeze: pre };
+    });
+  }
+  return Promise.all([
+    polyQuery(CQB_FPA_URL, { outFields: 'ID' }),
+    bfeQ,
+    polyQuery(CQB_LIMITS_URL, { where: 'YEAR=2004', outFields: 'YEAR' }),
+    polyQuery(CQB_ZONE_CITY_URL, { outFields: 'ZONE,OVERLAY,EFFDATE' }),
+    polyQuery(CQB_ZONE_CNTY_URL, { outFields: 'ZONE,OVERLAY,EFFDATE' })
+  ]).then(function (r) {
+    return {
+      floodProne: { ok: r[0].ok, ids: r[0].features.map(function (f) {
+        return (f.attributes || {}).ID;
+      }).filter(function (v) { return !cqbBlank(v); }) },
+      bfe: r[1],
+      /* true / false when the lookup answered; null when it did not. */
+      city2004: r[2].ok ? r[2].features.length > 0 : null,
+      zoningCity:   { ok: r[3].ok, rows: zoningRows(r[3]) },
+      zoningCounty: { ok: r[4].ok, rows: zoningRows(r[4]) }
+    };
+  });
+}
+
 /* The orchestrator behind the Site tools button. Fetches the parcel once,
- * then runs the three checks concurrently. The storage calculation may throw
+ * then runs the four checks concurrently. The storage calculation may throw
  * (its established behaviour, which its own tests pin); here that failure is
  * caught and carried as storage.failed so the Zone A flag and the recorded
  * documents still reach the screen. Only an unknown parcel rejects outright,
@@ -1617,14 +1717,18 @@ function cqbFloodReview(pid, opts, deps) {
       cqbStorageCalc(pid, storageOpts, deps).catch(function (e) {
         return { failed: true, message: String((e && e.message) || e), warnings: [] };
       }),
-      cqbRecordedFlood(pf.geometry, deps)
+      cqbRecordedFlood(pf.geometry, deps),
+      cqbFreeboardAssess(pf.geometry, deps).catch(function () {
+        return null; /* renderer treats null as "freeboard facts unavailable" */
+      })
     ]).then(function (r) {
       return {
         pid: pf.attributes.PARCELID,
         address: pf.attributes.SITEADDRESS || '',
         zone: r[0],
         storage: r[1],
-        records: r[2]
+        records: r[2],
+        freeboard: r[3]
       };
     });
   });
@@ -1739,6 +1843,101 @@ function cqbSeZoneHtml(z) {
     'development or only its Zone A portion is a staff determination made case by case ' +
     '&mdash; both figures are shown here and this tool does not decide it. A development ' +
     'can also span multiple parcels, which parcel mapping alone cannot capture.</div>';
+}
+
+/* The freeboard block (lowest-floor height above the base flood elevation).
+ * fb is a cqbFreeboardAssess report (or null when it could not run); z is the
+ * cqbZoneAssess report from the same review, reused so FEMA is queried once.
+ * Renders nothing when the parcel touches no FEMA zone and no flood prone
+ * area AND every lookup answered -- freeboard has nothing to say there. Two
+ * things it never does: pick between the 1 ft and 2 ft heights (no public
+ * layer says which studies are NOAA Atlas 14 based), and call the 27.52 vs
+ * 27.53 chapter (per Geovanni 2026-08-31 that is decided per application --
+ * the 2004 map facts are evidence, not an answer). */
+function cqbSeFreeboardHtml(z, fb) {
+  var esc = cqbSeEsc;
+  if (!fb) {
+    return '<div class="warn">The freeboard lookups could not be run just now, so no ' +
+      'flood prone area or lowest-floor information is shown. That is a lookup ' +
+      'failure, not an all-clear.</div>';
+  }
+  var zones = (z && z.zones) || [];
+  var zoneKnown = !(z && z.failed);
+  var fpIds = fb.floodProne.ids;
+  var touches = zones.length > 0 || fpIds.length > 0;
+  var fails = [];
+  if (!zoneKnown) fails.push('the FEMA flood zones');
+  if (!fb.floodProne.ok) fails.push('the flood prone areas');
+  if (touches || fails.length) { /* something to say */ } else {
+    return '';
+  }
+  var bits = [];
+  /* -- what the parcel touches -- */
+  var basis = [];
+  if (zones.length) basis.push('FEMA zone ' + zones.map(esc).join(', '));
+  if (fpIds.length) basis.push('mapped flood prone area ' + fpIds.map(function (i) {
+    return '#' + esc(i);
+  }).join(', '));
+  if (basis.length) {
+    bits.push('<div style="margin-top:6px"><b>Freeboard.</b> This parcel touches ' +
+      basis.join(' and ') + '. The lowest floor of new or substantially improved ' +
+      'buildings must sit above the base flood elevation by the freeboard height.</div>');
+  }
+  if (fails.length) {
+    bits.push('<div class="warn">Could not check ' + fails.join(' or ') +
+      ' just now. That is a lookup failure, not an all-clear.</div>');
+  }
+  if (!touches) return bits.join('');
+  /* -- the heights -- */
+  var f1 = CQB_REG.freeboardAtlasFt, f2 = CQB_REG.freeboardOtherFt;
+  if (!fb.bfe.ok) {
+    bits.push('<div class="warn">The base flood elevation lines could not be read ' +
+      'just now, so no heights are shown.</div>');
+  } else if (fb.bfe.count > 0) {
+    var lo = fb.bfe.min, hi = fb.bfe.max;
+    var rng = lo === hi ? lo.toFixed(2) + ' ft' : lo.toFixed(2) + ' &ndash; ' + hi.toFixed(2) + ' ft';
+    bits.push('<div style="margin-top:6px">Mapped base flood elevation within 2,000 ft: ' +
+      rng + '. Freeboard is <b>' + f1 + ' ft</b> where the study is based on NOAA ' +
+      'Atlas 14 rainfall and <b>' + f2 + ' ft</b> otherwise (LMC 27.52/27.53, Ord. 21393) ' +
+      '&mdash; no public layer records which basis applies, so both heights are shown: ' +
+      'lowest floor at least <b>' + (hi + f1).toFixed(2) + '</b> or <b>' + (hi + f2).toFixed(2) +
+      ' ft</b> against the highest nearby BFE. Under county zoning, Art. 11.017 sets a flat ' +
+      CQB_REG.freeboardCountyFt + ' ft. The BFE at the building site itself comes from ' +
+      'the flood study, not from this range.</div>');
+    if (!fb.bfe.datums.length) {
+      bits.push('<div class="warn">None of the nearby BFE lines declares a vertical datum, ' +
+        'so the NAVD88 basis of these elevations is unverified.</div>');
+    }
+  } else {
+    bits.push('<div style="margin-top:6px">No base flood elevation lines are mapped within ' +
+      '2,000 ft of this parcel' + (zones.indexOf('A') >= 0
+        ? ' &mdash; Zone A has no determined BFE, and the engineered study that sets one ' +
+          'also sets the required floor height.'
+        : '.') + '</div>');
+  }
+  /* -- the chapter facts, never a chapter verdict -- */
+  var facts = [];
+  if (fb.city2004 === true) facts.push('inside the 2004 city limits');
+  if (fb.city2004 === false) facts.push('outside the 2004 city limits');
+  if (fb.city2004 === null) facts.push('2004 city limits could not be checked');
+  function zoneFact(rows, label) {
+    rows.forEach(function (r) {
+      if (!r.zone) return;
+      var s = label + ' zoning ' + esc(r.zone);
+      if (r.preFreeze === true) s += ' (in effect since ' + esc(r.effdate) + ', before the 2004 freeze date)';
+      if (r.preFreeze === false) s += ' (in effect since ' + esc(r.effdate) + ' &mdash; its 2004 zoning is not knowable from the public map)';
+      if (r.preFreeze === null) s += ' (no effective date recorded)';
+      facts.push(s);
+    });
+  }
+  zoneFact(fb.zoningCity.rows, 'city');
+  zoneFact(fb.zoningCounty.rows, 'county');
+  if (!fb.zoningCity.ok || !fb.zoningCounty.ok) facts.push('some zoning layers could not be checked');
+  bits.push('<div style="margin-top:6px;color:#9fb4c8">Which chapter applies (Existing Urban ' +
+    '27.52, New Growth 27.53, or County Art. 11) is determined per application by staff. ' +
+    'Map evidence: ' + facts.join('; ') + '. The chapters are fixed as of ' +
+    CQB_REG.chapterFreezeDate + '.</div>');
+  return bits.join('');
 }
 
 /* Recorded flood documents. Three honest shapes: the documents found, an
@@ -1942,6 +2141,7 @@ function cqbSiteToolsDialog() {
       var head = '<b>' + (rv.address || ('PID ' + rv.pid)) + '</b>';
       res.innerHTML = head +
         cqbSeZoneHtml(rv.zone) +
+        cqbSeFreeboardHtml(rv.zone, rv.freeboard) +
         cqbSeStorageHtml(rv.storage) +
         cqbSeRecordsHtml(rv.records);
     }).catch(function (e) {
