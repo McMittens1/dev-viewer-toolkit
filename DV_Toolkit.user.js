@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.13.0
+// @version      1.14.0
 // @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools flood review (Salt Creek flood-storage and allowable-fill calculator, freeboard facts, FEMA Zone A, recorded flood documents, and FEMA letters of map change -- the USGS and FEMA services behind one opt-in), floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
@@ -38,7 +38,7 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.13.0 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.14.0 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -56,7 +56,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.13.0', ready: false };
+  window.__dvToolkit = { version: '1.14.0', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -241,6 +241,11 @@ function applyPopup() {
  *   the native layers- parameter actually applies (it toggles; it cannot set). See section 4b.
  */
 function runQuickBar() {
+  /* Parcel framing (see cqbParcelScale). 600 is the closest the map will go on a Find Parcel
+   * zoom; 1.25 leaves a quarter of the parcel's larger dimension as breathing room. */
+  var CQB_PARCEL_SCALE_MIN = 600;
+  var CQB_PARCEL_ZOOM_MARGIN = 1.25;
+
   var v = window.$arcgis && window.$arcgis.views && window.$arcgis.views.getItemAt(0);
   if (!v) { alert('Map not ready yet - let the map finish loading, then click the bookmark again.'); return; }
 
@@ -665,14 +670,20 @@ function runQuickBar() {
       li.setAttribute('role', 'option');
       li.setAttribute('tabindex', '0');
       li.className = 'MuiButtonBase-root MuiMenuItem-root MuiMenuItem-dense';
+      /* The app styles its own rows by id (gcx-search-suggestion-*), which ours cannot carry,
+       * so ours inherited cursor:auto -- an I-beam over a clickable row. Measured live: native
+       * rows compute 'pointer', ours computed 'auto'. Inline so no stylesheet can win. */
+      li.style.cursor = 'pointer';
+      li.style.userSelect = 'none';
       var wrap = document.createElement('div');
       wrap.className = 'MuiListItemText-root MuiListItemText-dense';
       var primary = document.createElement('span');
       primary.className = 'MuiTypography-root MuiTypography-body2 MuiListItemText-primary';
+      primary.style.cursor = 'pointer';
       primary.textContent = r.addr || ('Parcel ' + r.pid);
       var secondary = document.createElement('span');
       secondary.className = 'MuiTypography-root MuiTypography-body2';
-      secondary.style.cssText = 'display:block;opacity:.7;font-size:11px;';
+      secondary.style.cssText = 'display:block;opacity:.7;font-size:11px;cursor:pointer;';
       secondary.textContent = 'PID ' + r.pid + (r.owner ? ' \u00b7 ' + r.owner : '');
       wrap.appendChild(primary); wrap.appendChild(secondary);
       li.appendChild(wrap);
@@ -1902,6 +1913,20 @@ function cqbSeEsc(v) {
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+/* One titled section of the result panel. Returns '' when the body is empty, so a heading
+ * never appears over nothing -- several blocks render nothing by design (an AE-only parcel
+ * has no Zone A notice; a parcel outside every flood layer has no freeboard block).
+ * Added v1.14.0: the blocks used to run together with no headings, which read as one
+ * undifferentiated wall and made the Salt Creek storage numbers look like part of the
+ * floodplain determination. They are separate questions and now look it. */
+function cqbSeSection(title, body) {
+  if (!body || !String(body).trim()) return '';
+  return '<div style="margin-top:12px;padding-top:9px;border-top:1px solid #2b4257">' +
+    '<div style="color:#7cc4ff;font-size:11px;font-weight:600;letter-spacing:.04em;' +
+      'text-transform:uppercase;margin-bottom:2px">' + cqbSeEsc(title) + '</div>' +
+    body + '</div>';
+}
+
 /* The Zone A block. Empty string when there is nothing regulatory to say
  * (AE-only parcels are covered by the popup's floodplain rows already).
  * Per staff practice (Geovanni, 2026-08-31), whether the 5-acre engineered-
@@ -2117,7 +2142,9 @@ function cqbSeStorageHtml(r) {
       '<tr><td>Parcel inside it</td><td class="n">' + f(r.areaSqFt) + ' sq ft</td></tr>' +
       '<tr><td>Ground</td><td class="n">' + r.groundMin.toFixed(1) + ' &ndash; ' +
         r.groundMax.toFixed(1) + ' ft</td></tr>' +
-      '<tr><td>Base flood elevation</td><td class="n">' + r.bfeMin.toFixed(2) + ' &ndash; ' +
+      /* Labelled as an input: the regulatory BFE and the required floor height are stated
+       * in the floodplain section. This row exists to show what the volume was measured to. */
+      '<tr><td>BFE used for this calculation</td><td class="n">' + r.bfeMin.toFixed(2) + ' &ndash; ' +
         r.bfeMax.toFixed(2) + ' ft</td></tr>' +
       '<tr><td>Storage below BFE</td><td class="n"><b>' + f(r.volumeCF) + ' cu ft = ' +
         f(r.volumeCY) + ' CY</b></td></tr>' +
@@ -2312,11 +2339,12 @@ function cqbSiteToolsDialog() {
       st.textContent = 'Done.';
       var head = '<b>' + (rv.address || ('PID ' + rv.pid)) + '</b>';
       res.innerHTML = head +
-        cqbSeZoneHtml(rv.zone) +
-        cqbSeFreeboardHtml(rv.zone, rv.freeboard) +
-        cqbSeStorageHtml(rv.storage) +
-        cqbSeRecordsHtml(rv.records) +
-        cqbSeLettersHtml(rv.letters);
+        cqbSeSection('Floodplain and required floor elevation',
+          cqbSeZoneHtml(rv.zone) + cqbSeFreeboardHtml(rv.zone, rv.freeboard)) +
+        cqbSeSection('Salt Creek flood storage and allowable fill',
+          cqbSeStorageHtml(rv.storage)) +
+        cqbSeSection('Recorded flood documents', cqbSeRecordsHtml(rv.records)) +
+        cqbSeSection('FEMA letters of map change', cqbSeLettersHtml(rv.letters));
     }).catch(function (e) {
       btn.disabled = false;
       st.textContent = '';
@@ -3114,13 +3142,48 @@ function cqbSiteToolsDialog() {
       .then(function (r) { return r.json(); });
   }
   function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/'/g, '&#39;'); }
+  /* Where the parcel card starts, measured rather than assumed.
+   *
+   * It used to be a flat top:56px, which sat squarely on the app's search box
+   * (measured 2026-09-02: card 56-531, search input 80-110 -- total cover). A flat
+   * 118px clears today's layout, but the search widget is the app's, not ours: a
+   * different window size, browser zoom, or an app update moves it. So the bar is
+   * measured at open time and the card is placed 8px under it, never above the
+   * known-good 118 and never absurdly low if the measurement goes strange.
+   *
+   * The walk up the ancestors catches a frame taller than the input itself. It
+   * stops at anything 200px or taller: the app nests the search inside a page
+   * layout stack that runs the height of the screen (measured 77-630), and that
+   * is not the bar. */
+  function cqbCardTopPx() {
+    var floor = 118;
+    try {
+      var inp = document.querySelector('input[placeholder*="Search" i], .gcx-search input');
+      if (!inp) return floor;
+      var r0 = inp.getBoundingClientRect();
+      if (!(r0.height > 0) || !(r0.bottom > 0)) return floor;
+      var bottom = r0.bottom, el = inp.parentElement;
+      for (var i = 0; i < 4 && el; i++) {
+        var r = el.getBoundingClientRect();
+        if (Math.abs(r.top - r0.top) <= 2 && r.height > 0 && r.height < 200) {
+          bottom = Math.max(bottom, r.bottom);
+        }
+        el = el.parentElement;
+      }
+      var top = Math.round(bottom) + 8;
+      return (top >= floor && top <= 400) ? top : floor;
+    } catch (e) { return floor; }
+  }
+
   function card(html) {
     var oldc = document.getElementById('cqb-card'); if (oldc) oldc.remove();
     var d = document.createElement('div');
     d.id = 'cqb-card';
     d.setAttribute('role', 'dialog');
     d.setAttribute('aria-label', 'Parcel record card');
-    d.style.cssText = 'position:fixed;top:56px;right:12px;z-index:99998;width:min(330px,92vw);max-height:calc(100vh - 140px);overflow-y:auto;background:#141a22;border:1px solid #2c3a4d;border-radius:8px;padding:12px;color:#e8eef5;font:12px "Segoe UI",sans-serif;box-shadow:0 4px 18px rgba(0,0,0,.6);line-height:1.45;';
+    var topPx = cqbCardTopPx();
+    d.style.cssText = 'position:fixed;top:' + topPx + 'px;right:12px;z-index:99998;width:min(330px,92vw);' +
+      'max-height:calc(100vh - ' + (topPx + 82) + 'px);overflow-y:auto;background:#141a22;border:1px solid #2c3a4d;border-radius:8px;padding:12px;color:#e8eef5;font:12px "Segoe UI",sans-serif;box-shadow:0 4px 18px rgba(0,0,0,.6);line-height:1.45;';
     d.innerHTML = html;
     var close = document.createElement('div');
     close.style.cssText = 'text-align:right;margin-top:8px;';
@@ -3258,6 +3321,23 @@ function cqbSiteToolsDialog() {
     });
   }
 
+  /* The scale that frames one parcel. Was max(1000, pad * 8) -- a guess that ignored the
+   * viewport and left a city lot at roughly a fifth of the map width (measured 1307 on
+   * 1015 W O St, 2.27 ac). This fits the parcel to the actual map size with a margin, then
+   * refuses to go closer than CQB_PARCEL_SCALE_MIN. Big parcels still fit: the fitted scale
+   * simply comes back larger than the floor. v.scale / v.resolution is the view's own
+   * scale-per-map-unit-per-pixel constant, so no DPI or projection constant is assumed.
+   * Falls back to the old estimate if the view has not laid out yet. */
+  function cqbParcelScale(view, ext) {
+    var w = ext.xmax - ext.xmin, h = ext.ymax - ext.ymin;
+    var perRes = view.resolution > 0 ? view.scale / view.resolution : 0;
+    if (!(view.width > 0 && view.height > 0 && perRes > 0)) {
+      return Math.max(CQB_PARCEL_SCALE_MIN, (Math.max(w, h) * 0.8 + 30) * 8);
+    }
+    var needRes = Math.max(w / view.width, h / view.height) * CQB_PARCEL_ZOOM_MARGIN;
+    return Math.max(CQB_PARCEL_SCALE_MIN, needRes * perRes);
+  }
+
   /* full record card for one chosen parcel feature */
   function showParcel(f, matchCount, opts) {
     var at = f.attributes;
@@ -3267,14 +3347,20 @@ function cqbSiteToolsDialog() {
     var xs = ring.map(function (p) { return p[0]; }), ys = ring.map(function (p) { return p[1]; });
     var ext = { xmin: Math.min.apply(0, xs), ymin: Math.min.apply(0, ys), xmax: Math.max.apply(0, xs), ymax: Math.max.apply(0, ys) };
     var cx0 = (ext.xmin + ext.xmax) / 2, cy0 = (ext.ymin + ext.ymax) / 2;
-    var pad = Math.max(ext.xmax - ext.xmin, ext.ymax - ext.ymin) * 0.8 + 30;
     if (!(opts && opts.noZoom)) {
       v.center = { x: cx0, y: cy0, spatialReference: v.spatialReference };
-      v.scale = Math.max(1000, pad * 8);
+      v.scale = cqbParcelScale(v, ext);
     }
     try {
       v.graphics.removeAll();
-      v.graphics.add({ geometry: { type: 'polygon', rings: g.rings, spatialReference: g.spatialReference },
+      /* The spatial reference MUST come from the view, not the feature. ArcGIS REST puts
+       * spatialReference on the FeatureSet root, not on each feature, so f.geometry.spatialReference
+       * is undefined -- and an undefined SR autocasts to WGS84 (4326). The rings are Web Mercator
+       * (the query asks for outSR 3857), so the graphic claimed to be lat/long while holding
+       * Mercator metres: the API reprojected it off the map and the highlight silently never drew.
+       * Measured live 2026-09-02: graphic present, visible:true, SR 4326 against a 102100 view,
+       * nothing on screen; re-added with the view's SR and the outline appeared at once. */
+      v.graphics.add({ geometry: { type: 'polygon', rings: g.rings, spatialReference: v.spatialReference },
         symbol: { type: 'simple-fill', color: [124, 196, 255, 0.12], outline: { color: [124, 196, 255, 1], width: 2.5 } } });
     } catch (e) {}
     var gp = JSON.stringify(g);
