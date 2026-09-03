@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.14.0 — review-panel and map-behaviour fixes
+
+- **The parcel highlight actually draws.** It was built with the spatial reference taken from the individual feature, but ArcGIS REST puts that on the response root, not on each feature — so it was undefined, defaulted to WGS84 lat/long, and the Web Mercator rings were reprojected off the map. The graphic existed and reported itself visible the whole time. It now uses the view's own spatial reference.
+- **The result panel is split into titled sections:** floodplain and required floor elevation, Salt Creek flood storage and allowable fill, recorded flood documents, FEMA letters. The storage table's BFE row is relabelled "BFE used for this calculation" — it is the calculation's input; the regulatory BFE and the required floor height belong to the floodplain section. A section with nothing to say renders no heading.
+- **Find Parcel frames the lot properly.** The old zoom was a guess that ignored the viewport and left a city lot at about a fifth of the map width. It now fits the parcel to the actual map area with a margin and will not zoom out past 1:600. Large parcels still fit — 600 is a floor, not a target.
+- **The parcel card no longer covers the search box.** Its position is measured from the app's search bar when the card opens rather than assumed, so a different window size, browser zoom, or app update cannot put it back on top.
+- **Parcel rows in the search dropdown show the arrow cursor**, not the text caret.
+
+Not included: opening the app's Development Information panel automatically from a search result. The mapping library ignores clicks that a script generates, and the app exposes no command interface, so the panel still needs a click on the parcel.
+
 ## 1.13.0 — FEMA letters of map change
 
 The flood review now asks FEMA's National Flood Hazard Layer, live, for letters of map change on or within 500 ft of the parcel:
