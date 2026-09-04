@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.14.0
-// @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools flood review (Salt Creek flood-storage and allowable-fill calculator, freeboard facts, FEMA Zone A, recorded flood documents, and FEMA letters of map change -- the USGS and FEMA services behind one opt-in), floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
+// @version      1.15.0
+// @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools flood review (FEMA Zone A, freeboard facts, recorded flood documents, FEMA letters of map change) and a separate Salt Creek flood-storage and allowable-fill calculator, mobile-home and leased-land parcel lookup, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
 // @updateURL    https://raw.githubusercontent.com/McMittens1/dev-viewer-toolkit/main/DV_Toolkit.user.js
@@ -38,7 +38,7 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.14.0 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.15.0 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -56,7 +56,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.14.0', ready: false };
+  window.__dvToolkit = { version: '1.15.0', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -573,7 +573,8 @@ function runQuickBar() {
       }
     }
 
-    if (pid && /^\d{10,14}$/.test(pid)) {
+    if (pid && (/^\d{10,14}$/.test(pid) ||
+        (typeof cqbPidKind === 'function' && cqbPidKind(pid) === 'ioll'))) {
       /* if the link also carried a view, keep the sharer's view and just highlight the parcel;
        * with no view in the link, zoom to the parcel as Find Parcel normally would */
       findParcel(pid, { noZoom: qs.has('center-' + CQB_MAP_EXT) && qs.has('scale-' + CQB_MAP_EXT) });
@@ -636,6 +637,10 @@ function runQuickBar() {
   function cqbSugWhere(term) {
     var clean = term.replace(/'/g, "''").toUpperCase();
     if (/^\d{10,14}$/.test(clean)) return "PARCELID = '" + clean + "'";
+    /* An improvement-on-leased-land PID matches nothing in TaxParcels, and as
+     * free text it would run a SITEADDRESS LIKE that can only come back empty.
+     * Skip the suggestion query; Enter still routes it to findIoll. */
+    if (typeof cqbPidKind === 'function' && cqbPidKind(clean) === 'ioll') return null;
     /* strip LIKE wildcards so a typed % or _ searches for itself rather than matching everything */
     var like = clean.split(',')[0].replace(/[%_]/g, ' ').trim();
     if (like.length < CQB_SUG_MINLEN) return null;
@@ -1301,6 +1306,150 @@ function cqbSoilText(rows, maxParts) {
 
 var CQB_SA_URL  = CQB_PUB + 'LTUWatershed/FEMEFloodDetails/MapServer/3';
 
+/* Improvements On Leased Land: the assessor's records for property that is
+ * taxed separately from the ground it stands on. 2,375 records countywide,
+ * 2,080 of them ppTYPE 'MH' (mobile homes in the rented-lot parks) and the
+ * rest ppTYPE 'I01'. Verified live 2026-09-04.
+ *
+ * Two things about this layer drive every design choice below. Its PIDs are
+ * alphanumeric ('MH00002090000'), which every numeric-only PID pattern in the
+ * toolkit used to reject outright, so these parcels were simply unfindable.
+ * And its geometry is a POINT -- the home, not a boundary. There is no lot to
+ * measure, so parcel area, flood storage volume and allowable fill cannot be
+ * computed for an IOLL record at all. What can be done, and what the review
+ * does, is resolve the point to the tax parcel that contains it (for a mobile
+ * home that is the park's own land parcel) and review THAT, saying plainly
+ * whose flood answer the user is looking at. */
+var CQB_IOLL_URL = CQB_PUB + 'Assessor/IOLLParcels/MapServer/0';
+
+/* Normalise a typed parcel ID without destroying the alphanumeric ones. The
+ * old code did .replace(/\D/g, ''), which silently turned 'MH00002090000'
+ * into '00002090000' -- a number that matches no parcel, so the user got
+ * 'not found' for a PID they had copied correctly. */
+function cqbPidNorm(raw) {
+  return String(raw == null ? '' : raw).toUpperCase().replace(/[^0-9A-Z]/g, '');
+}
+
+/* 'parcel' for a mapped tax parcel, 'ioll' for an improvement on leased land,
+ * null for anything this toolkit cannot look up. */
+function cqbPidKind(pid) {
+  var p = cqbPidNorm(pid);
+  if (/^\d{8,16}$/.test(p)) return 'parcel';
+  if (/^[A-Z]{1,3}\d{6,16}$/.test(p)) return 'ioll';
+  return null;
+}
+
+/* Look an IOLL record up by PID and hand back both the record and the tax
+ * parcel its point falls inside. Either half can come back missing: an IOLL
+ * point that lands outside every mapped parcel is possible, and then there is
+ * no polygon to review, which the caller must say rather than guess. */
+function cqbIollResolve(pid, deps) {
+  deps = deps || {};
+  var getJson = deps.getJson || cqbGetJson;
+  var clean = cqbPidNorm(pid);
+  return getJson(CQB_IOLL_URL + '/query?' + cqbQs({
+    where: "PID='" + clean.replace(/'/g, "''") + "'",
+    outFields: 'PID,ppTYPE,SITUS,LEGAL,SUB_NAME,PRIME_USE,PROP_CLASS,ACRES,OWNER',
+    returnGeometry: 'true', outSR: CQB_SP_FT, f: 'json'
+  })).then(function (j) {
+    var f = (j.features || [])[0];
+    if (!f || !f.geometry || !isFinite(Number(f.geometry.x)) ||
+        !isFinite(Number(f.geometry.y))) {
+      throw new Error('Improvement ' + clean + ' not found, or it has no mapped location.');
+    }
+    var a = f.attributes || {};
+    var rec = {
+      pid: cqbBlank(a.PID) ? clean : String(a.PID),
+      type: cqbBlank(a.ppTYPE) ? null : String(a.ppTYPE),
+      isMobileHome: String(a.ppTYPE || '').toUpperCase() === 'MH',
+      address: cqbBlank(a.SITUS) ? '' : String(a.SITUS),
+      legal: cqbBlank(a.LEGAL) ? null : String(a.LEGAL),
+      park: cqbBlank(a.SUB_NAME) ? null : String(a.SUB_NAME),
+      use: cqbBlank(a.PRIME_USE) ? null : String(a.PRIME_USE),
+      x: Number(f.geometry.x), y: Number(f.geometry.y)
+    };
+    rec.home = cqbIollHome(rec.legal);
+    return getJson(CQB_SITE_SOURCES[0].url + '/query?' + cqbQs({
+      geometry: rec.x + ',' + rec.y, geometryType: 'esriGeometryPoint',
+      inSR: CQB_SP_FT, outSR: CQB_SP_FT, spatialRel: 'esriSpatialRelIntersects',
+      outFields: 'PARCELID,SITEADDRESS,GIS_AREA', returnGeometry: 'true', f: 'json'
+    })).then(function (pj) {
+      var pf = (pj.features || [])[0];
+      var land = (pf && pf.geometry && pf.geometry.rings && pf.geometry.rings.length)
+        ? pf : null;
+      return { ioll: rec, land: land };
+    }, function () {
+      return { ioll: rec, land: null };
+    });
+  });
+}
+
+/* Pull the structured facts out of an IOLL legal description. The assessor
+ * writes them as one comma-separated string, e.g.
+ *   'Maple Grove, SPACE 092, SERIAL # MY9847699ABW, MAKE FRIENDSHIP CROWN,
+ *    1998 REGIS  28 X 56  GRY/BLK'
+ * Everything here is optional and the format is not guaranteed, so each field
+ * is matched on its own and a miss is null rather than a wrong guess. The
+ * dimensions matter for plan review: 28 X 56 is a double-wide, which is the
+ * fact a setback or a replacement-unit question actually turns on. */
+function cqbIollHome(legal) {
+  var out = { space: null, serial: null, make: null, year: null,
+              widthFt: null, lengthFt: null, areaSqFt: null };
+  if (cqbBlank(legal)) return out;
+  var t = String(legal);
+  var m = t.match(/\bSPACE\s+([0-9A-Z-]+)/i);
+  if (m) out.space = m[1];
+  m = t.match(/\bSERIAL\s*#?\s*([0-9A-Z-]+)/i);
+  if (m) out.serial = m[1];
+  m = t.match(/\bMAKE\s+([^,]+)/i);
+  if (m) out.make = m[1].trim().replace(/\s+/g, ' ') || null;
+  m = t.match(/\b(18\d{2}|19\d{2}|20\d{2})\b/);
+  if (m) out.year = Number(m[1]);
+  /* Guard the dimension match against the year: '1998 REGIS  28 X 56' has two
+   * number pairs in it and only the X-joined one is a size. */
+  m = t.match(/\b(\d{1,3})\s*[Xx]\s*(\d{1,3})\b/);
+  if (m) {
+    var w = Number(m[1]), l = Number(m[2]);
+    if (isFinite(w) && isFinite(l) && w > 0 && l > 0) {
+      out.widthFt = w; out.lengthFt = l; out.areaSqFt = w * l;
+    }
+  }
+  return out;
+}
+
+/* Is this parcel in a mapped Salt Creek storage area? One query, no geometry
+ * returned and no elevation sampling, so the flood review can answer 'the
+ * fill-capacity button is worth pressing here' without doing the expensive
+ * half of the work. cqbStorageCalc remains the only thing that computes a
+ * volume; this exists so the user is not made to run it to find out it does
+ * not apply. */
+function cqbStorageAreaProbe(parcelGeom, deps) {
+  deps = deps || {};
+  var getJson = deps.getJson || cqbGetJson;
+  if (!parcelGeom || !parcelGeom.rings || !parcelGeom.rings.length) {
+    return Promise.resolve({ ok: false, inArea: false, areas: 0, saNumber: null, saLabel: null });
+  }
+  return getJson(CQB_SA_URL + '/query?' + cqbQs({
+    geometry: JSON.stringify({ rings: parcelGeom.rings, spatialReference: { wkid: CQB_SP_FT } }),
+    geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT,
+    spatialRel: 'esriSpatialRelIntersects', outFields: 'SA_NUMBER',
+    returnGeometry: 'false', f: 'json'
+  })).then(function (j) {
+    var fs = j.features || [];
+    if (!fs.length) {
+      return { ok: true, inArea: false, areas: 0, saNumber: null, saLabel: null };
+    }
+    var n = fs[0].attributes ? fs[0].attributes.SA_NUMBER : null;
+    var num = cqbBlank(n) ? null : n;
+    return { ok: true, inArea: true, areas: fs.length, saNumber: num,
+             saLabel: num === null ? null : cqbSaLabel(num) };
+  }, function () {
+    /* Degrade the same way every other independent lookup in the review does:
+     * say the check did not run, never imply the parcel is outside. */
+    return { ok: false, inArea: false, areas: 0, saNumber: null, saLabel: null };
+  });
+}
+
 var CQB_BFE_URL = CQB_PUB + 'LTUWatershed/FEMEFloodDetails/MapServer/1';
 
 /* Flatten BFE polylines into elevation-tagged segments. */
@@ -1785,34 +1934,40 @@ function cqbLomcLookup(parcelGeom, deps) {
   });
 }
 
-/* The orchestrator behind the Site tools button. Fetches the parcel once,
- * then runs the checks concurrently -- four county-only, plus the FEMA
- * letters when opts.includeFema is true (the UI sets it only after the
- * external-services consent; letters: null means "not checked", which the
- * renderer must say out loud). The storage calculation may throw
- * (its established behaviour, which its own tests pin); here that failure is
- * caught and carried as storage.failed so the Zone A flag and the recorded
- * documents still reach the screen. Only an unknown parcel rejects outright,
- * because then there is nothing to review. */
+/* The orchestrator behind the Flood review button.
+ *
+ * Split from the fill-capacity calculation in v1.15.0. The two used to run on
+ * one button press, which meant a parcel in the floodplain but outside every
+ * Salt Creek storage area still paid for the elevation sampling, and -- worse
+ * -- a user who declined the external-services consent got no flood review at
+ * all, because the consent gate sat in front of both. Now this function is
+ * county data only and always runnable: it never samples elevations, so it
+ * needs no consent, and it reports whether a storage area is present so the
+ * user knows whether the second button applies. FEMA letters are the one
+ * outside call and stay behind opts.includeFema; letters: null means 'not
+ * checked', which the renderer must say out loud.
+ *
+ * Accepts either a tax parcel ID or an IOLL one (see cqbIollResolve). For an
+ * IOLL record the review runs on the tax parcel containing the point and
+ * result.subject carries the improvement, so the renderer can say whose flood
+ * answer this is.
+ *
+ * Every check degrades on its own. Only an unresolvable parcel rejects
+ * outright, because then there is nothing to review. */
 function cqbFloodReview(pid, opts, deps) {
   opts = opts || {};
   deps = deps || {};
-  var getJson = deps.getJson || cqbGetJson;
   var say = opts.onStatus || function () {};
-  return cqbParcelByPid(pid, 'PARCELID,SITEADDRESS,GIS_AREA', getJson).then(function (pf) {
+  return cqbReviewSubject(pid, deps).then(function (subj) {
+    var pf = subj.parcel;
     say('Checking flood layers...');
-    var storageOpts = {};
-    for (var k in opts) storageOpts[k] = opts[k];
-    storageOpts.parcelFeature = pf;
     return Promise.all([
       cqbZoneAssess(pf.geometry, pf.attributes, deps),
-      cqbStorageCalc(pid, storageOpts, deps).catch(function (e) {
-        return { failed: true, message: String((e && e.message) || e), warnings: [] };
-      }),
       cqbRecordedFlood(pf.geometry, deps),
       cqbFreeboardAssess(pf.geometry, deps).catch(function () {
         return null; /* renderer treats null as "freeboard facts unavailable" */
       }),
+      cqbStorageAreaProbe(pf.geometry, deps),
       opts.includeFema
         ? cqbLomcLookup(pf.geometry, deps).catch(function () {
             return { loma: { ok: false, items: [] }, lomr: { ok: false, items: [] } };
@@ -1822,14 +1977,35 @@ function cqbFloodReview(pid, opts, deps) {
       return {
         pid: pf.attributes.PARCELID,
         address: pf.attributes.SITEADDRESS || '',
+        subject: subj.ioll ? { kind: 'ioll', ioll: subj.ioll } : { kind: 'parcel' },
         zone: r[0],
-        storage: r[1],
-        records: r[2],
-        freeboard: r[3],
+        records: r[1],
+        freeboard: r[2],
+        storageArea: r[3],
         letters: r[4]
       };
     });
   });
+}
+
+/* Resolve whatever the user typed to the polygon the review actually runs on.
+ * A tax parcel ID resolves to itself. An IOLL ID resolves to its point's
+ * containing tax parcel, and the improvement rides along. */
+function cqbReviewSubject(pid, deps) {
+  deps = deps || {};
+  var getJson = deps.getJson || cqbGetJson;
+  var clean = cqbPidNorm(pid);
+  if (cqbPidKind(clean) === 'ioll') {
+    return cqbIollResolve(clean, deps).then(function (r) {
+      if (!r.land) {
+        throw new Error('Improvement ' + clean + ' is mapped at a point that falls ' +
+          'outside every mapped tax parcel, so there is no boundary to review.');
+      }
+      return { parcel: r.land, ioll: r.ioll };
+    });
+  }
+  return cqbParcelByPid(clean, 'PARCELID,SITEADDRESS,GIS_AREA', getJson)
+    .then(function (pf) { return { parcel: pf, ioll: null }; });
 }
 
 /* Development Viewer -- Site tools dialog (shared).
@@ -1847,7 +2023,7 @@ function cqbFloodReview(pid, opts, deps) {
 var CQB_SE_OPTIN = '__claude_qb_ext_optin';
 
 /* Chip tooltip. A build that adds tools overwrites this with a fuller wording. */
-var CQB_SITE_TOOLS_TIP = 'For one parcel: compute Salt Creek flood storage and the allowable fill';
+var CQB_SITE_TOOLS_TIP = 'For one parcel: run a flood review, or compute the Salt Creek allowable fill';
 
 /* Build-time extension point. Each entry is a function (api) that may add
  * controls and buttons to the dialog. Populated only in builds that include
@@ -1891,15 +2067,19 @@ function cqbSeCss() {
  * is one click. Falls back to asking. */
 function cqbSeGuessPid() {
   try {
-    var m = (location.search + location.hash).match(/[?&#]pid=(\d{8,16})/);
-    if (m) return m[1];
+    var m = (location.search + location.hash).match(/[?&#]pid=([0-9A-Za-z]{8,19})/);
+    if (m && cqbPidKind(m[1])) return cqbPidNorm(m[1]);
   } catch (e) {}
   try {
     var els = document.querySelectorAll('.gcx-feature-details, .gcx-feature-details *');
     for (var i = 0; i < els.length; i++) {
       var t = (els[i].textContent || '');
-      var mm = t.match(/\bPID\s*(\d{10,14})\b/);
-      if (mm) return mm[1];
+      /* Mobile-home and other leased-land parcels carry alphanumeric PIDs
+       * ('MH00002090000'), which the old digits-only pattern skipped over --
+       * so the dialog opened blank on exactly the parcels the user was most
+       * likely to have to type by hand. */
+      var mm = t.match(/\bPID\s*([0-9A-Za-z]{8,19})\b/);
+      if (mm && cqbPidKind(mm[1])) return cqbPidNorm(mm[1]);
     }
   } catch (e) {}
   return '';
@@ -2106,6 +2286,68 @@ function cqbSeRecordsHtml(rec) {
 /* The fill-capacity block, one honest outcome at a time. r is a
  * cqbStorageCalc report, or {failed,message} when the calculation itself
  * fell over -- which must not hide the other blocks of the review. */
+/* Says whose flood answer the reader is looking at. For an ordinary parcel
+ * that is obvious and this prints nothing; for an improvement on leased land
+ * it is the whole point, because the polygon under review is the park's land
+ * parcel and not the home. Saying so is not a nicety -- a reviewer who reads
+ * 'in the floodplain' against a mobile home number and does not realise the
+ * boundary is the 74-acre park has been told something misleading. */
+/* Thousands separators, and never 'NaN' on the screen. */
+function cqbSeNum(n) {
+  var v = Number(n);
+  return isFinite(v) ? Math.round(v).toLocaleString() : '';
+}
+
+function cqbSeSubjectHtml(subject, pid, address) {
+  if (!subject || subject.kind !== 'ioll' || !subject.ioll) return '';
+  var i = subject.ioll, h = i.home || {};
+  var what = i.isMobileHome ? 'mobile home' : (i.use ? cqbSeEsc(i.use) : 'improvement');
+  var bits = [];
+  if (h.space) bits.push('space ' + cqbSeEsc(h.space));
+  if (h.widthFt && h.lengthFt) {
+    bits.push(h.widthFt + ' &times; ' + h.lengthFt + ' ft' +
+      (h.areaSqFt ? ' (' + cqbSeNum(h.areaSqFt) + ' sq ft)' : ''));
+  }
+  if (h.year) bits.push(String(h.year));
+  if (h.make) bits.push(cqbSeEsc(h.make));
+  if (h.serial) bits.push('serial ' + cqbSeEsc(h.serial));
+  return '<div style="margin-top:6px;color:#c2d4e6">' +
+    'PID ' + cqbSeEsc(i.pid) + ' is a ' + what + ' on leased land' +
+    (i.park ? ' in ' + cqbSeEsc(i.park) : '') + ', so it is taxed separately from ' +
+    'the ground and the assessor maps it as a <b>point, not a boundary</b>. ' +
+    'Everything below is for the land parcel underneath it &mdash; PID ' +
+    cqbSeEsc(pid) + (address ? ', ' + cqbSeEsc(address) : '') + '.' +
+    (bits.length ? '<div style="margin-top:4px">Unit: ' + bits.join(' &middot; ') + '</div>' : '') +
+    '<div style="margin-top:4px;color:#9fb6cc">Lot-specific answers &mdash; where this ' +
+    'unit sits relative to the mapped zone, and its own floor elevation &mdash; are not ' +
+    'in this data and still need the site plan.</div>' +
+    '</div>';
+}
+
+/* The flood review's cheap answer to "is the fill-capacity button worth
+ * pressing here". It states presence only; the volume is the other button's
+ * job, and a failed probe must read as "not checked", never as "outside". */
+function cqbSeStorageAreaHtml(sa) {
+  if (!sa) return '';
+  if (!sa.ok) {
+    return '<div class="warn">The storage-area check did not run, so whether this ' +
+      'parcel is in a mapped Salt Creek storage area is unknown here.</div>';
+  }
+  if (!sa.inArea) {
+    return '<div style="margin-top:6px;color:#c2d4e6">Not inside a mapped Salt Creek ' +
+      'flood storage area, so no fill allowance applies and the fill-capacity button ' +
+      'has nothing to compute. That is not the same as "no floodplain rules apply" ' +
+      '&mdash; the zones above still govern.</div>';
+  }
+  return '<div style="margin-top:6px;color:#c2d4e6">Inside ' +
+    (sa.areas > 1 ? cqbSeNum(sa.areas) + ' mapped Salt Creek flood storage areas' +
+       ' (first: ' + cqbSeEsc(sa.saLabel || sa.saNumber || 'unnumbered') + ')'
+     : 'mapped Salt Creek flood storage area ' +
+       cqbSeEsc(sa.saLabel || sa.saNumber || '(unnumbered)')) +
+    '. Press <b>Fill capacity</b> for the storage volume and the allowable fill ' +
+    '&mdash; that step samples ground elevations, so it needs the box ticked.</div>';
+}
+
 function cqbSeStorageHtml(r) {
   if (!r) return '';
   if (r.failed) {
@@ -2288,6 +2530,7 @@ function cqbSiteToolsDialog() {
       '<div class="res" id="cqb-se-res"></div>' +
       '<div class="ft">' +
         '<button id="cqb-se-x">Close</button>' +
+        '<button class="go" id="cqb-se-review">Flood review</button>' +
         '<button class="go" id="cqb-se-fill">Fill capacity</button>' +
       '</div>' +
     '</div>';
@@ -2313,15 +2556,70 @@ function cqbSiteToolsDialog() {
     if (e.key === 'Escape') { close(); document.removeEventListener('keydown', esc); }
   });
 
+  /* ---- Shared plumbing for both buttons -------------------------------- */
+
+  function readPid(st) {
+    var pid = cqbPidNorm($('cqb-se-pid').value);
+    if (!cqbPidKind(pid)) {
+      st.textContent = 'Enter a parcel ID first.';
+      return null;
+    }
+    return pid;
+  }
+
+  function fail(btn, st, res) {
+    return function (e) {
+      btn.disabled = false;
+      st.textContent = '';
+      res.innerHTML = '<div class="warn">' + cqbSeEsc(String((e && e.message) || e)) + '</div>';
+    };
+  }
+
+  /* ---- Flood review (county data, no consent needed) ---------------------
+   * Split off the fill-capacity button in v1.15.0. These two questions are
+   * independent: a parcel can sit in the floodplain and in no Salt Creek
+   * storage area at all, and until now that parcel's user had to run -- and
+   * consent to -- the elevation sampling to find out. Nothing this button
+   * does leaves the county server unless the box is ticked, and then only for
+   * the FEMA letters, so it runs either way and says which is which. */
+  $('cqb-se-review').addEventListener('click', function () {
+    var st = $('cqb-se-st'), res = $('cqb-se-res');
+    res.innerHTML = '';
+    var pid = readPid(st);
+    if (!pid) return;
+
+    var wantFema = $('cqb-se-ok').checked;
+    if (wantFema) { try { localStorage.setItem(CQB_SE_OPTIN, '1'); } catch (e) {} }
+
+    var btn = this;
+    btn.disabled = true;
+    st.textContent = 'Reading the parcel...';
+
+    cqbFloodReview(pid, { includeFema: wantFema,
+                          onStatus: function (t) { st.textContent = t; } }).then(function (rv) {
+      btn.disabled = false;
+      st.textContent = 'Done.';
+      var head = '<b>' + cqbSeEsc(rv.address || ('PID ' + rv.pid)) + '</b>' +
+        cqbSeSubjectHtml(rv.subject, rv.pid, rv.address);
+      res.innerHTML = head +
+        cqbSeSection('Floodplain and required floor elevation',
+          cqbSeZoneHtml(rv.zone) + cqbSeFreeboardHtml(rv.zone, rv.freeboard)) +
+        cqbSeSection('Recorded flood documents', cqbSeRecordsHtml(rv.records)) +
+        cqbSeSection('FEMA letters of map change', cqbSeLettersHtml(rv.letters)) +
+        cqbSeSection('Salt Creek flood storage', cqbSeStorageAreaHtml(rv.storageArea));
+    }).catch(fail(btn, st, res));
+  });
+
   /* ---- Fill capacity (Salt Creek flood storage) --------------------------
    * It only means anything inside one of the county's mapped Salt Creek
    * storage areas, so the honest outcomes are "here is the number" and "this
-   * parcel is not in one" -- never a quiet zero. */
+   * parcel is not in one" -- never a quiet zero. This half keeps the consent
+   * gate, because this is the half that samples ground elevations. */
   $('cqb-se-fill').addEventListener('click', function () {
-    var pid = ($('cqb-se-pid').value || '').replace(/\D/g, '');
     var st = $('cqb-se-st'), res = $('cqb-se-res');
     res.innerHTML = '';
-    if (!/^\d{8,16}$/.test(pid)) { st.textContent = 'Enter a parcel ID first.'; return; }
+    var pid = readPid(st);
+    if (!pid) return;
     if (!$('cqb-se-ok').checked) {
       needElevation(true);
       st.textContent = 'Fill capacity needs ground elevations. Tick the box to confirm.';
@@ -2333,23 +2631,24 @@ function cqbSiteToolsDialog() {
     btn.disabled = true;
     st.textContent = 'Reading the parcel...';
 
-    cqbFloodReview(pid, { includeFema: true,
-                          onStatus: function (t) { st.textContent = t; } }).then(function (rv) {
+    /* An IOLL id has to become its land parcel first: the calculation needs a
+     * polygon and the improvement is a point. */
+    cqbReviewSubject(pid, {}).then(function (subj) {
+      return cqbStorageCalc(subj.parcel.attributes.PARCELID, {
+        parcelFeature: subj.parcel,
+        onStatus: function (t) { st.textContent = t; }
+      }).then(function (r) { return { r: r, subj: subj }; });
+    }).then(function (o) {
       btn.disabled = false;
       st.textContent = 'Done.';
-      var head = '<b>' + (rv.address || ('PID ' + rv.pid)) + '</b>';
+      var rv = o.r;
+      var head = '<b>' + cqbSeEsc(rv.address || ('PID ' + rv.pid)) + '</b>' +
+        cqbSeSubjectHtml(o.subj.ioll ? { kind: 'ioll', ioll: o.subj.ioll } : null,
+                         rv.pid, rv.address);
       res.innerHTML = head +
-        cqbSeSection('Floodplain and required floor elevation',
-          cqbSeZoneHtml(rv.zone) + cqbSeFreeboardHtml(rv.zone, rv.freeboard)) +
         cqbSeSection('Salt Creek flood storage and allowable fill',
-          cqbSeStorageHtml(rv.storage)) +
-        cqbSeSection('Recorded flood documents', cqbSeRecordsHtml(rv.records)) +
-        cqbSeSection('FEMA letters of map change', cqbSeLettersHtml(rv.letters));
-    }).catch(function (e) {
-      btn.disabled = false;
-      st.textContent = '';
-      res.innerHTML = '<div class="warn">' + cqbSeEsc(String((e && e.message) || e)) + '</div>';
-    });
+          cqbSeStorageHtml(rv));
+    }).catch(fail(btn, st, res));
   });
 
   /* Let build-time extras add their controls and buttons. A broken extra must
@@ -2363,7 +2662,7 @@ function cqbSiteToolsDialog() {
     resultEl: $('cqb-se-res'),
     needElevation: needElevation,
     optKey: CQB_SE_OPTIN,
-    getPid: function () { return ($('cqb-se-pid').value || '').replace(/\D/g, ''); },
+    getPid: function () { return cqbPidNorm($('cqb-se-pid').value); },
     close: close
   };
   CQB_SITE_PLUGINS.forEach(function (p) {
@@ -3283,6 +3582,58 @@ function cqbSiteToolsDialog() {
     };
   }
 
+  /* An improvement on leased land resolves to the tax parcel its point falls
+   * inside -- for a mobile home that is the park's land parcel. The card then
+   * describes that parcel, so a banner has to say so; a reviewer who reads a
+   * 74-acre park's record believing it is one home's lot has been misled. */
+  function findIoll(pid, term, opts) {
+    card('<b>Find Parcel</b><br/>Looking up improvement ' + esc(pid) + ' &hellip;');
+    cqbIollResolve(pid, {}).then(function (r) {
+      if (!r.land) {
+        card('<b>Find Parcel</b><br/>' + esc(pid) + ' is mapped at a point that falls ' +
+          'outside every mapped tax parcel, so there is no boundary to show.');
+        return;
+      }
+      return q('/Assessor/TaxParcels/MapServer/0', {
+        where: "PARCELID = '" + String(r.land.attributes.PARCELID).replace(/'/g, "''") + "'",
+        outSR: '3857', returnGeometry: 'true', resultRecordCount: '1',
+        outFields: 'PARCELID,SITEADDRESS,OWNERNME1,GIS_AREA,PRPRTYDSCRP,CLASSDSCRP,RESYRBLT,RESSTRTYP,RESFLRAREA,CNTASSDVAL,CNVYNAME'
+      }).then(function (pj) {
+        var f = (pj.features || [])[0];
+        if (!f) {
+          card('<b>Find Parcel</b><br/>Could not load the land parcel under ' + esc(pid) + '.');
+          return;
+        }
+        showParcel(f, 1, opts);
+        cqbIollBanner(r.ioll, f.attributes.PARCELID);
+      });
+    }).catch(function (e) {
+      card('<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e));
+    });
+  }
+
+  /* Prepended to the card showParcel just built, rather than threaded through
+   * showParcel, so the ordinary parcel path is untouched. */
+  function cqbIollBanner(rec, landPid) {
+    var d = document.getElementById('cqb-card');
+    if (!d || !rec) return;
+    var h = rec.home || {};
+    var bits = [];
+    if (h.space) bits.push('space ' + h.space);
+    if (h.widthFt && h.lengthFt) bits.push(h.widthFt + ' \u00d7 ' + h.lengthFt + ' ft');
+    if (h.year) bits.push(String(h.year));
+    if (h.make) bits.push(h.make);
+    var b = document.createElement('div');
+    b.style.cssText = 'margin:-2px 0 8px;padding:7px 8px;border-radius:6px;' +
+      'background:#1b2a3a;border:1px solid #2f4a63;color:#c2d4e6;font-size:11px;line-height:1.5';
+    b.innerHTML = '<b style="color:#7cc4ff">' + esc(rec.pid) + '</b> is a ' +
+      (rec.isMobileHome ? 'mobile home' : 'improvement') + ' on leased land' +
+      (rec.park ? ' in ' + esc(rec.park) : '') + ', mapped as a point. ' +
+      'The record below is the <b>land parcel</b> it stands on (' + esc(landPid) + ').' +
+      (bits.length ? '<br/>Unit: ' + esc(bits.join(' \u00b7 ')) : '');
+    d.insertBefore(b, d.firstChild);
+  }
+
   /* Find Parcel: search -> (single result | picker) -> record card */
   function findParcel(text, opts) {
     var inp = document.querySelector('input[placeholder*="Search" i], .gcx-search input');
@@ -3291,6 +3642,16 @@ function cqbSiteToolsDialog() {
     term = term.trim();
     if (!term) return;
     var clean = term.replace(/'/g, "''").toUpperCase();
+    /* Mobile homes and other improvements on leased land carry alphanumeric
+     * PIDs and live in a different layer, as points. Searching TaxParcels for
+     * one used to fall through to the address branch and report 'no parcel
+     * found ... try a 13-digit PID', which is wrong twice over: the PID was
+     * correct, and there IS something to show -- the land parcel the home
+     * stands on. */
+    if (typeof cqbPidKind === 'function' && cqbPidKind(clean) === 'ioll') {
+      findIoll(cqbPidNorm(clean), term, opts);
+      return;
+    }
     var where = /^\d{10,14}$/.test(clean)
       ? "PARCELID = '" + clean + "'"
       : "UPPER(SITEADDRESS) LIKE '" + clean.split(',')[0] + "%'";
