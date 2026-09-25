@@ -346,12 +346,19 @@ function runQuickBar() {
     }
   }
 
-  /* ---- 4. snap slots: full-tree visibility snapshots ---- */
+  /* ---- 4. snap slots: full-tree visibility snapshots ----
+   * A snapshot records which layers are on, by position in the layer tree. It is not a map
+   * view: centre and scale are not saved. Since 1.16.0 layers that are not part of the map's
+   * durable state (see cqbNonDurableLayers in 4b) are left out when saving and ignored when
+   * applying -- including entries an older build saved for them -- so a snapshot never
+   * switches the viewer's identify highlights or another script's overlay. Entries for every
+   * other layer are stored and applied exactly as before. */
   function snapshot() {
-    var s = [];
+    var s = [], skip = cqbNonDurableLayers();
     (function walk(ls, path) {
       ls.forEach(function (l, i) {
         var p = path + '/' + i;
+        if (skip.indexOf(l) >= 0) return;
         s.push([p, !!l.visible]);
         if (l.layers) walk(l.layers, p);
       });
@@ -359,11 +366,12 @@ function runQuickBar() {
     return s;
   }
   function applySnap(s) {
-    var byPath = {};
+    var byPath = {}, skip = cqbNonDurableLayers();
     s.forEach(function (e) { byPath[e[0]] = e[1]; });
     (function walk(ls, path) {
       ls.forEach(function (l, i) {
         var p = path + '/' + i;
+        if (skip.indexOf(l) >= 0) return;
         if (p in byPath && l.visible !== byPath[p]) l.visible = byPath[p];
         if (l.layers) walk(l.layers, p);
       });
@@ -425,6 +433,57 @@ function runQuickBar() {
     });
     return out;
   }
+  /* ---- durable vs. transient layers (1.16.0, repair H1) ----
+   * Only layers that exist on a clean load of this web map belong in shared or saved layer
+   * state. Two kinds of layer appear later, and both used to leak into it:
+   *
+   *   - The viewer's own group, id __GWV_SPECIAL_LAYER, is the LAST operational layer on a
+   *     clean load and has no children (measured 2026-09-25). A native identify -- clicking a
+   *     parcel -- adds __GCX_* highlight graphics INSIDE it. They changed the signature, so a
+   *     link made after any parcel click was refused by every fresh recipient, and they also
+   *     broke the match with the sender's own baseline, which silently dropped layers-default
+   *     from the link as well. Shared layer state was lost; centre, scale and parcel were not.
+   *   - Layers other scripts add. view.map.add() puts a layer on top, above the viewer's own
+   *     group; a script that must add one lower down marks it with an id starting __OPT_.
+   *
+   * The durable list is cqbStockOps() without either kind. On a clean load nothing is removed,
+   * so the list, its signature, and therefore every baseline and link an older build made on a
+   * clean page are unchanged. Everything removed sits after __GWV_SPECIAL_LAYER, or is marked
+   * __OPT_, and a recipient's viewer counts neither when it applies layers-default at start-up,
+   * so the native indices of the remaining layers are exactly what they were. */
+  var CQB_VIEWER_GROUP_ID = '__GWV_SPECIAL_LAYER';
+  var CQB_OPTIONAL_ID_PREFIX = '__OPT_';
+  function cqbTransientId(l) {
+    var id = String((l && l.id) || '');
+    return id.indexOf('__GCX_') === 0 || id.indexOf(CQB_OPTIONAL_ID_PREFIX) === 0;
+  }
+  /* Every layer object that must stay out of shared and saved state: anything nested in the
+   * viewer's group (but not the group itself, which a clean load has), anything added above
+   * it, and anything carrying a transient id, together with everything nested inside those. */
+  function cqbNonDurableLayers() {
+    var out = [];
+    function all(l) { out.push(l); if (l.layers) l.layers.forEach(all); }
+    var above = false;
+    v.map.layers.forEach(function (l) {
+      if (above || cqbTransientId(l)) { all(l); return; }
+      if (String(l.id || '') === CQB_VIEWER_GROUP_ID) {
+        if (l.layers) l.layers.forEach(all);
+        above = true;
+        return;
+      }
+      (function inner(col) {
+        if (!col) return;
+        col.forEach(function (c) { if (cqbTransientId(c)) all(c); else inner(c.layers); });
+      })(l.layers);
+    });
+    return out;
+  }
+  /* the layers a link or baseline describes, in native layers- index order */
+  function cqbDurableOps() {
+    var skip = cqbNonDurableLayers();
+    return cqbStockOps().filter(function (l) { return skip.indexOf(l) < 0; });
+  }
+
   /* identity of the layer list itself, so a stale baseline or a link made against a different
    * version of this map is detected instead of applied to the wrong layers */
   function cqbOpsSig(ops) {
@@ -462,7 +521,7 @@ function runQuickBar() {
    * itself opened from a shared link (its layers are already someone else's), and never silently
    * replaces a baseline that is still valid for this map -- force=true is the Settings button. */
   function cqbCaptureBaseline(force) {
-    var ops = cqbStockOps(), sig = cqbOpsSig(ops);
+    var ops = cqbDurableOps(), sig = cqbOpsSig(ops);
     if (!force) {
       if (cqbUrlHasLayerState()) return null;
       var have = cqbReadBaseline(sig);
@@ -485,7 +544,7 @@ function runQuickBar() {
   }
 
   function cqbBuildLink() {
-    var ops = cqbStockOps(), sig = cqbOpsSig(ops), bits = cqbBitsOf(ops);
+    var ops = cqbDurableOps(), sig = cqbOpsSig(ops), bits = cqbBitsOf(ops);
     var qs = new URLSearchParams(location.search || '');
     var parts = [];
     if (qs.get('app')) parts.push('app=' + encodeURIComponent(qs.get('app')));
@@ -551,7 +610,7 @@ function runQuickBar() {
     var qbl = qs.get('qbl'), pid = qs.get('pid');
 
     if (qbl) {
-      var ops = cqbStockOps(), sig = cqbOpsSig(ops);
+      var ops = cqbDurableOps(), sig = cqbOpsSig(ops);
       var split = qbl.split('~');
       var incoming = split.length === 2 ? cqbHexToBits(split[1], ops.length) : null;
       if (split[0] === sig && incoming) {
