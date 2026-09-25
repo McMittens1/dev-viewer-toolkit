@@ -815,6 +815,11 @@ function runQuickBar() {
   }
 
   /* ---- 5. the bar ---- */
+  /* A re-run of the bar (the 5 s watchdog, or a fresh copy injected over an old one) first
+   * undoes what the previous run left behind: its open card and Site tools dialog, with their
+   * Escape handlers, and its window resize listener. Only toolkit-owned handlers are touched
+   * (1.16.0, repair H5). */
+  if (typeof window.__cqbTeardown === 'function') { try { window.__cqbTeardown(); } catch (e) {} }
   var old = document.getElementById('cqb'); if (old) old.remove();
   var oldHandle = document.getElementById('cqb-handle'); if (oldHandle) oldHandle.remove();
   if (window.__cqbRefreshTimer) { clearInterval(window.__cqbRefreshTimer); } /* a prior click's chip-repaint loop would otherwise run forever */
@@ -2612,7 +2617,18 @@ function cqbSeLettersHtml(l) {
     'authoritative.</div>' + bits.join('');
 }
 
+/* The open Site tools dialog's close(), if one is open. Opening the dialog again replaces the
+ * open one instead of stacking a second copy (with duplicate element ids) on top of it, and
+ * every close path -- the Close button, a backdrop click, Escape, a plugin's api.close(),
+ * replacement, and toolbar teardown -- removes the dialog's Escape handler with it. Until
+ * 1.16.0 only Escape removed the handler (repair H5). */
+var cqbSeActiveClose = null;
+function cqbSeCloseActive() {
+  if (typeof cqbSeActiveClose === 'function') cqbSeActiveClose();
+}
+
 function cqbSiteToolsDialog() {
+  cqbSeCloseActive();
   cqbSeCss();
   var back = document.createElement('div');
   back.className = 'cqb-se-back';
@@ -2670,12 +2686,16 @@ function cqbSiteToolsDialog() {
     if (this.checked) $('cqb-se-optin').style.display = 'none';
   });
 
-  function close() { back.remove(); }
+  function esc(e) { if (e.key === 'Escape') close(); }
+  function close() {
+    document.removeEventListener('keydown', esc);
+    if (cqbSeActiveClose === close) cqbSeActiveClose = null;
+    if (back.parentNode) back.remove();
+  }
+  cqbSeActiveClose = close;
   $('cqb-se-x').addEventListener('click', close);
   back.addEventListener('click', function (e) { if (e.target === back) close(); });
-  document.addEventListener('keydown', function esc(e) {
-    if (e.key === 'Escape') { close(); document.removeEventListener('keydown', esc); }
-  });
+  document.addEventListener('keydown', esc);
 
   /* ---- Shared plumbing for both buttons -------------------------------- */
 
@@ -2963,6 +2983,12 @@ function cqbSiteToolsDialog() {
     window.__cqbResizeObserver = ro;
   }
   window.addEventListener('resize', positionBar);
+  window.__cqbTeardown = function () {
+    window.__cqbTeardown = null;
+    window.removeEventListener('resize', positionBar);
+    try { closeCard(); } catch (e) {}
+    try { cqbSeCloseActive(); } catch (e) {}
+  };
 
   /* ---- 5b. remembered show/hide state ---- */
   function hideBar() {
@@ -3720,8 +3746,18 @@ function cqbSiteToolsDialog() {
     } catch (e) { return floor; }
   }
 
+  /* Every way a card goes away runs through its own dismiss(): the close control, Enter/Space
+   * on it, Escape, a Settings action, a newer card replacing it, and toolbar teardown.
+   * dismiss() removes the card AND its document-level Escape handler. Until 1.16.0 only Escape removed
+   * the handler, so every other dismissal left one behind (repair H5). */
+  function closeCard(d) {
+    d = d || document.getElementById('cqb-card');
+    if (!d) return;
+    if (typeof d.cqbClose === 'function') d.cqbClose();
+    else if (d.parentNode) d.remove();     /* a card left by a toolkit older than 1.16.0 */
+  }
   function card(html) {
-    var oldc = document.getElementById('cqb-card'); if (oldc) oldc.remove();
+    closeCard();
     var d = document.createElement('div');
     d.id = 'cqb-card';
     d.setAttribute('role', 'dialog');
@@ -3735,10 +3771,18 @@ function cqbSiteToolsDialog() {
     close.innerHTML = "<span role='button' tabindex='0' id='cqb-card-x' style='cursor:pointer;color:#a9bccf;padding:2px 10px;border:1px solid #2c3a4d;border-radius:4px;'>close</span>";
     d.appendChild(close);
     document.body.appendChild(d);
-    var cx = document.getElementById('cqb-card-x');
-    cx.onclick = function () { d.remove(); };
-    cx.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); d.remove(); } });
-    document.addEventListener('keydown', function esck(ev) { if (ev.key === 'Escape') { d.remove(); document.removeEventListener('keydown', esck); } });
+    /* named dismiss, not close: `close` above is the element that holds the close control */
+    function esck(ev) { if (ev.key === 'Escape') dismiss(); }
+    function dismiss() {
+      document.removeEventListener('keydown', esck);
+      d.cqbClose = null;
+      if (d.parentNode) d.remove();
+    }
+    d.cqbClose = dismiss;
+    var cx = d.querySelector('#cqb-card-x');
+    cx.onclick = dismiss;
+    cx.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); dismiss(); } });
+    document.addEventListener('keydown', esck);
     return d;
   }
   function row(label, val) {
@@ -3791,17 +3835,17 @@ function cqbSiteToolsDialog() {
       var off = localStorage.getItem('__claude_qb_nosearch') === '1';
       if (off) localStorage.removeItem('__claude_qb_nosearch'); else localStorage.setItem('__claude_qb_nosearch', '1');
       try { cqbSugRemove(null); } catch (e) {}
-      d.remove();
+      closeCard(d);
       toast('Parcel results in the search box: ' + (off ? 'on' : 'off'));
     };
     var recal = d.querySelector('#cqb-recal-btn');
     if (recal) recal.onclick = function () {
       if (!confirm('Record the layers that are on right now as this app\u2019s normal startup state?\n\nDo this on a freshly-loaded viewer you have not changed yet.')) return;
-      cqbCaptureBaseline(true); d.remove();
+      cqbCaptureBaseline(true); closeCard(d);
       toast('Layer baseline recorded');
     };
     d.querySelectorAll('.cqb-rm').forEach(function (r) {
-      r.onclick = function () { cfg.splice(+r.getAttribute('data-i'), 1); saveCfg(); renderChips(); d.remove(); openSettings(); };
+      r.onclick = function () { cfg.splice(+r.getAttribute('data-i'), 1); saveCfg(); renderChips(); closeCard(d); openSettings(); };
     });
     var addBtn = d.querySelector('#cqb-add-btn');
     if (addBtn) addBtn.onclick = function () {
@@ -3809,7 +3853,7 @@ function cqbSiteToolsDialog() {
       var t = sel.value, l = (lab.value || t.slice(0, 8)).trim();
       if (!t) return;
       cfg.push({ k: 'c' + Date.now(), t: t, l: l });
-      saveCfg(); renderChips(); d.remove(); openSettings();
+      saveCfg(); renderChips(); closeCard(d); openSettings();
     };
     var saveBtn = d.querySelector('#cqb-save-btn');
     saveBtn.onclick = function () {
@@ -3818,12 +3862,12 @@ function cqbSiteToolsDialog() {
         var inp = tr.querySelector('input[data-f="l"]');
         if (inp && cfg[i]) cfg[i].l = inp.value.trim() || cfg[i].l;
       });
-      saveCfg(); renderChips(); d.remove();
+      saveCfg(); renderChips(); closeCard(d);
       toast('Chip labels saved');
     };
     d.querySelector('#cqb-reset-btn').onclick = function () {
       if (!confirm('Reset to the default 7 layers? This clears your custom chip configuration.')) return;
-      cfg = DEFAULTS.slice(); saveCfg(); renderChips(); d.remove();
+      cfg = DEFAULTS.slice(); saveCfg(); renderChips(); closeCard(d);
       toast('Reset to default layers');
     };
   }
