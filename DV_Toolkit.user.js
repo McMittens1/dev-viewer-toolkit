@@ -2208,6 +2208,14 @@ function cqbSeGuessPid() {
       if (mm && cqbPidKind(mm[1])) return cqbPidNorm(mm[1]);
     }
   } catch (e) {}
+  /* Last, the parcel from the toolkit's own Find Parcel card (1.16.0). Without this the dialog
+   * opened blank right after a Find Parcel search. Same order the Link chip uses: the app's own
+   * record first, then the last Find Parcel. For a mobile home this is the MH id, which the
+   * dialog resolves to its land parcel with the leased-land warning. */
+  try {
+    var last = window.__cqbLastPid;
+    if (last && cqbPidKind(String(last))) return cqbPidNorm(String(last));
+  } catch (e) {}
   return '';
 }
 
