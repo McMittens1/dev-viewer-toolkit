@@ -3671,13 +3671,28 @@ function cqbSiteToolsDialog() {
     };
   }
 
+  /* One Find Parcel at a time (1.16.0, repair H2). Every search and every card load takes a
+   * ticket; an asynchronous step that finishes after a newer search has started must not
+   * write into the newer search's card. Before this, a slow mobile-home lookup overtaken by an
+   * ordinary search replaced the ordinary card with the 74-acre park record, and a late
+   * floodplain percentage could land in the wrong parcel's row. */
+  var cqbFindSeq = 0;
+  function cqbFindTicket() { var mine = ++cqbFindSeq; return function () { return mine === cqbFindSeq; }; }
+
   /* An improvement on leased land resolves to the tax parcel its point falls
    * inside -- for a mobile home that is the park's land parcel. The card then
    * describes that parcel, so a banner has to say so; a reviewer who reads a
-   * 74-acre park's record believing it is one home's lot has been misled. */
+   * 74-acre park's record believing it is one home's lot has been misled.
+   *
+   * 1.15.0 inserted the banner into the card that existed when the land parcel arrived --
+   * showParcel's "Loading..." card -- and showParcel's final render replaced that card, so the
+   * banner never survived (reproduced live 2026-09-25 on MH00002090000). The banner is now
+   * HTML that showParcel puts at the top of EVERY render it makes: loading, final, and error. */
   function findIoll(pid, term, opts) {
+    var live = cqbFindTicket();
     card('<b>Find Parcel</b><br/>Looking up improvement ' + esc(pid) + ' &hellip;');
     cqbIollResolve(pid, {}).then(function (r) {
+      if (!live()) return;
       if (!r.land) {
         card('<b>Find Parcel</b><br/>' + esc(pid) + ' is mapped at a point that falls ' +
           'outside every mapped tax parcel, so there is no boundary to show.');
@@ -3688,39 +3703,43 @@ function cqbSiteToolsDialog() {
         outSR: '3857', returnGeometry: 'true', resultRecordCount: '1',
         outFields: 'PARCELID,SITEADDRESS,OWNERNME1,GIS_AREA,PRPRTYDSCRP,CLASSDSCRP,RESYRBLT,RESSTRTYP,RESFLRAREA,CNTASSDVAL,CNVYNAME'
       }).then(function (pj) {
+        if (!live()) return;
         var f = (pj.features || [])[0];
         if (!f) {
           card('<b>Find Parcel</b><br/>Could not load the land parcel under ' + esc(pid) + '.');
           return;
         }
-        showParcel(f, 1, opts);
-        cqbIollBanner(r.ioll, f.attributes.PARCELID);
+        showParcel(f, 1, Object.assign({}, opts || {}, {
+          banner: cqbIollBannerHtml(r.ioll, f.attributes),
+          lastPid: r.ioll && r.ioll.pid       /* a shared link then reopens THIS card, warning included */
+        }));
       });
     }).catch(function (e) {
+      if (!live()) return;
       card('<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e));
     });
   }
 
-  /* Prepended to the card showParcel just built, rather than threaded through
-   * showParcel, so the ordinary parcel path is untouched. */
-  function cqbIollBanner(rec, landPid) {
-    var d = document.getElementById('cqb-card');
-    if (!d || !rec) return;
+  /* The improvement and the land under it, kept distinct: the MH id and unit facts, then the
+   * PID and address of the parcel the record below actually describes. */
+  function cqbIollBannerHtml(rec, land) {
+    if (!rec) return '';
     var h = rec.home || {};
     var bits = [];
     if (h.space) bits.push('space ' + h.space);
     if (h.widthFt && h.lengthFt) bits.push(h.widthFt + ' \u00d7 ' + h.lengthFt + ' ft');
     if (h.year) bits.push(String(h.year));
     if (h.make) bits.push(h.make);
-    var b = document.createElement('div');
-    b.style.cssText = 'margin:-2px 0 8px;padding:7px 8px;border-radius:6px;' +
-      'background:#1b2a3a;border:1px solid #2f4a63;color:#c2d4e6;font-size:11px;line-height:1.5';
-    b.innerHTML = '<b style="color:#7cc4ff">' + esc(rec.pid) + '</b> is a ' +
+    var landPid = land && land.PARCELID, landAddr = land && land.SITEADDRESS;
+    return "<div data-cqb-ioll='1' role='note' style='margin:-2px 0 8px;padding:7px 8px;border-radius:6px;" +
+      "background:#1b2a3a;border:1px solid #2f4a63;color:#c2d4e6;font-size:11px;line-height:1.5;'>" +
+      "<b style='color:#7cc4ff'>" + esc(rec.pid) + '</b> is a ' +
       (rec.isMobileHome ? 'mobile home' : 'improvement') + ' on leased land' +
-      (rec.park ? ' in ' + esc(rec.park) : '') + ', mapped as a point. ' +
-      'The record below is the <b>land parcel</b> it stands on (' + esc(landPid) + ').' +
-      (bits.length ? '<br/>Unit: ' + esc(bits.join(' \u00b7 ')) : '');
-    d.insertBefore(b, d.firstChild);
+      (rec.park ? ' in ' + esc(rec.park) : '') + ', mapped as a point, not a boundary. ' +
+      'The record below describes the <b>underlying land parcel</b>' +
+      (landPid ? ', PID ' + esc(landPid) : '') + (landAddr ? ' (' + esc(landAddr) + ')' : '') +
+      ' &mdash; not this unit.' +
+      (bits.length ? '<br/>Unit: ' + esc(bits.join(' \u00b7 ')) : '') + '</div>';
   }
 
   /* Find Parcel: search -> (single result | picker) -> record card */
@@ -3744,14 +3763,16 @@ function cqbSiteToolsDialog() {
     var where = /^\d{10,14}$/.test(clean)
       ? "PARCELID = '" + clean + "'"
       : "UPPER(SITEADDRESS) LIKE '" + clean.split(',')[0] + "%'";
+    var live = cqbFindTicket();
     card('<b>Find Parcel</b><br/>Searching for &ldquo;' + esc(term) + '&rdquo; &hellip;');
     q('/Assessor/TaxParcels/MapServer/0', { where: where, outSR: '3857', returnGeometry: 'true',
       outFields: 'PARCELID,SITEADDRESS,OWNERNME1,GIS_AREA,PRPRTYDSCRP,CLASSDSCRP,RESYRBLT,RESSTRTYP,RESFLRAREA,CNTASSDVAL,CNVYNAME', resultRecordCount: '8' })
     .then(function (pj) {
+      if (!live()) return;
       if (!pj.features || !pj.features.length) { card('<b>Find Parcel</b><br/>No parcel found for &ldquo;' + esc(term) + '&rdquo;. Try the street number + name only, or a 13-digit PID.'); return; }
       if (pj.features.length === 1) { showParcel(pj.features[0], 1, opts); return; }
       showPicker(pj.features, term);
-    }).catch(function (e) { card('<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e)); });
+    }).catch(function (e) { if (!live()) return; card('<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e)); });
   }
 
   /* multiple address/PID matches: let the user pick which parcel before loading the full card */
@@ -3791,7 +3812,9 @@ function cqbSiteToolsDialog() {
   /* full record card for one chosen parcel feature */
   function showParcel(f, matchCount, opts) {
     var at = f.attributes;
-    window.__cqbLastPid = at.PARCELID || window.__cqbLastPid;
+    var live = cqbFindTicket();
+    var banner = (opts && opts.banner) || '';
+    window.__cqbLastPid = (opts && opts.lastPid) || at.PARCELID || window.__cqbLastPid;
     var g = f.geometry;
     var ring = g.rings[0];
     var xs = ring.map(function (p) { return p[0]; }), ys = ring.map(function (p) { return p[1]; });
@@ -3817,7 +3840,7 @@ function cqbSiteToolsDialog() {
     var lat = (Math.atan(Math.exp(cy0 / 6378137)) * 2 - Math.PI / 2) * 180 / Math.PI;
     var lon = cx0 * 180 / 20037508.342787;
     var geomP = { geometry: gp, geometryType: 'esriGeometryPolygon', spatialRel: 'esriSpatialRelIntersects', where: '1=1', returnGeometry: 'false' };
-    card('<b>Find Parcel</b><br/>Loading record for ' + esc(at.SITEADDRESS || at.PARCELID) + '&hellip;');
+    card(banner + '<b>Find Parcel</b><br/>Loading record for ' + esc(at.SITEADDRESS || at.PARCELID) + '&hellip;');
     Promise.all([
       q('/Planning/DevRevZoningandRegulations/MapServer/1', Object.assign({ outFields: 'ZONE' }, geomP)),
       q('/LTUWatershed/FEMAFlood/MapServer/1', Object.assign({ outFields: 'FLD_ZONE,FLOODWAY' }, geomP)),
@@ -3828,6 +3851,7 @@ function cqbSiteToolsDialog() {
       q('/Planning/HOANA2/MapServer/0', Object.assign({ outFields: 'na_name,first_name,last_name,phone,email', resultRecordCount: '10' }, geomP)).catch(function () { return { features: [] }; }),
       q('/Planning/HOANA2/MapServer/1', Object.assign({ outFields: 'ASSOCNAME,SHORTNAME,first_name,last_name,phone,email', resultRecordCount: '10' }, geomP)).catch(function () { return { features: [] }; })
     ]).then(function (rs) {
+      if (!live()) return;
       function vals(j, fld) {
         var s = [];
         (j.features || []).forEach(function (ff) { var vv = ff.attributes[fld]; if (vv != null && String(vv).trim() !== '' && s.indexOf(vv) < 0) s.push(vv); });
@@ -3882,7 +3906,7 @@ function cqbSiteToolsDialog() {
       var money = at.CNTASSDVAL ? '$' + Math.round(at.CNTASSDVAL).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') : '';
       var flr = at.RESFLRAREA ? Math.round(at.RESFLRAREA).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' ft\u00b2' : '';
       var B = "display:inline-block;background:#24354d;color:#cfe8ff;text-decoration:none;font-size:11px;font-weight:bold;padding:4px 8px;border-radius:4px;margin:0 4px 4px 0;";
-      card(
+      card(banner +
         "<div style='font-size:13px;font-weight:bold;color:#fff;'>" + esc(at.SITEADDRESS || 'Parcel ' + at.PARCELID) + '</div>' +
         "<div style='color:#8fa3ba;margin:1px 0 6px 0;'>PID " + esc(at.PARCELID) + ' \u00b7 ' + esc(at.OWNERNME1 || '') + '</div>' +
         "<table style='width:100%;border-collapse:collapse;'>" +
@@ -3903,11 +3927,12 @@ function cqbSiteToolsDialog() {
        * held up waiting on the geometry service */
       if (flood !== 'None mapped') {
         cqbFloodPercent(g, at.GIS_AREA).then(function (txt) {
+          if (!live()) return;                 /* the row now on screen belongs to a newer card */
           var el = document.getElementById('cqb-flood-pct');
           if (el && txt) el.textContent = ' \u00b7 ' + txt;
         });
       }
-    }).catch(function (e) { card('<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e)); });
+    }).catch(function (e) { if (!live()) return; card(banner + '<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e)); });
   }
   window.__qbFindParcel = findParcel;
 
