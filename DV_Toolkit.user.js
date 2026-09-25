@@ -1014,6 +1014,25 @@ function cqbBlank(v) {
   return v === null || v === undefined || String(v).trim() === '';
 }
 
+/* A usable flood elevation (feet, NAVD88), or null. Blank shapes, text that is
+ * not a number, and non-finite values are refused BEFORE Number() can turn them
+ * into 0 -- Number(' ') is 0, which is how a single-space ELEV became a
+ * sea-level BFE line before 1.16.0 (repair H4). Only numbers and numeric
+ * strings count; a boolean or an array is not an elevation even though Number()
+ * would accept it.
+ * Domain rule: an elevation at or below zero is treated as missing too. Ground
+ * in Lancaster County sits roughly 1,100 to 1,500 ft above NAVD88 datum, so a
+ * value <= 0 can only be a placeholder (0, or a sentinel such as -9999), never
+ * a real base flood elevation. Every positive finite value is kept as given --
+ * this is a data-shape guard, not a plausibility filter. */
+function cqbElevOrNull(raw) {
+  if (cqbBlank(raw)) return null;
+  if (typeof raw !== 'number' && typeof raw !== 'string') return null;
+  var e = Number(raw);
+  if (!isFinite(e) || e <= 0) return null;
+  return e;
+}
+
 /* Storage areas are shown by number; an unnumbered one must not read "#null". */
 function cqbSaLabel(n) {
   return cqbBlank(n) ? '(unnumbered)' : '#' + n;
@@ -1546,16 +1565,16 @@ function cqbStorageAreaProbe(parcelGeom, deps) {
 
 var CQB_BFE_URL = CQB_PUB + 'LTUWatershed/FEMEFloodDetails/MapServer/1';
 
-/* Flatten BFE polylines into elevation-tagged segments. */
+/* Flatten BFE polylines into elevation-tagged segments. A line whose ELEV is not
+ * a usable elevation (see cqbElevOrNull) is left out and counted in `skipped`:
+ * Number(null) and Number(' ') are both 0, and a zero line would drag every
+ * interpolation near it toward sea level. Until 1.16.0 this guarded null,
+ * undefined and '' but not a single space (repair H4). */
 function cqbBfeSegments(features) {
-  var segs = [];
+  var segs = [], skipped = 0;
   (features || []).forEach(function (f) {
-    /* Number(null) is 0, so a null ELEV would otherwise become a sea-level BFE
-     * line and drag every interpolation near it. Reject the empty cases first. */
-    var raw = f.attributes ? f.attributes.ELEV : null;
-    if (raw === null || raw === undefined || raw === '') return;
-    var e = Number(raw);
-    if (!isFinite(e)) return;
+    var e = cqbElevOrNull(f && f.attributes ? f.attributes.ELEV : null);
+    if (e === null) { skipped++; return; }
     ((f.geometry && f.geometry.paths) || []).forEach(function (path) {
       for (var i = 0; i < path.length - 1; i++) segs.push({ e: e, a: path[i], b: path[i + 1] });
     });
@@ -1563,7 +1582,7 @@ function cqbBfeSegments(features) {
   var elevs = [];
   segs.forEach(function (s) { if (elevs.indexOf(s.e) < 0) elevs.push(s.e); });
   elevs.sort(function (a, b) { return a - b; });
-  return { segs: segs, elevs: elevs };
+  return { segs: segs, elevs: elevs, skipped: skipped };
 }
 
 /* BFE at a point: inverse-distance blend of the two nearest distinct contour
@@ -1693,7 +1712,14 @@ function cqbStorageCalc(pid, opts, deps) {
     }
     var bfe = cqbBfeSegments(fs);
     if (!bfe.elevs.length) { rep.noBfe = true; return null; }
-    rep.bfeLineCount = fs.length;
+    /* the lines actually used; a line with no usable elevation is not one of them */
+    rep.bfeLineCount = fs.length - bfe.skipped;
+    if (bfe.skipped) {
+      rep.bfeLinesSkipped = bfe.skipped;
+      rep.warnings.push(bfe.skipped + ' BFE line' + (bfe.skipped === 1 ? '' : 's') + ' near this parcel ' +
+        (bfe.skipped === 1 ? 'has' : 'have') + ' no usable elevation recorded (blank or not a number) ' +
+        'and ' + (bfe.skipped === 1 ? 'was' : 'were') + ' left out of the BFE surface.');
+    }
 
     var gspec = cqbGridSpec(cqbBounds(rep._clip.rings), opts.maxPoints || 3000, opts.gridStep || 5);
     rep.gridStep = gspec.step;
@@ -1927,7 +1953,8 @@ function cqbFreeboardAssess(parcelGeom, deps) {
     ((j && j.features) || []).forEach(function (f) {
       var a = f.attributes || {};
       /* Same Number(null)===0 trap as everywhere else in this file. */
-      if (!cqbBlank(a.ELEV) && isFinite(Number(a.ELEV))) elevs.push(Number(a.ELEV));
+      var e = cqbElevOrNull(a.ELEV);
+      if (e !== null) elevs.push(e);
       if (cqbBlank(a.V_DATUM)) undeclared++; else datums[String(a.V_DATUM).trim()] = 1;
     });
     return { ok: true, count: elevs.length,
