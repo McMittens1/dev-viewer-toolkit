@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.16.0 — reliability repairs
+
+Five defects found in an independent review, each now covered by a regression test. None of them changes a result on good data.
+
+- **Shared links keep their layers after you click a parcel.** Clicking a parcel on the map makes the app add temporary highlight graphics to the map's layer list. The Link chip counted them. A link made after a click therefore carried a layer description that a freshly opened viewer could not match, and the recipient got the right place and parcel but their own default layers — Flood on for you, off for them. The chip now describes only the map's own layers. It ignores the app's temporary graphics and any layer the toolkit itself adds. The app's own `layers-default` numbering is unchanged, links made by earlier versions still open, and a link whose layers really do not match this map is still refused rather than guessed at.
+- **The leased-land warning stays on the Find Parcel card.** Searching `MH00002090000` showed the warning while the card loaded, then the finished card replaced it. What remained was the 74-acre land parcel's record with nothing to say it was not the home's. The finished card now keeps the warning: the MH id, the park, and that PID `1115200001000` / 101 Gaslight Circle describes the land underneath, not the unit. A slow search can no longer overwrite a newer one, and a link made from that card reopens the MH record.
+- **A failed lookup is no longer shown as "None mapped".** Find Parcel and the popup repair did not check the county's replies for errors. An ArcGIS error reply, or a reply with no feature list, came out as an empty result — "Floodplain: None mapped" — and the popup repair kept that answer for the rest of the session. Other failures blanked the whole card, and a reply that never came left it loading. Now each row stands alone. A failed row says "could not be checked" and offers Retry. A failed popup value stays `#INVALID`, underlined in amber, and a click retries it. Nothing that failed is cached, and a genuinely empty result still reads "None mapped". The Site tools reader now also treats an HTTP error status as a failure. This was found with deliberately broken replies; it is not a report of a county outage.
+- **A blank base flood elevation is no longer read as 0 ft.** A BFE line whose elevation was a single space would have become a sea-level line and pulled the Salt Creek storage figure toward zero. Blank, non-numeric and zero-or-negative elevations are now left out, and the result panel says when a line was skipped. On the validation parcel, 1015 W O St, the figures are unchanged: 18,500 sq ft, 624 CY of storage, 218 CY allowable at 35%.
+- **Closing a card or Site tools no longer leaves a keyboard handler behind.** Only Escape removed them. The close button, a backdrop click, Settings actions and replacing a card each left one more. Every way of closing now removes its own handler, opening Site tools again replaces any open copy, and a restarted Quick Bar cleans up after the one it replaces. The app's own keyboard handling is never touched.
+
+Also in this release:
+
+- **Site tools fills in the parcel ID from your last Find Parcel card.** A `pid=` link or the app's own open parcel record still comes first.
+- **The mobile-home dimension parser, re-measured against real data.** This was prepared as 1.15.1 and never published on its own. The 1.15.0 parser was written from one example legal description and did not survive the other 1,778. Dimensions written length-first are no longer reported reversed (13 records read `80 X 16`, not `16 X 80`). Implausible pairs, such as a two-foot-long home, are dropped rather than displayed. Feet marks (`14' X 56'`) and a length run into the colour (`16 X 80GRY/WHT`) now parse. A serial number containing its own `X` pair can no longer win. Result: 1,769 of 1,779 records parse, and the widths land where they should — 14 ft and 16 ft single-wides most common, 24–32 ft double-wides next.
+
+## 1.15.0 — two buttons, and parcels that were unfindable
+
+**Flood review and Salt Creek fill capacity are now separate button presses.** They were one, and that was wrong in two ways. A parcel can sit in the floodplain and in no Salt Creek storage area at all — most do — and its user still paid for the elevation sampling to be told the fill number did not apply. Worse, the consent gate for the external services sat in front of both, so declining it meant getting no flood review either, when the flood review needs nothing but county data.
+
+- **Flood review** runs on county data alone and needs no opt-in: FEMA zones and the county's flood prone areas, the Zone A study notice, required lowest floor at both freeboard heights, recorded flood documents, and — if you have agreed to the external services — FEMA letters of map change. Without that agreement the letters section says it was not checked, rather than implying there are none.
+- It also reports **whether the parcel is in a mapped Salt Creek storage area**, in one cheap query with no elevation sampling, so you know whether the second button has anything to compute before pressing it. A storage layer that fails to answer reads as "not checked", never as "outside".
+- **Fill capacity** keeps the opt-in, because it is the half that samples ground elevations, and is unchanged otherwise.
+
+**Mobile homes and other improvements on leased land can be found at all.** These are taxed separately from the ground they stand on, carry alphanumeric parcel IDs like `MH00002090000`, and live in their own assessor layer as points — 2,375 records countywide, 2,080 of them mobile homes. Every parcel-ID pattern in the toolkit was digits-only, and the Site tools dialog stripped non-digits from whatever you typed, so a correctly copied ID became a number matching nothing and came back "not found".
+
+- Search and Site tools now accept them, resolve the point to the tax parcel containing it, and review that parcel.
+- Both the card and the review panel say so: the improvement is mapped as a **point, not a boundary**, and the flood answer describes the land parcel underneath — for a mobile home, the whole park. A reviewer reading a 74-acre park's flood record as if it were one home's lot has been told something misleading, so the toolkit says which it is, and adds that lot-specific answers still need the site plan.
+- The unit's space number, dimensions, year, make and serial are read out of the assessor's legal description.
+
 ## 1.14.0 — review-panel and map-behaviour fixes
 
 - **The parcel highlight actually draws.** It was built with the spatial reference taken from the individual feature, but ArcGIS REST puts that on the response root, not on each feature — so it was undefined, defaulted to WGS84 lat/long, and the Web Mercator rings were reprojected off the map. The graphic existed and reported itself visible the whole time. It now uses the view's own spatial reference.
