@@ -456,7 +456,7 @@ function runQuickBar() {
    *     above the group and missed exactly this case). Such a layer is recognised because it
    *     was not a top-level layer when the toolkit first ran on this map. A script that adds a
    *     layer BEFORE the toolkit starts, or nests one inside a web-map group, must give it an
-   *     id starting __OPT_ -- the convention a future overlay (e.g. listings) should follow.
+   *     id starting __OPT_ -- the convention any future overlay script should follow.
    *
    * The durable list is cqbStockOps() without these. On a clean load nothing is removed, so
    * the list, its signature, and therefore every baseline and link an older build made on a
