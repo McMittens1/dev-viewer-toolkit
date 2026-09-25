@@ -1036,13 +1036,18 @@ function cqbGetJson(url, timeoutMs, postBody) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: postBody
     })
-      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        /* An HTTP error is a failure even when its body happens to parse (1.16.0, H3). */
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
       .then(function (j) {
         if (done) return;
         done = true; clearTimeout(t);
-        /* ArcGIS reports failures as {"error":{...}} inside an HTTP 200, so the
-         * response status is not a reliable success test. */
-        if (j && j.error) reject(new Error(j.error.message || ('code ' + j.error.code)));
+        /* ArcGIS also reports failures as {"error":{...}} inside an HTTP 200, so the
+         * response status alone is not a reliable success test either. */
+        if (!j || typeof j !== 'object') reject(new Error('the reply was empty'));
+        else if (j.error) reject(new Error(j.error.message || ('code ' + j.error.code)));
         else resolve(j);
       })
       .catch(function (e) { if (!done) { done = true; clearTimeout(t); reject(e); } });
@@ -3008,14 +3013,81 @@ function cqbSiteToolsDialog() {
   var CQB_SVC = 'https://gis.lincoln.ne.gov/public/rest/services';
   var cqbLayerUrl = {};      /* layer title -> ".../MapServer/<n>", resolved from the live map */
   var cqbGeomCache = {};     /* pid -> parcel geometry (one fetch per parcel, not per field) */
-  var cqbValueCache = {};    /* pid + "|" + label -> repaired string */
+  var cqbValueCache = {};    /* pid + "|" + label -> repaired string (successful answers only) */
   var cqbInFlight = {};
+  var cqbFailedAt = {};      /* pid + "|" + label -> time of the last FAILED attempt */
 
-  function cqbQuery(url, params) {
-    return fetch(url + '/query', {
+  /* ---- strict service reads (1.16.0, repair H3) ----
+   * A query answer is one of three things, and they must never be confused:
+   *   - a result with features       -> the value
+   *   - a result with NO features    -> a real absence: "None mapped" is TRUE
+   *   - a failure: an HTTP error, an ArcGIS {error} inside an HTTP 200, a body that is not
+   *     JSON, JSON without a features list, or no answer within CQB_HTTP_TIMEOUT_MS
+   * Until 1.16.0 both the popup repair and Find Parcel read (r.features || []), which turns
+   * every failure into the second case: a controlled {error} reply produced "Floodplain: None
+   * mapped" on the card, and the popup repair wrote it into the popup and cached it for the
+   * rest of the page. That was a failure-path defect; it is not evidence that the county
+   * services failed during any real review. Both paths now read through these two functions,
+   * and a failure rejects with e.cqbKind set, so callers can show "could not be checked". */
+  var CQB_HTTP_TIMEOUT_MS = 30000;
+  function cqbFetchError(kind, msg) { var e = new Error(msg); e.cqbKind = kind; return e; }
+  function cqbStrictJson(url, init, timeoutMs) {
+    var ms = timeoutMs || CQB_HTTP_TIMEOUT_MS;
+    var ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    var opts = Object.assign({}, init || {});
+    if (ctl) opts.signal = ctl.signal;
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      var timer = setTimeout(function () {
+        if (done) return;
+        done = true;
+        if (ctl) { try { ctl.abort(); } catch (e) {} }
+        reject(cqbFetchError('timeout', 'no answer within ' + Math.round(ms / 1000) + ' s'));
+      }, ms);
+      fetch(url, opts).then(function (r) {
+        if (!r.ok) throw cqbFetchError('http', 'HTTP ' + r.status);
+        return r.text();
+      }).then(function (txt) {
+        var j;
+        try { j = JSON.parse(txt); } catch (e) { throw cqbFetchError('malformed', 'the reply was not valid JSON'); }
+        if (!j || typeof j !== 'object') throw cqbFetchError('malformed', 'the reply was empty');
+        if (j.error) {
+          throw cqbFetchError('arcgis', 'service error' + (j.error.code ? ' ' + j.error.code : '') +
+            (j.error.message ? ': ' + j.error.message : ''));
+        }
+        return j;
+      }).then(function (j) {
+        if (done) return;
+        done = true; clearTimeout(timer); resolve(j);
+      }, function (e) {
+        if (done) return;
+        done = true; clearTimeout(timer);
+        reject(e && e.cqbKind ? e : cqbFetchError('network', (e && e.message) || String(e)));
+      });
+    });
+  }
+  /* A layer query: resolves only with a JSON object that carries a features array. */
+  function cqbStrictQuery(url, params, timeoutMs) {
+    return cqbStrictJson(url, {
       method: 'POST',
       body: new URLSearchParams(Object.assign({ f: 'json' }, params))
-    }).then(function (r) { return r.json(); });
+    }, timeoutMs).then(function (j) {
+      if (!Array.isArray(j.features)) throw cqbFetchError('malformed', 'the reply had no features list');
+      return j;
+    });
+  }
+  /* A short reason for the screen. */
+  function cqbWhyFailed(e) {
+    var k = e && e.cqbKind;
+    if (k === 'timeout') return 'no answer from the county server';
+    if (k === 'http') return 'the county server returned ' + e.message;
+    if (k === 'arcgis') return 'the map service reported an error';
+    if (k === 'malformed') return 'the county server sent an unreadable reply';
+    return 'the request could not be completed';
+  }
+
+  function cqbQuery(url, params) {
+    return cqbStrictQuery(url + '/query', params);
   }
 
   /* Resolve by the same title the Arcade passes to FeatureSetByName. Prefer a real
@@ -3329,9 +3401,9 @@ function cqbSiteToolsDialog() {
       where: "PARCELID='" + String(pid).replace(/'/g, "''") + "'",
       outSR: '3857', returnGeometry: 'true', outFields: 'PARCELID', resultRecordCount: '1'
     }).then(function (r) {
-      var g = r.features && r.features[0] && r.features[0].geometry;
+      var g = r.features[0] && r.features[0].geometry;
       if (g) cqbGeomCache[pid] = g;
-      return g;
+      return g || null;        /* no such parcel: a real answer. A failure has already rejected. */
     });
   }
 
@@ -3350,7 +3422,7 @@ function cqbSiteToolsDialog() {
           geometry: JSON.stringify(g), geometryType: 'esriGeometryPolygon', inSR: '3857',
           spatialRel: 'esriSpatialRelIntersects', returnGeometry: 'false',
           outFields: spec.fields, resultRecordCount: '50'
-        }).then(function (r) { return (r && r.features) || []; });
+        }).then(function (r) { return r.features; });
       }
       return run(geom).then(function (feats) {
         /* Exactly one distinct answer means the -10 ft buffer could not have changed it,
@@ -3364,10 +3436,17 @@ function cqbSiteToolsDialog() {
         });
       });
     }).then(function (val) {
+      /* Only an answer is cached -- a value, or null for "no such parcel". A failure rejects
+       * below and leaves nothing behind, so the next attempt asks the server again. */
       cqbValueCache[key] = val;
       delete cqbInFlight[key];
+      delete cqbFailedAt[key];
       return val;
-    }).catch(function () { delete cqbInFlight[key]; return null; });
+    }, function (e) {
+      delete cqbInFlight[key];
+      cqbFailedAt[key] = Date.now();
+      throw e;
+    });
 
     cqbInFlight[key] = p;
     return p;
@@ -3430,18 +3509,55 @@ function cqbSiteToolsDialog() {
       if (!el) return;
       var label = cqbLabelFor(el);
       if (!label) return;
+      /* after a failed attempt, wait before asking again -- the observer sweeps often, and a
+       * down service must not be hammered. A click on the marked value retries at once. */
+      var at = cqbFailedAt[pid + '|' + label];
+      if (at && Date.now() - at < CQB_REPAIR_RETRY_MS) return;
       node.__cqbRepairing = true;
       cqbLookup(pid, label).then(function (val) {
         if (val === null || val === undefined) { node.__cqbRepairing = false; return; }
         if (!node.parentElement || !document.contains(node)) return;  /* panel re-rendered under us */
         node.nodeValue = node.nodeValue.replace(/#INVALID/g, val);
         var mark = node.parentElement;
+        cqbClearRepairFailure(mark);
         mark.style.borderBottom = '1px dotted #7cc4ff';
         mark.title = 'Recovered by Quick Bar: the app\'s own lookup for this field failed '
           + '(a known VertiGIS bug), so this value was read straight from the '
           + 'map service instead.';
+      }, function (err) {
+        node.__cqbRepairing = false;
+        if (!node.parentElement || !document.contains(node)) return;
+        cqbMarkRepairFailure(node.parentElement, panel, pid, label, err);
       });
     });
+  }
+  /* The value stays "#INVALID" -- the app's own failure marker, which nobody reads as an
+   * answer -- and says why, with a click to try again. It is never replaced by "None". */
+  var CQB_REPAIR_RETRY_MS = 20000;
+  function cqbMarkRepairFailure(el, panel, pid, label, err) {
+    el.style.borderBottom = '1px dashed #ffb74d';
+    el.style.cursor = 'pointer';
+    el.setAttribute('role', 'button');
+    el.setAttribute('tabindex', '0');
+    el.setAttribute('data-cqb-repair-failed', '1');
+    el.title = 'Quick Bar could not read the real value: ' + cqbWhyFailed(err) + '. This is not a '
+      + '"none" answer -- the value is unknown. Click to try again.';
+    el.onclick = function (ev) {
+      if (ev && ev.preventDefault) ev.preventDefault();
+      delete cqbFailedAt[pid + '|' + label];
+      cqbClearRepairFailure(el);
+      repairInvalidValues(panel);
+    };
+  }
+  function cqbClearRepairFailure(el) {
+    if (!el || !el.getAttribute || el.getAttribute('data-cqb-repair-failed') !== '1') return;
+    el.removeAttribute('data-cqb-repair-failed');
+    el.removeAttribute('role');
+    el.removeAttribute('tabindex');
+    el.style.borderBottom = '';
+    el.style.cursor = '';
+    el.onclick = null;
+    el.title = '';
   }
 
 
@@ -3525,9 +3641,23 @@ function cqbSiteToolsDialog() {
 
   /* ---- 6. Find Parcel card + Settings popover ---- */
   var SVC = 'https://gis.lincoln.ne.gov/public/rest/services';
+  /* Every Find Parcel read goes through the strict reader (section 5c): a failure rejects,
+   * so it can never be displayed as an empty result. */
   function q(path, params) {
-    return fetch(SVC + path + '/query', { method: 'POST', body: new URLSearchParams(Object.assign({ f: 'json' }, params)) })
-      .then(function (r) { return r.json(); });
+    return cqbStrictQuery(SVC + path + '/query', params);
+  }
+  function cqbSettle(p) {
+    return p.then(function (j) { return { ok: true, j: j }; }, function (e) { return { ok: false, err: e }; });
+  }
+  function cqbRetryButton(id, label) {
+    return "<span role='button' tabindex='0' id='" + id + "' style='display:inline-block;margin-top:6px;cursor:pointer;" +
+      "color:#ffcf87;padding:2px 10px;border:1px solid #6b5222;border-radius:4px;'>" + label + '</span>';
+  }
+  function cqbWireRetry(d, id, fn) {
+    var el = d && d.querySelector('#' + id);
+    if (!el) return;
+    el.onclick = fn;
+    el.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); fn(); } });
   }
   function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/'/g, '&#39;'); }
   /* Where the parcel card starts, measured rather than assumed.
@@ -3716,7 +3846,14 @@ function cqbSiteToolsDialog() {
       });
     }).catch(function (e) {
       if (!live()) return;
-      card('<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e));
+      var msg = String((e && e.message) || e);
+      if (/not found/i.test(msg)) {                /* the improvement genuinely does not exist */
+        card('<b>Find Parcel</b><br/>' + esc(msg));
+        return;
+      }
+      var d = card('<b>Find Parcel</b><br/>The lookup for ' + esc(pid) + ' could not be completed: ' +
+        esc(cqbWhyFailed(e)) + '.<br/>' + cqbRetryButton('cqb-find-retry', 'Retry the lookup'));
+      cqbWireRetry(d, 'cqb-find-retry', function () { findIoll(pid, term, opts); });
     });
   }
 
@@ -3772,7 +3909,12 @@ function cqbSiteToolsDialog() {
       if (!pj.features || !pj.features.length) { card('<b>Find Parcel</b><br/>No parcel found for &ldquo;' + esc(term) + '&rdquo;. Try the street number + name only, or a 13-digit PID.'); return; }
       if (pj.features.length === 1) { showParcel(pj.features[0], 1, opts); return; }
       showPicker(pj.features, term);
-    }).catch(function (e) { if (!live()) return; card('<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e)); });
+    }).catch(function (e) {
+      if (!live()) return;
+      var d = card('<b>Find Parcel</b><br/>The parcel search could not be completed: ' + esc(cqbWhyFailed(e)) +
+        '. This is not a &ldquo;no match&rdquo; answer.<br/>' + cqbRetryButton('cqb-find-retry', 'Retry the search'));
+      cqbWireRetry(d, 'cqb-find-retry', function () { findParcel(term, opts); });
+    });
   }
 
   /* multiple address/PID matches: let the user pick which parcel before loading the full card */
@@ -3841,6 +3983,9 @@ function cqbSiteToolsDialog() {
     var lon = cx0 * 180 / 20037508.342787;
     var geomP = { geometry: gp, geometryType: 'esriGeometryPolygon', spatialRel: 'esriSpatialRelIntersects', where: '1=1', returnGeometry: 'false' };
     card(banner + '<b>Find Parcel</b><br/>Loading record for ' + esc(at.SITEADDRESS || at.PARCELID) + '&hellip;');
+    /* Each lookup settles on its own (1.16.0, repair H3). A failed one shows "could not be
+     * checked" in its own row and offers a retry; it never becomes an empty answer, and it no
+     * longer takes the rest of the card down with it. */
     Promise.all([
       q('/Planning/DevRevZoningandRegulations/MapServer/1', Object.assign({ outFields: 'ZONE' }, geomP)),
       q('/LTUWatershed/FEMAFlood/MapServer/1', Object.assign({ outFields: 'FLD_ZONE,FLOODWAY' }, geomP)),
@@ -3848,28 +3993,34 @@ function cqbSiteToolsDialog() {
       q('/Planning/DevRevLanduseAndGrowth/MapServer/13', Object.assign({ outFields: 'Tier' }, geomP)),
       q('/Planning/DevReviewAreas/MapServer/0', Object.assign({ outFields: 'Region,Planner,Phone' }, geomP)),
       q('/Planning/DevRevAPPLICATIONS/MapServer/1', Object.assign({ outFields: 'APPNUM,STATUS,PLANNER_ASSIGNED,HYPERLINK', resultRecordCount: '8' }, geomP)),
-      q('/Planning/HOANA2/MapServer/0', Object.assign({ outFields: 'na_name,first_name,last_name,phone,email', resultRecordCount: '10' }, geomP)).catch(function () { return { features: [] }; }),
-      q('/Planning/HOANA2/MapServer/1', Object.assign({ outFields: 'ASSOCNAME,SHORTNAME,first_name,last_name,phone,email', resultRecordCount: '10' }, geomP)).catch(function () { return { features: [] }; })
-    ]).then(function (rs) {
+      q('/Planning/HOANA2/MapServer/0', Object.assign({ outFields: 'na_name,first_name,last_name,phone,email', resultRecordCount: '10' }, geomP)),
+      q('/Planning/HOANA2/MapServer/1', Object.assign({ outFields: 'ASSOCNAME,SHORTNAME,first_name,last_name,phone,email', resultRecordCount: '10' }, geomP))
+    ].map(cqbSettle)).then(function (settled) {
       if (!live()) return;
+      var failedWhy = null;
+      var rs = settled.map(function (x) {
+        if (x.ok) return x.j;
+        if (!failedWhy) failedWhy = cqbWhyFailed(x.err);
+        return null;
+      });
+      var UNKNOWN = "<span style='color:#ffcf87;font-weight:normal;'>could not be checked &mdash; " + esc(failedWhy || '') + '</span>';
       function vals(j, fld) {
         var s = [];
         (j.features || []).forEach(function (ff) { var vv = ff.attributes[fld]; if (vv != null && String(vv).trim() !== '' && s.indexOf(vv) < 0) s.push(vv); });
         return s;
       }
-      var zoning = vals(rs[0], 'ZONE').sort().join(', ');
-      var floodRows = (rs[1].features || []).map(function (ff) { return ff.attributes; });
-      var flood = cqbFloodShort(floodRows) !== 'None mapped'
-        ? cqbFloodShort(floodRows)
-        : 'None mapped';
-      var flu = vals(rs[2], 'CAT').join(', ');
-      var tier = vals(rs[3], 'Tier').join(', ');
-      var planner = (rs[4].features || []).map(function (ff) {
+      var zoning = rs[0] ? vals(rs[0], 'ZONE').sort().join(', ') : null;
+      var floodRows = rs[1] ? rs[1].features.map(function (ff) { return ff.attributes; }) : null;
+      /* null = the flood check FAILED; 'None mapped' only ever comes from a successful empty reply */
+      var flood = floodRows ? cqbFloodShort(floodRows) : null;
+      var flu = rs[2] ? vals(rs[2], 'CAT').join(', ') : null;
+      var tier = rs[3] ? vals(rs[3], 'Tier').join(', ') : null;
+      var planner = rs[4] === null ? null : (rs[4].features || []).map(function (ff) {
         var a = ff.attributes;
         var n = a.Region === 'Village' ? 'Village of ' + a.Planner : a.Planner;
         return a.Phone ? n + ' \u00b7 ' + a.Phone : n;
       }).filter(function (xv, i, arr) { return arr.indexOf(xv) === i; }).join(', ');
-      var apps = (rs[5].features || []).map(function (ff) {
+      var apps = rs[5] === null ? null : (rs[5].features || []).map(function (ff) {
         var a = ff.attributes;
         var lab = esc(a.APPNUM) + (a.STATUS ? ' \u00b7 ' + esc(a.STATUS) : '') + (a.PLANNER_ASSIGNED ? ' \u00b7 ' + esc(a.PLANNER_ASSIGNED) : '');
         return a.HYPERLINK ? "<a href='" + esc(a.HYPERLINK) + "' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;'>" + lab + '</a>' : lab;
@@ -3877,7 +4028,8 @@ function cqbSiteToolsDialog() {
       /* HOA/NA: field names confirmed live 2026-08-27 against Planning/HOANA2/0 ("Neighborhood
          Association Contacts": na_name) and /1 ("Homeowner Association Contacts": ASSOCNAME/SHORTNAME);
          both share first_name/last_name/phone/email for the contact person. */
-      var hoaFeats = (rs[6].features || []).concat(rs[7].features || []);
+      var hoaFailed = rs[6] === null || rs[7] === null;
+      var hoaFeats = ((rs[6] && rs[6].features) || []).concat((rs[7] && rs[7].features) || []);
       /* HOANA2 stores one feature per board contact, all sharing the same association name/boundary
          (live-confirmed: Country Meadows HOA returned 3 features -- Jeff Woita, Christine Kiewra, Steve
          Lovell -- for one parcel). Group by association name so multi-contact HOAs render as one line
@@ -3910,12 +4062,18 @@ function cqbSiteToolsDialog() {
         "<div style='font-size:13px;font-weight:bold;color:#fff;'>" + esc(at.SITEADDRESS || 'Parcel ' + at.PARCELID) + '</div>' +
         "<div style='color:#8fa3ba;margin:1px 0 6px 0;'>PID " + esc(at.PARCELID) + ' \u00b7 ' + esc(at.OWNERNME1 || '') + '</div>' +
         "<table style='width:100%;border-collapse:collapse;'>" +
-        row('Zoning', esc(zoning)) + row('Floodplain', esc(flood) + "<span id='cqb-flood-pct' style='color:#8fa3ba;'></span>") + row('Future use', esc(flu)) + row('Growth tier', esc(tier)) +
+        row('Zoning', zoning === null ? UNKNOWN : esc(zoning)) +
+        row('Floodplain', flood === null ? UNKNOWN : esc(flood) + "<span id='cqb-flood-pct' style='color:#8fa3ba;'></span>") +
+        row('Future use', flu === null ? UNKNOWN : esc(flu)) + row('Growth tier', tier === null ? UNKNOWN : esc(tier)) +
         row('Area', ac + ' ac') + row('Class', esc(at.CLASSDSCRP)) + row('Built', built) + row('Floor area', flr) + row('Assessed', money) +
-        row('Area planner', esc(planner)) +
+        row('Area planner', planner === null ? UNKNOWN : esc(planner)) +
         '</table>' +
-        (apps.length ? "<div style='color:#6f8bb0;font-size:10px;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;margin:7px 0 3px 0;'>APPLICATIONS</div><div style='line-height:1.7;'>" + apps.join('<br/>') + '</div>' : '') +
-        (hoa.length ? "<div style='color:#6f8bb0;font-size:10px;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;margin:7px 0 3px 0;'>HOA / NEIGHBORHOOD ASSOC.</div><div style='line-height:1.6;font-size:11px;'>" + hoa.join('<br/>') + '</div>' : '') +
+        (apps === null ? "<div style='color:#6f8bb0;font-size:10px;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;margin:7px 0 3px 0;'>APPLICATIONS</div><div>" + UNKNOWN + '</div>' :
+         apps.length ? "<div style='color:#6f8bb0;font-size:10px;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;margin:7px 0 3px 0;'>APPLICATIONS</div><div style='line-height:1.7;'>" + apps.join('<br/>') + '</div>' : '') +
+        (hoaFailed ? "<div style='color:#6f8bb0;font-size:10px;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;margin:7px 0 3px 0;'>HOA / NEIGHBORHOOD ASSOC.</div><div style='font-size:11px;'>" + UNKNOWN + '</div>' :
+         hoa.length ? "<div style='color:#6f8bb0;font-size:10px;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;margin:7px 0 3px 0;'>HOA / NEIGHBORHOOD ASSOC.</div><div style='line-height:1.6;font-size:11px;'>" + hoa.join('<br/>') + '</div>' : '') +
+        (failedWhy ? "<div style='margin-top:6px;color:#ffcf87;font-size:11px;'>Some checks could not be completed. " +
+          'A row marked &ldquo;could not be checked&rdquo; is unknown, not empty.<br/>' + cqbRetryButton('cqb-card-retry', 'Retry the failed checks') + '</div>' : '') +
         "<div style='margin-top:8px;border-top:1px solid #2c3a4d;padding-top:7px;'>" +
         "<a style='" + B + "' target='_blank' rel='noopener noreferrer' href='https://orion.lancaster.ne.gov/appraisal/publicaccess/PropertyDetail.aspx?PropertyNumber=" + esc(at.PARCELID) + "'>Assessor</a>" +
         "<a style='" + B + "' target='_blank' rel='noopener noreferrer' href='https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent((at.SITEADDRESS || '') + ', Lancaster County, NE') + "'>Google Maps</a>" +
@@ -3923,9 +4081,14 @@ function cqbSiteToolsDialog() {
         '</div>' +
         "<div style='color:#6f8bb0;font-size:10px;margin-top:6px;'>Parcel is highlighted on the map - click it for the full Development Information popup." + (matchCount > 1 ? ' (' + matchCount + ' parcels matched this search.)' : '') + '</div>'
       );
+      if (failedWhy) {
+        cqbWireRetry(document.getElementById('cqb-card'), 'cqb-card-retry', function () {
+          showParcel(f, matchCount, Object.assign({}, opts || {}, { noZoom: true }));
+        });
+      }
       /* the share of the parcel in the floodplain arrives after the card, so the card is never
        * held up waiting on the geometry service */
-      if (flood !== 'None mapped') {
+      if (flood !== null && flood !== 'None mapped') {
         cqbFloodPercent(g, at.GIS_AREA).then(function (txt) {
           if (!live()) return;                 /* the row now on screen belongs to a newer card */
           var el = document.getElementById('cqb-flood-pct');
