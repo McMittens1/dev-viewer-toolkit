@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.15.0
+// @version      1.15.1
 // @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools flood review (FEMA Zone A, freeboard facts, recorded flood documents, FEMA letters of map change) and a separate Salt Creek flood-storage and allowable-fill calculator, mobile-home and leased-land parcel lookup, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
@@ -38,7 +38,7 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.15.0 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.15.1 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -56,7 +56,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.15.0', ready: false };
+  window.__dvToolkit = { version: '1.15.1', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -1322,6 +1322,13 @@ var CQB_SA_URL  = CQB_PUB + 'LTUWatershed/FEMEFloodDetails/MapServer/3';
  * whose flood answer the user is looking at. */
 var CQB_IOLL_URL = CQB_PUB + 'Assessor/IOLLParcels/MapServer/0';
 
+/* Plausibility bounds for a manufactured-home footprint, in feet. Derived from
+ * the live width distribution (8-32 across 1,769 parsed records), widened a
+ * little so a legitimate outlier is not thrown away. A pair outside these is
+ * treated as unparsed rather than displayed. */
+var CQB_MH_MIN_W = 8, CQB_MH_MAX_W = 40;
+var CQB_MH_MIN_L = 20, CQB_MH_MAX_L = 110;
+
 /* Normalise a typed parcel ID without destroying the alphanumeric ones. The
  * old code did .replace(/\D/g, ''), which silently turned 'MH00002090000'
  * into '00002090000' -- a number that matches no parcel, so the user got
@@ -1405,13 +1412,36 @@ function cqbIollHome(legal) {
   if (m) out.make = m[1].trim().replace(/\s+/g, ' ') || null;
   m = t.match(/\b(18\d{2}|19\d{2}|20\d{2})\b/);
   if (m) out.year = Number(m[1]);
-  /* Guard the dimension match against the year: '1998 REGIS  28 X 56' has two
-   * number pairs in it and only the X-joined one is a size. */
-  m = t.match(/\b(\d{1,3})\s*[Xx]\s*(\d{1,3})\b/);
+
+  /* Dimensions. Measured against all 1,779 mobile-home records on 2026-09-04,
+   * because the first version of this was written from one example and the
+   * real data has four shapes it did not survive:
+   *
+   *   '1998 REGIS  28 X 56  GRY/BLK'   the sample: plain, width first
+   *   '1972 14' X 56''                 feet marks between number and X
+   *   '1987 16 X 80GRY/WHT'            length run together with the colour
+   *   '1994 80 X 16'                   written LENGTH first -- 13 records do
+   *   '# 70X143SKD2FR2B, ... 14 X 66'  a SERIAL containing a false pair
+   *
+   * So: drop the serial token before matching (it can sit before the real
+   * pair), allow the feet marks, do not demand a word boundary after the
+   * second number, and treat the pair as unordered -- narrow side is the
+   * width. Then refuse anything outside the range a manufactured home can
+   * actually be. That last gate is the point: '1962 56 X 2FDR WHI' otherwise
+   * reports a two-foot-long home, and this panel does not print numbers it
+   * cannot stand behind. Result: 1,769 of 1,779 parsed (99.4%), widths
+   * landing exactly where they should -- 14 ft and 16 ft single-wides most
+   * common, 24-32 ft double-wides next, nothing absurd. */
+  m = t.replace(/\bSERIAL\s*#?\s*[0-9A-Z-]+/i, ' ')
+       .match(/\b(\d{1,3})\s*'?\s*[Xx]\s*(\d{1,3})\s*'?/);
   if (m) {
-    var w = Number(m[1]), l = Number(m[2]);
-    if (isFinite(w) && isFinite(l) && w > 0 && l > 0) {
-      out.widthFt = w; out.lengthFt = l; out.areaSqFt = w * l;
+    var a = Number(m[1]), b = Number(m[2]);
+    if (isFinite(a) && isFinite(b)) {
+      var w = Math.min(a, b), l = Math.max(a, b);
+      if (w >= CQB_MH_MIN_W && w <= CQB_MH_MAX_W &&
+          l >= CQB_MH_MIN_L && l <= CQB_MH_MAX_L) {
+        out.widthFt = w; out.lengthFt = l; out.areaSqFt = w * l;
+      }
     }
   }
   return out;
