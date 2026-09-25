@@ -351,14 +351,19 @@ function runQuickBar() {
    * view: centre and scale are not saved. Since 1.16.0 layers that are not part of the map's
    * durable state (see cqbNonDurableLayers in 4b) are left out when saving and ignored when
    * applying -- including entries an older build saved for them -- so a snapshot never
-   * switches the viewer's identify highlights or another script's overlay. Entries for every
-   * other layer are stored and applied exactly as before. */
+   * switches the viewer's identify highlights or another script's overlay. Paths count only
+   * those durable layers, so a transient layer sitting between real ones never shifts a real
+   * layer's path: VertiGIS parks a script-added layer just below its own group, which would
+   * otherwise renumber that group, and a layer inserted lower down would renumber real layers
+   * (found live during this repair). On a clean map every path is exactly what 1.15.x saved,
+   * so older snapshots apply unchanged. */
   function snapshot() {
     var s = [], skip = cqbNonDurableLayers();
     (function walk(ls, path) {
-      ls.forEach(function (l, i) {
-        var p = path + '/' + i;
+      var n = 0;
+      ls.forEach(function (l) {
         if (skip.indexOf(l) >= 0) return;
+        var p = path + '/' + (n++);
         s.push([p, !!l.visible]);
         if (l.layers) walk(l.layers, p);
       });
@@ -369,9 +374,10 @@ function runQuickBar() {
     var byPath = {}, skip = cqbNonDurableLayers();
     s.forEach(function (e) { byPath[e[0]] = e[1]; });
     (function walk(ls, path) {
-      ls.forEach(function (l, i) {
-        var p = path + '/' + i;
+      var n = 0;
+      ls.forEach(function (l) {
         if (skip.indexOf(l) >= 0) return;
+        var p = path + '/' + (n++);
         if (p in byPath && l.visible !== byPath[p]) l.visible = byPath[p];
         if (l.layers) walk(l.layers, p);
       });
@@ -443,29 +449,53 @@ function runQuickBar() {
    *     link made after any parcel click was refused by every fresh recipient, and they also
    *     broke the match with the sender's own baseline, which silently dropped layers-default
    *     from the link as well. Shared layer state was lost; centre, scale and parcel were not.
-   *   - Layers other scripts add. view.map.add() puts a layer on top, above the viewer's own
-   *     group; a script that must add one lower down marks it with an id starting __OPT_.
+   *   - Layers other scripts add. view.map.add() puts a layer on top, but VertiGIS then moves
+   *     its own group back to the top within about a second, so the added layer ends up just
+   *     BELOW __GWV_SPECIAL_LAYER, after every web-map layer (measured live 2026-09-25 during
+   *     this repair's visible-browser check; the first version of this fix only excluded layers
+   *     above the group and missed exactly this case). Such a layer is recognised because it
+   *     was not a top-level layer when the toolkit first ran on this map. A script that adds a
+   *     layer BEFORE the toolkit starts, or nests one inside a web-map group, must give it an
+   *     id starting __OPT_ -- the convention a future overlay (e.g. listings) should follow.
    *
-   * The durable list is cqbStockOps() without either kind. On a clean load nothing is removed,
-   * so the list, its signature, and therefore every baseline and link an older build made on a
-   * clean page are unchanged. Everything removed sits after __GWV_SPECIAL_LAYER, or is marked
-   * __OPT_, and a recipient's viewer counts neither when it applies layers-default at start-up,
-   * so the native indices of the remaining layers are exactly what they were. */
+   * The durable list is cqbStockOps() without these. On a clean load nothing is removed, so
+   * the list, its signature, and therefore every baseline and link an older build made on a
+   * clean page are unchanged. A removed layer is one a recipient's viewer does not have when it
+   * applies layers-default at start-up, so taking it out leaves every remaining layer at the
+   * position a clean load gives it: the native indices are exactly what they were. */
   var CQB_VIEWER_GROUP_ID = '__GWV_SPECIAL_LAYER';
   var CQB_OPTIONAL_ID_PREFIX = '__OPT_';
   function cqbTransientId(l) {
     var id = String((l && l.id) || '');
     return id.indexOf('__GCX_') === 0 || id.indexOf(CQB_OPTIONAL_ID_PREFIX) === 0;
   }
+  /* The top-level layers present when the toolkit first ran on this map, remembered per map
+   * object on window, so a re-run of the bar (the watchdog, or a fresh copy injected over an
+   * old one) keeps the first list instead of adopting layers added since. */
+  function cqbLayerKey(l) { return String((l && (l.uid || l.id)) || ''); }
+  var cqbStartLayers = null;
+  try {
+    var cqbStartByMap = window.__cqbStartLayersByMap || (window.__cqbStartLayersByMap = new WeakMap());
+    cqbStartLayers = cqbStartByMap.get(v.map) || null;
+    if (!cqbStartLayers) {
+      cqbStartLayers = [];
+      v.map.layers.forEach(function (l) { cqbStartLayers.push(cqbLayerKey(l)); });
+      cqbStartByMap.set(v.map, cqbStartLayers);
+    }
+  } catch (e) { cqbStartLayers = null; }            /* no WeakMap: fall back to the id rules */
+  function cqbLateLayer(l) {
+    return !!cqbStartLayers && cqbStartLayers.indexOf(cqbLayerKey(l)) < 0;
+  }
   /* Every layer object that must stay out of shared and saved state: anything nested in the
-   * viewer's group (but not the group itself, which a clean load has), anything added above
-   * it, and anything carrying a transient id, together with everything nested inside those. */
+   * viewer's group (but not the group itself, which a clean load has), any top-level layer
+   * added after the toolkit started or sitting above that group, and anything carrying a
+   * transient id, together with everything nested inside those. */
   function cqbNonDurableLayers() {
     var out = [];
     function all(l) { out.push(l); if (l.layers) l.layers.forEach(all); }
     var above = false;
     v.map.layers.forEach(function (l) {
-      if (above || cqbTransientId(l)) { all(l); return; }
+      if (above || cqbTransientId(l) || cqbLateLayer(l)) { all(l); return; }
       if (String(l.id || '') === CQB_VIEWER_GROUP_ID) {
         if (l.layers) l.layers.forEach(all);
         above = true;
