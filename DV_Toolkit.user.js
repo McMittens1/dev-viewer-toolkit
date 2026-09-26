@@ -1095,12 +1095,33 @@ function cqbQs(o) {
   }).join('&');
 }
 
+/* How long a read waits for an answer before it counts as failed. */
+var CQB_GET_TIMEOUT_MS = 30000;
+
+/* A failure that says what kind of failure it is (1.16.0 correction R-01), in the same
+ * words the Quick Bar's strict reader uses: 'timeout', 'http', 'arcgis', 'malformed' or
+ * 'network'. A caller that has to tell a failed lookup from a real "none" reads e.cqbKind;
+ * it must never search the message for words such as "not found", because a service's own
+ * error text can contain them. */
+function cqbKindError(kind, msg) {
+  var e = new Error(msg);
+  e.cqbKind = kind;
+  return e;
+}
+
+/* Every failure rejects, tagged with its kind; only a JSON object without an ArcGIS error
+ * resolves. The messages are the ones this reader has always used. */
 function cqbGetJson(url, timeoutMs, postBody) {
   return new Promise(function (resolve, reject) {
     var done = false;
+    function fail(e) {
+      if (done) return;
+      done = true; clearTimeout(t);
+      reject(e && e.cqbKind ? e : cqbKindError('network', String((e && e.message) || e)));
+    }
     var t = setTimeout(function () {
-      if (!done) { done = true; reject(new Error('timeout')); }
-    }, timeoutMs || 30000);
+      fail(cqbKindError('timeout', 'timeout'));
+    }, timeoutMs || CQB_GET_TIMEOUT_MS);
     fetch(url, postBody == null ? undefined : {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -1108,20 +1129,42 @@ function cqbGetJson(url, timeoutMs, postBody) {
     })
       .then(function (r) {
         /* An HTTP error is a failure even when its body happens to parse (1.16.0, H3). */
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
+        if (!r.ok) throw cqbKindError('http', 'HTTP ' + r.status);
+        return Promise.resolve().then(function () { return r.json(); }).then(null, function () {
+          throw cqbKindError('malformed', 'the reply was not valid JSON');
+        });
       })
       .then(function (j) {
         if (done) return;
-        done = true; clearTimeout(t);
         /* ArcGIS also reports failures as {"error":{...}} inside an HTTP 200, so the
          * response status alone is not a reliable success test either. */
-        if (!j || typeof j !== 'object') reject(new Error('the reply was empty'));
-        else if (j.error) reject(new Error(j.error.message || ('code ' + j.error.code)));
-        else resolve(j);
+        if (!j || typeof j !== 'object') fail(cqbKindError('malformed', 'the reply was empty'));
+        else if (j.error) fail(cqbKindError('arcgis', j.error.message || ('code ' + j.error.code)));
+        else { done = true; clearTimeout(t); resolve(j); }
       })
-      .catch(function (e) { if (!done) { done = true; clearTimeout(t); reject(e); } });
+      .catch(fail);
   });
+}
+
+/* A short reason for the screen, in the Quick Bar's words (cqbWhyFailed in app.js). */
+function cqbFailReason(e) {
+  var k = e && e.cqbKind;
+  if (k === 'timeout') return 'no answer from the county server';
+  if (k === 'http') return 'the county server returned ' + e.message;
+  if (k === 'arcgis') return 'the map service reported an error';
+  if (k === 'malformed') return 'the county server sent an unreadable reply';
+  return 'the request could not be completed';
+}
+
+/* The error a lookup rejects with when it FAILED, as opposed to finding nothing. It keeps
+ * the failure's kind, so a caller can offer a retry, and its message says plainly that this
+ * is not a "not found" answer -- the Site tools dialog shows messages as they are. */
+function cqbLookupFailure(what, e) {
+  var err = cqbKindError((e && e.cqbKind) || 'network',
+    what + ' could not be completed: ' + cqbFailReason(e) +
+    '. This is not a "not found" answer; try again.');
+  err.cqbReason = cqbFailReason(e);
+  return err;
 }
 
 /* Query one layer for whatever intersects the site envelope, in State Plane feet. */
@@ -1480,23 +1523,66 @@ function cqbPidKind(pid) {
   return null;
 }
 
+/* A map coordinate, or null. Blank shapes are refused before Number() can turn them into 0
+ * (cqbBlank), so a point with null coordinates is "no mapped location", not a point at 0,0. */
+function cqbCoord(raw) {
+  if (typeof raw !== 'number' && typeof raw !== 'string') return null;
+  if (cqbBlank(raw)) return null;
+  var n = Number(raw);
+  return isFinite(n) ? n : null;
+}
+
 /* Look an IOLL record up by PID and hand back both the record and the tax
- * parcel its point falls inside. Either half can come back missing: an IOLL
- * point that lands outside every mapped parcel is possible, and then there is
- * no polygon to review, which the caller must say rather than guess. */
+ * parcel its point falls inside. Every outcome is explicit (1.16.0 correction R-01):
+ *
+ *   resolves { ioll, land, landStatus: 'found' }           the land parcel under the point
+ *            { ioll, land: null, landStatus: 'outside' }   the containing-parcel query
+ *                                  succeeded and no mapped tax parcel contains the point
+ *   rejects  e.cqbKind 'absent'      the improvement query succeeded and holds no such PID
+ *            e.cqbKind 'nolocation'  the record exists but carries no usable map point
+ *            any failure kind        either query failed or its reply was unusable -- an
+ *                                    HTTP error, an ArcGIS {error}, a body that is not
+ *                                    JSON, no features list, a land parcel without a
+ *                                    boundary, or no answer in time -- with that kind
+ *                                    ('timeout', 'http', 'arcgis', 'malformed', 'network')
+ *
+ * A "none" is only ever concluded from a successful reply that carries a features list.
+ * Before this correction, (j.features || []) turned a reply with no features list into
+ * "not found", and any failure of the containing-parcel query came back as land: null,
+ * which both callers present as "outside every mapped tax parcel" -- with no retry. */
 function cqbIollResolve(pid, deps) {
   deps = deps || {};
   var getJson = deps.getJson || cqbGetJson;
   var clean = cqbPidNorm(pid);
+  var recWhat = 'The lookup for improvement ' + clean;
+  var landWhat = 'The lookup for the land parcel under improvement ' + clean;
+  function failed(what) {
+    return function (e) { throw cqbLookupFailure(what, e); };
+  }
+  function featureList(j, what) {
+    if (!j || typeof j !== 'object' || !Array.isArray(j.features)) {
+      throw cqbLookupFailure(what, cqbKindError('malformed', 'the reply had no features list'));
+    }
+    return j.features;
+  }
   return getJson(CQB_IOLL_URL + '/query?' + cqbQs({
     where: "PID='" + clean.replace(/'/g, "''") + "'",
     outFields: 'PID,ppTYPE,SITUS,LEGAL,SUB_NAME,PRIME_USE,PROP_CLASS,ACRES,OWNER',
     returnGeometry: 'true', outSR: CQB_SP_FT, f: 'json'
-  })).then(function (j) {
-    var f = (j.features || [])[0];
-    if (!f || !f.geometry || !isFinite(Number(f.geometry.x)) ||
-        !isFinite(Number(f.geometry.y))) {
-      throw new Error('Improvement ' + clean + ' not found, or it has no mapped location.');
+  })).then(null, failed(recWhat)).then(function (j) {
+    var list = featureList(j, recWhat);
+    if (!list.length) {
+      throw cqbKindError('absent', 'Improvement ' + clean + ' was not found in the county\'s ' +
+        'records of improvements on leased land.');
+    }
+    var f = list[0];
+    if (!f || typeof f !== 'object') {
+      throw cqbLookupFailure(recWhat, cqbKindError('malformed', 'the reply held an unusable record'));
+    }
+    var x = cqbCoord(f.geometry && f.geometry.x), y = cqbCoord(f.geometry && f.geometry.y);
+    if (x === null || y === null) {
+      throw cqbKindError('nolocation', 'Improvement ' + clean + ' is on record but has no mapped ' +
+        'location, so there is no point to show or to review.');
     }
     var a = f.attributes || {};
     var rec = {
@@ -1507,20 +1593,21 @@ function cqbIollResolve(pid, deps) {
       legal: cqbBlank(a.LEGAL) ? null : String(a.LEGAL),
       park: cqbBlank(a.SUB_NAME) ? null : String(a.SUB_NAME),
       use: cqbBlank(a.PRIME_USE) ? null : String(a.PRIME_USE),
-      x: Number(f.geometry.x), y: Number(f.geometry.y)
+      x: x, y: y
     };
     rec.home = cqbIollHome(rec.legal);
     return getJson(CQB_SITE_SOURCES[0].url + '/query?' + cqbQs({
       geometry: rec.x + ',' + rec.y, geometryType: 'esriGeometryPoint',
       inSR: CQB_SP_FT, outSR: CQB_SP_FT, spatialRel: 'esriSpatialRelIntersects',
       outFields: 'PARCELID,SITEADDRESS,GIS_AREA', returnGeometry: 'true', f: 'json'
-    })).then(function (pj) {
-      var pf = (pj.features || [])[0];
-      var land = (pf && pf.geometry && pf.geometry.rings && pf.geometry.rings.length)
-        ? pf : null;
-      return { ioll: rec, land: land };
-    }, function () {
-      return { ioll: rec, land: null };
+    })).then(null, failed(landWhat)).then(function (pj) {
+      var lands = featureList(pj, landWhat);
+      if (!lands.length) return { ioll: rec, land: null, landStatus: 'outside' };
+      var pf = lands[0];
+      if (!pf || !pf.geometry || !Array.isArray(pf.geometry.rings) || !pf.geometry.rings.length) {
+        throw cqbLookupFailure(landWhat, cqbKindError('malformed', 'the land parcel came back without a boundary'));
+      }
+      return { ioll: rec, land: pf, landStatus: 'found' };
     });
   });
 }
@@ -2162,16 +2249,23 @@ function cqbFloodReview(pid, opts, deps) {
 
 /* Resolve whatever the user typed to the polygon the review actually runs on.
  * A tax parcel ID resolves to itself. An IOLL ID resolves to its point's
- * containing tax parcel, and the improvement rides along. */
+ * containing tax parcel, and the improvement rides along. A failed IOLL lookup
+ * rejects with the resolver's own "could not be completed" error (correction
+ * R-01), never with the "outside every mapped tax parcel" answer below, which
+ * only a successful containing-parcel query that found nothing can produce. */
 function cqbReviewSubject(pid, deps) {
   deps = deps || {};
   var getJson = deps.getJson || cqbGetJson;
   var clean = cqbPidNorm(pid);
   if (cqbPidKind(clean) === 'ioll') {
     return cqbIollResolve(clean, deps).then(function (r) {
-      if (!r.land) {
-        throw new Error('Improvement ' + clean + ' is mapped at a point that falls ' +
+      if (r.landStatus === 'outside') {
+        throw cqbKindError('outside', 'Improvement ' + clean + ' is mapped at a point that falls ' +
           'outside every mapped tax parcel, so there is no boundary to review.');
+      }
+      if (!r.land) {
+        throw cqbLookupFailure('The lookup for the land parcel under improvement ' + clean,
+          cqbKindError('malformed', 'no land parcel came back'));
       }
       return { parcel: r.land, ioll: r.ioll };
     });
@@ -3942,17 +4036,24 @@ function cqbSiteToolsDialog() {
    * 1.15.0 inserted the banner into the card that existed when the land parcel arrived --
    * showParcel's "Loading..." card -- and showParcel's final render replaced that card, so the
    * banner never survived (reproduced live 2026-09-25 on MH00002090000). The banner is now
-   * HTML that showParcel puts at the top of EVERY render it makes: loading, final, and error. */
+   * HTML that showParcel puts at the top of EVERY render it makes: loading, final, and error.
+   *
+   * What comes back is judged by its status, never by its wording (correction R-01). Only the
+   * resolver's successful answers say something is absent: e.cqbKind 'absent' (no such
+   * improvement), 'nolocation' (no mapped point) and landStatus 'outside' (no parcel under the
+   * point). Every other rejection is a failed lookup and gets the retry card, even when the
+   * service's own error text happens to say "not found". */
   function findIoll(pid, term, opts) {
     var live = cqbFindTicket();
     card('<b>Find Parcel</b><br/>Looking up improvement ' + esc(pid) + ' &hellip;');
     cqbIollResolve(pid, {}).then(function (r) {
       if (!live()) return;
-      if (!r.land) {
+      if (r.landStatus === 'outside') {
         card('<b>Find Parcel</b><br/>' + esc(pid) + ' is mapped at a point that falls ' +
           'outside every mapped tax parcel, so there is no boundary to show.');
         return;
       }
+      if (!r.land) throw cqbFetchError('malformed', 'no land parcel came back');
       return q('/Assessor/TaxParcels/MapServer/0', {
         where: "PARCELID = '" + String(r.land.attributes.PARCELID).replace(/'/g, "''") + "'",
         outSR: '3857', returnGeometry: 'true', resultRecordCount: '1',
@@ -3971,13 +4072,14 @@ function cqbSiteToolsDialog() {
       });
     }).catch(function (e) {
       if (!live()) return;
-      var msg = String((e && e.message) || e);
-      if (/not found/i.test(msg)) {                /* the improvement genuinely does not exist */
-        card('<b>Find Parcel</b><br/>' + esc(msg));
+      var kind = e && e.cqbKind;
+      if (kind === 'absent' || kind === 'nolocation') {   /* a successful reply said so */
+        card('<b>Find Parcel</b><br/>' + esc(e.message));
         return;
       }
       var d = card('<b>Find Parcel</b><br/>The lookup for ' + esc(pid) + ' could not be completed: ' +
-        esc(cqbWhyFailed(e)) + '.<br/>' + cqbRetryButton('cqb-find-retry', 'Retry the lookup'));
+        esc((e && e.cqbReason) || cqbWhyFailed(e)) + '. This is not a &ldquo;not found&rdquo; answer.<br/>' +
+        cqbRetryButton('cqb-find-retry', 'Retry the lookup'));
       cqbWireRetry(d, 'cqb-find-retry', function () { findIoll(pid, term, opts); });
     });
   }
