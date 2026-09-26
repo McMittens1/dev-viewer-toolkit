@@ -279,6 +279,32 @@ function runQuickBar() {
   CQB_LOOKUP_LAYERS.forEach(function (spec) { CQB_TOOLKIT_TITLES[spec.title] = 1; });
   var CQB_BASE_KEY = '__claude_qb_baseline';
   var CQB_MAP_EXT = 'default';
+  /* Everything the durable-layer rules of section 4b read is set HERE, before the capture below
+   * (1.16.0 correction C-01). Those rules are function declarations, which JavaScript hoists,
+   * so the capture can call them this early -- but the values they read are ordinary var
+   * assignments, which are not hoisted. Until this correction they were assigned down in 4b,
+   * so the capture ran with the viewer-group id, the __OPT_ prefix and the start-up layer list
+   * all still undefined: an __OPT_ layer present at start-up, or on a re-run of the bar a layer
+   * added since, was counted into the stored baseline (and on a re-run replaced a good one).
+   * Links built later, with the rules in force, no longer matched that baseline, so the native
+   * layers- parameter was silently dropped from them. What the rules mean: section 4b. */
+  var CQB_VIEWER_GROUP_ID = '__GWV_SPECIAL_LAYER';
+  var CQB_OPTIONAL_ID_PREFIX = '__OPT_';
+  /* The top-level layers present when the toolkit first ran on this map, remembered per map
+   * object on window, so a re-run of the bar (the watchdog, or a fresh copy injected over an
+   * old one) keeps the first list instead of adopting layers added since. It is taken before
+   * this run adds its hidden lookup layers (step 2c); those are kept out of every shared or
+   * saved layer list by title in any case (cqbStockOps), whether or not they are in it. */
+  var cqbStartLayers = null;
+  try {
+    var cqbStartByMap = window.__cqbStartLayersByMap || (window.__cqbStartLayersByMap = new WeakMap());
+    cqbStartLayers = cqbStartByMap.get(v.map) || null;
+    if (!cqbStartLayers) {
+      cqbStartLayers = [];
+      v.map.layers.forEach(function (l) { cqbStartLayers.push(cqbLayerKey(l)); });
+      cqbStartByMap.set(v.map, cqbStartLayers);
+    }
+  } catch (e) { cqbStartLayers = null; }            /* no WeakMap: fall back to the id rules */
   try { cqbCaptureBaseline(false); } catch (e) { /* a link feature must never block the bar */ }
 
   /* ---- 1. re-apply improved popup from localStorage ---- */
@@ -463,26 +489,16 @@ function runQuickBar() {
    * clean page are unchanged. A removed layer is one a recipient's viewer does not have when it
    * applies layers-default at start-up, so taking it out leaves every remaining layer at the
    * position a clean load gives it: the native indices are exactly what they were. */
-  var CQB_VIEWER_GROUP_ID = '__GWV_SPECIAL_LAYER';
-  var CQB_OPTIONAL_ID_PREFIX = '__OPT_';
+  /* CQB_VIEWER_GROUP_ID, CQB_OPTIONAL_ID_PREFIX and the start-up layer list cqbStartLayers are
+   * assigned in section 0, before the start-up baseline capture that already applies these
+   * rules (correction C-01). Nothing below may be moved into an assignment that section 0's
+   * capture depends on without moving it there too; test_links.js runs the real start-up
+   * order to catch exactly that. */
   function cqbTransientId(l) {
     var id = String((l && l.id) || '');
     return id.indexOf('__GCX_') === 0 || id.indexOf(CQB_OPTIONAL_ID_PREFIX) === 0;
   }
-  /* The top-level layers present when the toolkit first ran on this map, remembered per map
-   * object on window, so a re-run of the bar (the watchdog, or a fresh copy injected over an
-   * old one) keeps the first list instead of adopting layers added since. */
   function cqbLayerKey(l) { return String((l && (l.uid || l.id)) || ''); }
-  var cqbStartLayers = null;
-  try {
-    var cqbStartByMap = window.__cqbStartLayersByMap || (window.__cqbStartLayersByMap = new WeakMap());
-    cqbStartLayers = cqbStartByMap.get(v.map) || null;
-    if (!cqbStartLayers) {
-      cqbStartLayers = [];
-      v.map.layers.forEach(function (l) { cqbStartLayers.push(cqbLayerKey(l)); });
-      cqbStartByMap.set(v.map, cqbStartLayers);
-    }
-  } catch (e) { cqbStartLayers = null; }            /* no WeakMap: fall back to the id rules */
   function cqbLateLayer(l) {
     return !!cqbStartLayers && cqbStartLayers.indexOf(cqbLayerKey(l)) < 0;
   }
