@@ -1135,7 +1135,8 @@ function cqbKindError(kind, msg) {
 }
 
 /* Every failure rejects, tagged with its kind; only a JSON object without an ArcGIS error
- * resolves. The messages are the ones this reader has always used. */
+ * resolves. The messages are the ones this reader has always used, except that a body that
+ * is not JSON now says so instead of passing on the parser's own error text. */
 function cqbGetJson(url, timeoutMs, postBody) {
   return new Promise(function (resolve, reject) {
     var done = false;
@@ -4279,7 +4280,7 @@ function cqbSiteToolsDialog() {
     /* A record can come back with no polygon (rings: [] is real on this layer). Until
      * correction R-02 this threw after the new operation had started, which left the
      * "Searching..." card on screen for good. Nothing is zoomed or selected for it. */
-    if (!ring || !ring.length) {
+    if (!Array.isArray(ring) || !ring.length) {
       op.card(banner + '<b>Find Parcel</b><br/>' + esc(at.SITEADDRESS || ('Parcel ' + (at.PARCELID || ''))) +
         ' is on record but has no mapped boundary, so there is nothing to show on the map.');
       return;
