@@ -1584,10 +1584,35 @@ function cqbIollPoint(g) {
   return none(g.x) && none(g.y) ? null : false;
 }
 
+/* The containing tax parcel as a usable record, or null (1.16.0 correction round 3, CR-01).
+ * Usable means a feature object -- not a list -- whose attributes object carries a PARCELID
+ * that is a tax-parcel id by the toolkit's own rule (cqbPidNorm, then cqbPidKind 'parcel':
+ * 8-16 digits), so an improvement id such as 'MH...' does not count. The id's TYPE is checked
+ * before it is normalised: only text or a whole positive number can be an id, so a list, an
+ * object or a boolean can never be turned into one by String(). The record handed on is a copy
+ * whose PARCELID is that normalised id, so Find Parcel's follow-up query and the Site tools
+ * review use -- and show -- exactly the id that was checked. Address, area and the other
+ * fields stay optional. The boundary is checked separately, as before. */
+function cqbLandRecord(pf) {
+  if (!pf || typeof pf !== 'object' || Array.isArray(pf)) return null;
+  var a = pf.attributes;
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return null;
+  var raw = a.PARCELID;
+  if (typeof raw === 'number') {
+    if (!Number.isSafeInteger(raw) || raw <= 0) return null;
+  } else if (typeof raw !== 'string') {
+    return null;
+  }
+  var id = cqbPidNorm(raw);
+  if (cqbPidKind(id) !== 'parcel') return null;
+  return Object.assign({}, pf, { attributes: Object.assign({}, a, { PARCELID: id }) });
+}
+
 /* Look an IOLL record up by PID and hand back both the record and the tax
  * parcel its point falls inside. Every outcome is explicit (1.16.0 correction R-01):
  *
- *   resolves { ioll, land, landStatus: 'found' }           the land parcel under the point
+ *   resolves { ioll, land, landStatus: 'found' }           the land parcel under the point, its
+ *                                  PARCELID a checked, normalised tax-parcel id (cqbLandRecord)
  *            { ioll, land: null, landStatus: 'outside' }   the containing-parcel query
  *                                  succeeded and no mapped tax parcel contains the point
  *   rejects  e.cqbKind 'absent'      the improvement query succeeded and holds no such PID
@@ -1596,8 +1621,8 @@ function cqbIollPoint(g) {
  *                                    HTTP error, an ArcGIS {error}, a body that is not
  *                                    JSON, no features list, an entry that is not a usable
  *                                    record for this PID or whose geometry is not a readable
- *                                    point, a land parcel without a boundary, or no answer in
- *                                    time -- with that kind
+ *                                    point, a land parcel without a boundary or without a
+ *                                    usable tax-parcel id, or no answer in time -- with that kind
  *                                    ('timeout', 'http', 'arcgis', 'malformed', 'network')
  *
  * A "none" is only ever concluded from a successful reply that carries a features list, and
@@ -1606,7 +1631,9 @@ function cqbIollPoint(g) {
  * "not found", and any failure of the containing-parcel query came back as land: null,
  * which both callers present as "outside every mapped tax parcel" -- with no retry. Until
  * round 2, any object as the first entry -- {}, [] or {"error": ...} -- was read as a record
- * with no point: "on record but has no mapped location", again with no retry. */
+ * with no point: "on record but has no mapped location", again with no retry. Until round 3,
+ * a land parcel was accepted on its boundary alone, so one with no usable PARCELID reached
+ * Find Parcel as PARCELID = 'undefined' and Site tools as a finished review of "PID undefined". */
 function cqbIollResolve(pid, deps) {
   deps = deps || {};
   var getJson = deps.getJson || cqbGetJson;
@@ -1667,7 +1694,11 @@ function cqbIollResolve(pid, deps) {
       if (!pf || !pf.geometry || !Array.isArray(pf.geometry.rings) || !pf.geometry.rings.length) {
         throw cqbLookupFailure(landWhat, cqbKindError('malformed', 'the land parcel came back without a boundary'));
       }
-      return { ioll: rec, land: pf, landStatus: 'found' };
+      var land = cqbLandRecord(pf);
+      if (!land) {
+        throw cqbLookupFailure(landWhat, cqbKindError('malformed', 'the land parcel came back without a usable parcel id'));
+      }
+      return { ioll: rec, land: land, landStatus: 'found' };
     });
   });
 }
