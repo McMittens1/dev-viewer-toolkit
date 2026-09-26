@@ -230,7 +230,8 @@ function applyPopup() {
  *     county's own public geometry service.
  * Accessibility: chips are keyboard buttons (Tab/Enter/Space), aria-pressed states.
  * Config: localStorage __claude_quick_layers = JSON [{"k":"flood","t":"Layer Title","l":"Chip"}, ...]
- * Snap slots: localStorage __claude_qb_preset1/2 = JSON {"name":"...", "snap":[[path,bool],...]} (legacy raw array still read)
+ * Snap slots: localStorage __claude_qb_preset1/2 = JSON {"v":2,"name":"...","sig":"<hash>.<count>","bits":"0101..."}
+ *   (since 1.16.0; older unversioned [[path,bool],...] records are kept as stored but refused -- section 4)
  * Bar visibility: localStorage __claude_qb_hidden = "1" when last hidden by the user
  * Search group: localStorage __claude_qb_nosearch = "1" to switch the parcel results in the
  *   native search box back off (Settings has a toggle for it).
@@ -372,43 +373,56 @@ function runQuickBar() {
     }
   }
 
-  /* ---- 4. snap slots: full-tree visibility snapshots ----
-   * A snapshot records which layers are on, by position in the layer tree. It is not a map
-   * view: centre and scale are not saved. Since 1.16.0 layers that are not part of the map's
-   * durable state (see cqbNonDurableLayers in 4b) are left out when saving and ignored when
-   * applying -- including entries an older build saved for them -- so a snapshot never
-   * switches the viewer's identify highlights or another script's overlay. Paths count only
-   * those durable layers, so a transient layer sitting between real ones never shifts a real
-   * layer's path: VertiGIS parks a script-added layer just below its own group, which would
-   * otherwise renumber that group, and a layer inserted lower down would renumber real layers
-   * (found live during this repair). On a clean map every path is exactly what 1.15.x saved,
-   * so older snapshots apply unchanged. */
+  /* ---- 4. snap slots: layer visibility snapshots ----
+   * A snapshot records which layers are on. It is not a map view: centre and scale are not
+   * saved.
+   *
+   * Format (1.16.0 correction R-03). A snapshot declares what it is:
+   *     {"v":2, "sig":"<hash>.<count>", "bits":"0101..."}        plus "name" in a saved slot
+   * It describes the same durable layer list, with the same signature, that shared links and
+   * the start-up baseline use (section 4b): the layers of a clean load of this web map, in
+   * native index order, without the toolkit's own lookup layers, the viewer's identify
+   * graphics, layers other scripts added after start-up, or __OPT_ layers. So transient layers
+   * are never saved or switched, and none of them can shift another layer's place. Before a
+   * single layer changes, the version, the signature and the whole bit string are checked; a
+   * snapshot made for a different layer list is refused as a whole.
+   *
+   * Older snapshots are refused, not guessed at. Every earlier build stored an unversioned list
+   * of [path, visible] pairs. 1.15.x numbered the paths across ALL layers; the 1.16.0 review
+   * candidate numbered only durable layers. Neither recorded which layer a path meant, so an
+   * old record cannot be tied to layers with confidence: whenever an optional layer sat in
+   * front of real ones the two numberings name different layers, and the review found a
+   * 1.15.0 snapshot restored by the candidate switching the wrong ones. Matching counts or tree
+   * shape would not settle which numbering, or which historical layer order, produced a
+   * record. An old record is therefore left exactly as stored, nothing changes, and the chip
+   * says to save it again; a later Shift+click save replaces it normally. Declutter's own
+   * in-memory snapshot uses the same format and the same checks. */
+  var CQB_SNAP_VERSION = 2;
   function snapshot() {
-    var s = [], skip = cqbNonDurableLayers();
-    (function walk(ls, path) {
-      var n = 0;
-      ls.forEach(function (l) {
-        if (skip.indexOf(l) >= 0) return;
-        var p = path + '/' + (n++);
-        s.push([p, !!l.visible]);
-        if (l.layers) walk(l.layers, p);
-      });
-    })(v.map.layers, '');
-    return s;
+    var ops = cqbDurableOps();
+    return { v: CQB_SNAP_VERSION, sig: cqbOpsSig(ops), bits: cqbBitsOf(ops) };
   }
+  /* '' when snapshot s can be applied to the durable list ops as it stands, otherwise why not:
+   * 'legacy' (no version: every build before this one), 'version' (another format version),
+   * 'unreadable' (not a snapshot at all), or 'changed' (made for a different layer list). */
+  function cqbSnapProblem(s, ops) {
+    if (Array.isArray(s)) return 'legacy';
+    if (!s || typeof s !== 'object') return 'unreadable';
+    if (s.v === undefined) return Array.isArray(s.snap) ? 'legacy' : 'unreadable';
+    if (s.v !== CQB_SNAP_VERSION) return 'version';
+    if (typeof s.sig !== 'string' || typeof s.bits !== 'string' || !/^[01]*$/.test(s.bits)) return 'unreadable';
+    if (s.sig !== cqbOpsSig(ops) || s.bits.length !== ops.length) return 'changed';
+    return '';
+  }
+  /* Applies snapshot s in full, or changes nothing at all. Returns '' when it was applied,
+   * otherwise the reason it was refused (see cqbSnapProblem). */
   function applySnap(s) {
-    var byPath = {}, skip = cqbNonDurableLayers();
-    s.forEach(function (e) { byPath[e[0]] = e[1]; });
-    (function walk(ls, path) {
-      var n = 0;
-      ls.forEach(function (l) {
-        if (skip.indexOf(l) >= 0) return;
-        var p = path + '/' + (n++);
-        if (p in byPath && l.visible !== byPath[p]) l.visible = byPath[p];
-        if (l.layers) walk(l.layers, p);
-      });
-    })(v.map.layers, '');
+    var ops = cqbDurableOps();
+    var why = cqbSnapProblem(s, ops);
+    if (why) return why;
+    cqbSetVisibility(ops, s.bits);
     refresh();
+    return '';
   }
 
 
@@ -538,6 +552,23 @@ function runQuickBar() {
     return h + '.' + ops.length;
   }
   function cqbBitsOf(ops) { return ops.map(function (l) { return l.visible ? '1' : '0'; }).join(''); }
+  /* Sets each layer of ops to its bit in bits ('1' on), and touches no other layer. The caller
+   * has already checked that bits was made for exactly this list (a link's qbl, or a snapshot:
+   * section 4). Parents before children, or a child set visible under a still-hidden group
+   * stays hidden. */
+  function cqbSetVisibility(ops, bits) {
+    var order = [];
+    (function walk(col, depth) {
+      col.forEach(function (l) { order.push({ l: l, d: depth }); if (l.layers) walk(l.layers, depth + 1); });
+    })(v.map.layers, 0);
+    order.sort(function (a, b) { return a.d - b.d; });
+    order.forEach(function (e) {
+      var i = ops.indexOf(e.l);
+      if (i < 0) return;
+      var want = bits.charAt(i) === '1';
+      if (e.l.visible !== want) { try { e.l.visible = want; } catch (err) {} }
+    });
+  }
   function cqbBitsToHex(bits) {
     var out = '';
     for (var i = 0; i < bits.length; i += 4) out += parseInt((bits.substr(i, 4) + '0000').substr(0, 4), 2).toString(16);
@@ -660,18 +691,7 @@ function runQuickBar() {
       var split = qbl.split('~');
       var incoming = split.length === 2 ? cqbHexToBits(split[1], ops.length) : null;
       if (split[0] === sig && incoming) {
-        /* parents before children, or a child set visible under a still-hidden group stays hidden */
-        var order = [];
-        (function walk(col, depth) {
-          col.forEach(function (l) { order.push({ l: l, d: depth }); if (l.layers) walk(l.layers, depth + 1); });
-        })(v.map.layers, 0);
-        order.sort(function (a, b) { return a.d - b.d; });
-        order.forEach(function (e) {
-          var i = ops.indexOf(e.l);
-          if (i < 0) return;
-          var want = incoming.charAt(i) === '1';
-          if (e.l.visible !== want) { try { e.l.visible = want; } catch (err) {} }
-        });
+        cqbSetVisibility(ops, incoming);
         try { refresh(); } catch (e) {}
       } else {
         toast('Shared link: layer state skipped - this map is not the one the link was made from');
@@ -3010,25 +3030,35 @@ function cqbSiteToolsDialog() {
   renderChips();
   function refresh() { chips.forEach(function (x) { paint(x.c, x.lyr.visible); }); }
 
-  /* snap slots (named) */
+  /* snap slots (named). The stored format, and why older records are refused: section 4.
+   * Reading a slot never writes it; only an explicit Shift+click save replaces what is there. */
+  var CQB_SNAP_REFUSAL = {
+    legacy: 'was saved by an older version of the toolkit, which did not record which layers it meant',
+    version: 'was saved by a different version of the toolkit',
+    unreadable: 'cannot be read',
+    changed: 'was saved for a different set of map layers (the map has changed since)'
+  };
   [1, 2].forEach(function (n) {
     var key = '__claude_qb_preset' + n;
+    /* null when the slot is empty; otherwise its name and the stored record, as stored */
     function readPreset() {
       var rawp = localStorage.getItem(key);
       if (!rawp) return null;
-      try {
-        var parsed = JSON.parse(rawp);
-        return Array.isArray(parsed) ? { name: '', snap: parsed } : parsed; /* legacy raw-array snapshots still load */
-      } catch (e) { return null; }
+      var rec;
+      try { rec = JSON.parse(rawp); } catch (e) { rec = undefined; }
+      var nm = rec && !Array.isArray(rec) && typeof rec.name === 'string' ? rec.name : '';
+      return { name: nm, rec: rec };
     }
+    function label(nm) { return 'Snap ' + n + (nm ? ' ("' + nm + '")' : ''); }
     var c = chip('Snap ' + n, '');
     function retitle() {
       var p = readPreset();
-      c.title = p
-        ? 'Snap ' + n + (p.name ? ' ("' + p.name + '")' : '') + ': click applies; Shift+click re-saves'
-        : 'Snap ' + n + ' is empty: Shift+click to save the current layers';
+      var why = p ? cqbSnapProblem(p.rec, cqbDurableOps()) : '';
+      c.title = !p ? 'Snap ' + n + ' is empty: Shift+click to save the current layers'
+        : why ? label(p.name) + ' ' + CQB_SNAP_REFUSAL[why] + ', so it cannot be applied: Shift+click to save the current layers in its place'
+        : label(p.name) + ': click applies; Shift+click re-saves';
       c.setAttribute('aria-label', c.title);
-      c.style.color = p ? '#7cc4ff' : '#7a8ba0';
+      c.style.color = !p ? '#7a8ba0' : why ? '#ffcf87' : '#7cc4ff';
     }
     c.style.background = '#232b36';
     retitle();
@@ -3037,33 +3067,52 @@ function cqbSiteToolsDialog() {
         var existing = readPreset();
         var nm = prompt('Name this snapshot (optional, Cancel keeps the current name):', existing && existing.name || '');
         if (nm === null) nm = (existing && existing.name) || '';
-        localStorage.setItem(key, JSON.stringify({ name: nm, snap: snapshot() }));
+        var s = snapshot();
+        localStorage.setItem(key, JSON.stringify({ v: s.v, name: nm, sig: s.sig, bits: s.bits }));
         retitle();
-        toast('Saved to Snap ' + n + (nm ? ' ("' + nm + '")' : ''));
+        toast('Saved to ' + label(nm));
       } else {
         var p = readPreset();
         if (!p) { toast('Snap ' + n + ' is empty - Shift+click to save the current layers'); return; }
-        applySnap(p.snap);
-        toast('Snap ' + n + (p.name ? ' ("' + p.name + '")' : '') + ' applied');
+        var why = applySnap(p.rec);
+        if (why) {
+          retitle();
+          toast(label(p.name) + ' ' + CQB_SNAP_REFUSAL[why] + ', so it was not applied. Nothing changed. ' +
+            'Set up the layers you want, then Shift+click Snap ' + n + ' to save them again.', 7000);
+          return;
+        }
+        toast(label(p.name) + ' applied');
       }
     };
     bar.appendChild(c);
   });
 
-  /* Declutter / Restore */
-  var dc = chip('Declutter', 'Turn everything off except parcels and development; click again to restore');
+  /* Declutter / Restore. The layers to restore are kept on window, so they survive a re-run of
+   * the bar on the same page, and they are checked exactly like a saved slot before anything
+   * changes: what an older toolkit run on this page kept is refused, not guessed at. */
+  var dc = chip(window.__qbDeclutterSnap ? 'Restore' : 'Declutter', 'Turn everything off except parcels and development; click again to restore');
   dc.style.background = '#232b36'; dc.style.color = '#ffcf87';
   dc.onclick = function () {
     if (window.__qbDeclutterSnap) {
-      applySnap(window.__qbDeclutterSnap);
+      var why = applySnap(window.__qbDeclutterSnap);
       window.__qbDeclutterSnap = null;
       dc.textContent = 'Declutter';
-      toast('Layers restored');
+      if (why) {
+        toast('Restore skipped: the layers kept before Declutter ' + (why === 'changed'
+          ? 'were for a different set of map layers' : 'were kept by a different toolkit version on this page') +
+          ', so they cannot be applied. Nothing changed.', 7000);
+      } else {
+        toast('Layers restored');
+      }
     } else {
       window.__qbDeclutterSnap = snapshot();
       var keep = { 'Development': 1, 'Parcel Information': 1, 'City and Village Limits': 1, 'GWV Special Layer': 1 };
+      /* Layers outside the saved state -- another script's overlay, an __OPT_ layer -- are left
+       * alone: the snapshot does not hold them, so Restore could not turn them back on. */
+      var transient = cqbNonDurableLayers();
       v.map.layers.forEach(function (l) {
         if (l.opacity === 0) return;
+        if (transient.indexOf(l) >= 0) return;
         l.visible = !!keep[l.title];
       });
       refresh();
@@ -4376,13 +4425,14 @@ function cqbSiteToolsDialog() {
   }
   window.__qbFindParcel = findParcel;
 
-  function toast(msg) {
+  /* ms: how long it stays up; a message someone has to act on gets longer than the default */
+  function toast(msg, ms) {
     var e = document.createElement('div');
     e.setAttribute('role', 'status');
     e.textContent = msg;
-    e.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:99999;background:#1b5e20;color:#fff;padding:8px 14px;border-radius:6px;font:13px sans-serif';
+    e.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:99999;background:#1b5e20;color:#fff;padding:8px 14px;border-radius:6px;font:13px sans-serif;max-width:min(560px,90vw);';
     document.body.appendChild(e);
-    setTimeout(function () { e.remove(); }, 2200);
+    setTimeout(function () { e.remove(); }, ms || 2200);
   }
   toast('Quick Bar ready - popup applied, locators paused');
   try { cqbApplyIncomingLink(); } catch (e) { /* a malformed shared link must never break the bar */ }
