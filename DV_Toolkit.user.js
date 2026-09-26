@@ -724,6 +724,10 @@ function runQuickBar() {
   var cqbSugCache = {};             /* upper-cased term -> array of {pid, addr, owner} */
   var cqbSugPending = null;
   var cqbSugSeq = 0;
+  /* Set by this toolbar's teardown (5a): a suggestion lookup still in flight then renders
+   * nothing into the new toolbar's dropdown (correction R-02). */
+  var cqbSugRetired = false;
+  function cqbSugRetire() { cqbSugRetired = true; cqbSugPending = null; }
 
   function cqbSearchInput() { return document.querySelector('input[aria-label="Type your search terms"]'); }
   function cqbSearchListbox() {
@@ -851,6 +855,7 @@ function runQuickBar() {
     cqbSugLookup(term).then(function (rows) {
       cqbSugCache[term] = rows;
       if (seq !== cqbSugSeq) return;                     /* a later keystroke superseded this */
+      if (cqbSugRetired) return;                         /* this toolbar was torn down (R-02) */
       var lb2 = cqbSearchListbox();
       if (lb2) cqbSugRender(lb2, term, rows);
     }).catch(function () {
@@ -862,9 +867,9 @@ function runQuickBar() {
 
   /* ---- 5. the bar ---- */
   /* A re-run of the bar (the 5 s watchdog, or a fresh copy injected over an old one) first
-   * undoes what the previous run left behind: its open card and Site tools dialog, with their
-   * Escape handlers, and its window resize listener. Only toolkit-owned handlers are touched
-   * (1.16.0, repair H5). */
+   * undoes what the previous run left behind: the Find Parcel work it still had in flight
+   * (correction R-02), its open card and Site tools dialog, with their Escape handlers, and
+   * its window resize listener. Only toolkit-owned handlers are touched (1.16.0, repair H5). */
   if (typeof window.__cqbTeardown === 'function') { try { window.__cqbTeardown(); } catch (e) {} }
   var old = document.getElementById('cqb'); if (old) old.remove();
   var oldHandle = document.getElementById('cqb-handle'); if (oldHandle) oldHandle.remove();
@@ -3133,6 +3138,10 @@ function cqbSiteToolsDialog() {
   window.addEventListener('resize', positionBar);
   window.__cqbTeardown = function () {
     window.__cqbTeardown = null;
+    /* First retire everything this toolbar still has in flight, so no reply to it can reach
+     * the next toolbar's card, map or parcel selection -- then remove its UI (correction R-02). */
+    try { cqbRetireFinds(); } catch (e) {}
+    try { cqbSugRetire(); } catch (e) {}
     window.removeEventListener('resize', positionBar);
     try { closeCard(); } catch (e) {}
     try { cqbSeCloseActive(); } catch (e) {}
@@ -3897,7 +3906,11 @@ function cqbSiteToolsDialog() {
   /* Every way a card goes away runs through its own dismiss(): the close control, Enter/Space
    * on it, Escape, a Settings action, a newer card replacing it, and toolbar teardown.
    * dismiss() removes the card AND its document-level Escape handler. Until 1.16.0 only Escape removed
-   * the handler, so every other dismissal left one behind (repair H5). */
+   * the handler, so every other dismissal left one behind (repair H5).
+   * The three ways the PERSON closes a card -- the close control, Enter/Space on it, Escape --
+   * also retire the Find Parcel work that was loading into it (correction R-02; see
+   * cqbFindOp). A card replaced by the next step of its own search does not: that replacement
+   * uses closeCard() as well, which is why closeCard() itself cannot be the signal. */
   function closeCard(d) {
     d = d || document.getElementById('cqb-card');
     if (!d) return;
@@ -3920,16 +3933,17 @@ function cqbSiteToolsDialog() {
     d.appendChild(close);
     document.body.appendChild(d);
     /* named dismiss, not close: `close` above is the element that holds the close control */
-    function esck(ev) { if (ev.key === 'Escape') dismiss(); }
+    function esck(ev) { if (ev.key === 'Escape') closedByUser(); }
     function dismiss() {
       document.removeEventListener('keydown', esck);
       d.cqbClose = null;
       if (d.parentNode) d.remove();
     }
+    function closedByUser() { cqbRetireFinds(); dismiss(); }
     d.cqbClose = dismiss;
     var cx = d.querySelector('#cqb-card-x');
-    cx.onclick = dismiss;
-    cx.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); dismiss(); } });
+    cx.onclick = closedByUser;
+    cx.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); closedByUser(); } });
     document.addEventListener('keydown', esck);
     return d;
   }
@@ -4020,13 +4034,41 @@ function cqbSiteToolsDialog() {
     };
   }
 
-  /* One Find Parcel at a time (1.16.0, repair H2). Every search and every card load takes a
-   * ticket; an asynchronous step that finishes after a newer search has started must not
-   * write into the newer search's card. Before this, a slow mobile-home lookup overtaken by an
+  /* One Find Parcel at a time (1.16.0, repair H2; correction R-02). Every search and every card
+   * load is an operation with a number. Before this, a slow mobile-home lookup overtaken by an
    * ordinary search replaced the ordinary card with the 74-acre park record, and a late
-   * floodplain percentage could land in the wrong parcel's row. */
-  var cqbFindSeq = 0;
-  function cqbFindTicket() { var mine = ++cqbFindSeq; return function () { return mine === cqbFindSeq; }; }
+   * floodplain percentage could land in the wrong parcel's row.
+   *
+   * An operation's asynchronous steps may change the card, the map or the selected parcel only
+   * while it is live:
+   *   - no newer operation has started. The counter is on window, not in this run of the bar,
+   *     so a search in a NEWER toolbar also retires the searches of the one it replaced;
+   *   - nothing retired it. Toolbar teardown retires everything outstanding before it removes
+   *     the old UI, and the person closing the card (close control, Enter/Space, Escape)
+   *     retires what was loading into it;
+   *   - the card it put up is still the card on screen. An operation's own next step (loading
+   *     card -> result, error or retry) replaces that card through op.card(), which keeps it
+   *     live; any other card replacing it -- Settings, the link fallback -- ends it.
+   * Until correction R-02 each run of the bar kept its own counter: after a toolbar restart a
+   * reply to the old toolbar could still replace the new toolbar's card, re-select its parcel
+   * and move the map, and a search closed while pending reopened its card when it finished. */
+  function cqbRetireFinds() { window.__cqbFindGen = (+window.__cqbFindGen || 0) + 1; }
+  function cqbFindOp() {
+    cqbRetireFinds();
+    var mine = window.__cqbFindGen;
+    return {
+      live: function () {
+        if (window.__cqbFindGen !== mine) return false;
+        var d = document.getElementById('cqb-card');
+        return !!d && d.cqbOp === mine;
+      },
+      card: function (html) {
+        var d = card(html);
+        d.cqbOp = mine;
+        return d;
+      }
+    };
+  }
 
   /* An improvement on leased land resolves to the tax parcel its point falls
    * inside -- for a mobile home that is the park's land parcel. The card then
@@ -4044,12 +4086,12 @@ function cqbSiteToolsDialog() {
    * point). Every other rejection is a failed lookup and gets the retry card, even when the
    * service's own error text happens to say "not found". */
   function findIoll(pid, term, opts) {
-    var live = cqbFindTicket();
-    card('<b>Find Parcel</b><br/>Looking up improvement ' + esc(pid) + ' &hellip;');
+    var op = cqbFindOp();
+    op.card('<b>Find Parcel</b><br/>Looking up improvement ' + esc(pid) + ' &hellip;');
     cqbIollResolve(pid, {}).then(function (r) {
-      if (!live()) return;
+      if (!op.live()) return;
       if (r.landStatus === 'outside') {
-        card('<b>Find Parcel</b><br/>' + esc(pid) + ' is mapped at a point that falls ' +
+        op.card('<b>Find Parcel</b><br/>' + esc(pid) + ' is mapped at a point that falls ' +
           'outside every mapped tax parcel, so there is no boundary to show.');
         return;
       }
@@ -4059,10 +4101,10 @@ function cqbSiteToolsDialog() {
         outSR: '3857', returnGeometry: 'true', resultRecordCount: '1',
         outFields: 'PARCELID,SITEADDRESS,OWNERNME1,GIS_AREA,PRPRTYDSCRP,CLASSDSCRP,RESYRBLT,RESSTRTYP,RESFLRAREA,CNTASSDVAL,CNVYNAME'
       }).then(function (pj) {
-        if (!live()) return;
+        if (!op.live()) return;
         var f = (pj.features || [])[0];
         if (!f) {
-          card('<b>Find Parcel</b><br/>Could not load the land parcel under ' + esc(pid) + '.');
+          op.card('<b>Find Parcel</b><br/>Could not load the land parcel under ' + esc(pid) + '.');
           return;
         }
         showParcel(f, 1, Object.assign({}, opts || {}, {
@@ -4071,13 +4113,13 @@ function cqbSiteToolsDialog() {
         }));
       });
     }).catch(function (e) {
-      if (!live()) return;
+      if (!op.live()) return;
       var kind = e && e.cqbKind;
       if (kind === 'absent' || kind === 'nolocation') {   /* a successful reply said so */
-        card('<b>Find Parcel</b><br/>' + esc(e.message));
+        op.card('<b>Find Parcel</b><br/>' + esc(e.message));
         return;
       }
-      var d = card('<b>Find Parcel</b><br/>The lookup for ' + esc(pid) + ' could not be completed: ' +
+      var d = op.card('<b>Find Parcel</b><br/>The lookup for ' + esc(pid) + ' could not be completed: ' +
         esc((e && e.cqbReason) || cqbWhyFailed(e)) + '. This is not a &ldquo;not found&rdquo; answer.<br/>' +
         cqbRetryButton('cqb-find-retry', 'Retry the lookup'));
       cqbWireRetry(d, 'cqb-find-retry', function () { findIoll(pid, term, opts); });
@@ -4127,18 +4169,18 @@ function cqbSiteToolsDialog() {
     var where = /^\d{10,14}$/.test(clean)
       ? "PARCELID = '" + clean + "'"
       : "UPPER(SITEADDRESS) LIKE '" + clean.split(',')[0] + "%'";
-    var live = cqbFindTicket();
-    card('<b>Find Parcel</b><br/>Searching for &ldquo;' + esc(term) + '&rdquo; &hellip;');
+    var op = cqbFindOp();
+    op.card('<b>Find Parcel</b><br/>Searching for &ldquo;' + esc(term) + '&rdquo; &hellip;');
     q('/Assessor/TaxParcels/MapServer/0', { where: where, outSR: '3857', returnGeometry: 'true',
       outFields: 'PARCELID,SITEADDRESS,OWNERNME1,GIS_AREA,PRPRTYDSCRP,CLASSDSCRP,RESYRBLT,RESSTRTYP,RESFLRAREA,CNTASSDVAL,CNVYNAME', resultRecordCount: '8' })
     .then(function (pj) {
-      if (!live()) return;
-      if (!pj.features || !pj.features.length) { card('<b>Find Parcel</b><br/>No parcel found for &ldquo;' + esc(term) + '&rdquo;. Try the street number + name only, or a 13-digit PID.'); return; }
+      if (!op.live()) return;
+      if (!pj.features || !pj.features.length) { op.card('<b>Find Parcel</b><br/>No parcel found for &ldquo;' + esc(term) + '&rdquo;. Try the street number + name only, or a 13-digit PID.'); return; }
       if (pj.features.length === 1) { showParcel(pj.features[0], 1, opts); return; }
       showPicker(pj.features, term);
     }).catch(function (e) {
-      if (!live()) return;
-      var d = card('<b>Find Parcel</b><br/>The parcel search could not be completed: ' + esc(cqbWhyFailed(e)) +
+      if (!op.live()) return;
+      var d = op.card('<b>Find Parcel</b><br/>The parcel search could not be completed: ' + esc(cqbWhyFailed(e)) +
         '. This is not a &ldquo;no match&rdquo; answer.<br/>' + cqbRetryButton('cqb-find-retry', 'Retry the search'));
       cqbWireRetry(d, 'cqb-find-retry', function () { findParcel(term, opts); });
     });
@@ -4180,12 +4222,20 @@ function cqbSiteToolsDialog() {
 
   /* full record card for one chosen parcel feature */
   function showParcel(f, matchCount, opts) {
-    var at = f.attributes;
-    var live = cqbFindTicket();
+    var at = (f && f.attributes) || {};
+    var op = cqbFindOp();
     var banner = (opts && opts.banner) || '';
+    var g = f && f.geometry;
+    var ring = g && g.rings && g.rings[0];
+    /* A record can come back with no polygon (rings: [] is real on this layer). Until
+     * correction R-02 this threw after the new operation had started, which left the
+     * "Searching..." card on screen for good. Nothing is zoomed or selected for it. */
+    if (!ring || !ring.length) {
+      op.card(banner + '<b>Find Parcel</b><br/>' + esc(at.SITEADDRESS || ('Parcel ' + (at.PARCELID || ''))) +
+        ' is on record but has no mapped boundary, so there is nothing to show on the map.');
+      return;
+    }
     window.__cqbLastPid = (opts && opts.lastPid) || at.PARCELID || window.__cqbLastPid;
-    var g = f.geometry;
-    var ring = g.rings[0];
     var xs = ring.map(function (p) { return p[0]; }), ys = ring.map(function (p) { return p[1]; });
     var ext = { xmin: Math.min.apply(0, xs), ymin: Math.min.apply(0, ys), xmax: Math.max.apply(0, xs), ymax: Math.max.apply(0, ys) };
     var cx0 = (ext.xmin + ext.xmax) / 2, cy0 = (ext.ymin + ext.ymax) / 2;
@@ -4209,7 +4259,7 @@ function cqbSiteToolsDialog() {
     var lat = (Math.atan(Math.exp(cy0 / 6378137)) * 2 - Math.PI / 2) * 180 / Math.PI;
     var lon = cx0 * 180 / 20037508.342787;
     var geomP = { geometry: gp, geometryType: 'esriGeometryPolygon', spatialRel: 'esriSpatialRelIntersects', where: '1=1', returnGeometry: 'false' };
-    card(banner + '<b>Find Parcel</b><br/>Loading record for ' + esc(at.SITEADDRESS || at.PARCELID) + '&hellip;');
+    op.card(banner + '<b>Find Parcel</b><br/>Loading record for ' + esc(at.SITEADDRESS || at.PARCELID) + '&hellip;');
     /* Each lookup settles on its own (1.16.0, repair H3). A failed one shows "could not be
      * checked" in its own row and offers a retry; it never becomes an empty answer, and it no
      * longer takes the rest of the card down with it. */
@@ -4223,7 +4273,7 @@ function cqbSiteToolsDialog() {
       q('/Planning/HOANA2/MapServer/0', Object.assign({ outFields: 'na_name,first_name,last_name,phone,email', resultRecordCount: '10' }, geomP)),
       q('/Planning/HOANA2/MapServer/1', Object.assign({ outFields: 'ASSOCNAME,SHORTNAME,first_name,last_name,phone,email', resultRecordCount: '10' }, geomP))
     ].map(cqbSettle)).then(function (settled) {
-      if (!live()) return;
+      if (!op.live()) return;
       var failedWhy = null;
       var rs = settled.map(function (x) {
         if (x.ok) return x.j;
@@ -4285,7 +4335,7 @@ function cqbSiteToolsDialog() {
       var money = at.CNTASSDVAL ? '$' + Math.round(at.CNTASSDVAL).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') : '';
       var flr = at.RESFLRAREA ? Math.round(at.RESFLRAREA).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' ft\u00b2' : '';
       var B = "display:inline-block;background:#24354d;color:#cfe8ff;text-decoration:none;font-size:11px;font-weight:bold;padding:4px 8px;border-radius:4px;margin:0 4px 4px 0;";
-      card(banner +
+      var done = op.card(banner +
         "<div style='font-size:13px;font-weight:bold;color:#fff;'>" + esc(at.SITEADDRESS || 'Parcel ' + at.PARCELID) + '</div>' +
         "<div style='color:#8fa3ba;margin:1px 0 6px 0;'>PID " + esc(at.PARCELID) + ' \u00b7 ' + esc(at.OWNERNME1 || '') + '</div>' +
         "<table style='width:100%;border-collapse:collapse;'>" +
@@ -4309,7 +4359,7 @@ function cqbSiteToolsDialog() {
         "<div style='color:#6f8bb0;font-size:10px;margin-top:6px;'>Parcel is highlighted on the map - click it for the full Development Information popup." + (matchCount > 1 ? ' (' + matchCount + ' parcels matched this search.)' : '') + '</div>'
       );
       if (failedWhy) {
-        cqbWireRetry(document.getElementById('cqb-card'), 'cqb-card-retry', function () {
+        cqbWireRetry(done, 'cqb-card-retry', function () {
           showParcel(f, matchCount, Object.assign({}, opts || {}, { noZoom: true }));
         });
       }
@@ -4317,12 +4367,12 @@ function cqbSiteToolsDialog() {
        * held up waiting on the geometry service */
       if (flood !== null && flood !== 'None mapped') {
         cqbFloodPercent(g, at.GIS_AREA).then(function (txt) {
-          if (!live()) return;                 /* the row now on screen belongs to a newer card */
-          var el = document.getElementById('cqb-flood-pct');
+          if (!op.live()) return;              /* closed, or the card now belongs to a newer search */
+          var el = done.querySelector('#cqb-flood-pct');
           if (el && txt) el.textContent = ' \u00b7 ' + txt;
         });
       }
-    }).catch(function (e) { if (!live()) return; card(banner + '<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e)); });
+    }).catch(function (e) { if (!op.live()) return; op.card(banner + '<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e)); });
   }
   window.__qbFindParcel = findParcel;
 
