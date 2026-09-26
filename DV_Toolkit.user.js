@@ -1558,6 +1558,32 @@ function cqbCoord(raw) {
   return isFinite(n) ? n : null;
 }
 
+/* The attributes of a usable improvement record, or null (1.16.0 correction round 2).
+ * Usable means a feature object -- not a list -- whose attributes object names the
+ * improvement that was asked for, compared in normalised form. An entry such as {}, [] or
+ * {"error": ...} establishes nothing about the record, so it must never reach the "no mapped
+ * location" answer. Only the PID is required; the optional assessor fields are not. */
+function cqbIollRecord(f, clean) {
+  if (!f || typeof f !== 'object' || Array.isArray(f)) return null;
+  var a = f.attributes;
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return null;
+  return cqbPidNorm(a.PID) === clean ? a : null;
+}
+
+/* A usable record's map point (1.16.0 correction round 2): { x, y } when it has one; null when
+ * it genuinely has none -- no geometry at all, or an empty point, whose coordinates ArcGIS
+ * writes as null or "NaN"; false when a geometry is there but is not a readable point (text,
+ * a list, half a point, blank or non-numeric coordinates), which is an unusable reply. Only
+ * null supports the qualified "no mapped location" answer. */
+function cqbIollPoint(g) {
+  function none(v) { return v === undefined || v === null || v === 'NaN'; }
+  if (g === undefined || g === null) return null;
+  if (typeof g !== 'object' || Array.isArray(g)) return false;
+  var x = cqbCoord(g.x), y = cqbCoord(g.y);
+  if (x !== null && y !== null) return { x: x, y: y };
+  return none(g.x) && none(g.y) ? null : false;
+}
+
 /* Look an IOLL record up by PID and hand back both the record and the tax
  * parcel its point falls inside. Every outcome is explicit (1.16.0 correction R-01):
  *
@@ -1565,17 +1591,22 @@ function cqbCoord(raw) {
  *            { ioll, land: null, landStatus: 'outside' }   the containing-parcel query
  *                                  succeeded and no mapped tax parcel contains the point
  *   rejects  e.cqbKind 'absent'      the improvement query succeeded and holds no such PID
- *            e.cqbKind 'nolocation'  the record exists but carries no usable map point
+ *            e.cqbKind 'nolocation'  a usable record for this PID carries no map point
  *            any failure kind        either query failed or its reply was unusable -- an
  *                                    HTTP error, an ArcGIS {error}, a body that is not
- *                                    JSON, no features list, a land parcel without a
- *                                    boundary, or no answer in time -- with that kind
+ *                                    JSON, no features list, an entry that is not a usable
+ *                                    record for this PID or whose geometry is not a readable
+ *                                    point, a land parcel without a boundary, or no answer in
+ *                                    time -- with that kind
  *                                    ('timeout', 'http', 'arcgis', 'malformed', 'network')
  *
- * A "none" is only ever concluded from a successful reply that carries a features list.
+ * A "none" is only ever concluded from a successful reply that carries a features list, and
+ * "no mapped location" only from a usable record (cqbIollRecord, cqbIollPoint).
  * Before this correction, (j.features || []) turned a reply with no features list into
  * "not found", and any failure of the containing-parcel query came back as land: null,
- * which both callers present as "outside every mapped tax parcel" -- with no retry. */
+ * which both callers present as "outside every mapped tax parcel" -- with no retry. Until
+ * round 2, any object as the first entry -- {}, [] or {"error": ...} -- was read as a record
+ * with no point: "on record but has no mapped location", again with no retry. */
 function cqbIollResolve(pid, deps) {
   deps = deps || {};
   var getJson = deps.getJson || cqbGetJson;
@@ -1601,18 +1632,21 @@ function cqbIollResolve(pid, deps) {
       throw cqbKindError('absent', 'Improvement ' + clean + ' was not found in the county\'s ' +
         'records of improvements on leased land.');
     }
-    var f = list[0];
-    if (!f || typeof f !== 'object') {
-      throw cqbLookupFailure(recWhat, cqbKindError('malformed', 'the reply held an unusable record'));
+    var a = cqbIollRecord(list[0], clean);
+    if (!a) {
+      throw cqbLookupFailure(recWhat, cqbKindError('malformed', 'the reply held no usable record for this improvement'));
     }
-    var x = cqbCoord(f.geometry && f.geometry.x), y = cqbCoord(f.geometry && f.geometry.y);
-    if (x === null || y === null) {
+    var pt = cqbIollPoint(list[0].geometry);
+    if (pt === false) {
+      throw cqbLookupFailure(recWhat, cqbKindError('malformed', 'the record\'s map point could not be read'));
+    }
+    if (!pt) {
       throw cqbKindError('nolocation', 'Improvement ' + clean + ' is on record but has no mapped ' +
         'location, so there is no point to show or to review.');
     }
-    var a = f.attributes || {};
+    var x = pt.x, y = pt.y;
     var rec = {
-      pid: cqbBlank(a.PID) ? clean : String(a.PID),
+      pid: String(a.PID),
       type: cqbBlank(a.ppTYPE) ? null : String(a.ppTYPE),
       isMobileHome: String(a.ppTYPE || '').toUpperCase() === 'MH',
       address: cqbBlank(a.SITUS) ? '' : String(a.SITUS),
