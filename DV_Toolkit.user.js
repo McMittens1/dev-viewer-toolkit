@@ -3862,7 +3862,12 @@ function cqbSiteToolsDialog() {
     });
   }
   /* The value stays "#INVALID" -- the app's own failure marker, which nobody reads as an
-   * answer -- and says why, with a click to try again. It is never replaced by "None". */
+   * answer -- and says why, with a click to try again. It is never replaced by "None".
+   * The marked value is announced as a button and takes keyboard focus, so Enter and Space
+   * retry it too, exactly as a click does: the keys every other Retry here takes
+   * (cqbWireRetry). Both handlers are properties, not added listeners, so a value that fails
+   * again while still marked gets its handlers replaced, never a second pair, and clearing
+   * the mark removes both. */
   var CQB_REPAIR_RETRY_MS = 20000;
   function cqbMarkRepairFailure(el, panel, pid, label, err) {
     el.style.borderBottom = '1px dashed #ffb74d';
@@ -3872,12 +3877,14 @@ function cqbSiteToolsDialog() {
     el.setAttribute('data-cqb-repair-failed', '1');
     el.title = 'Quick Bar could not read the real value: ' + cqbWhyFailed(err) + '. This is not a '
       + '"none" answer -- the value is unknown. Click to try again.';
-    el.onclick = function (ev) {
+    function retry(ev) {
       if (ev && ev.preventDefault) ev.preventDefault();
       delete cqbFailedAt[pid + '|' + label];
       cqbClearRepairFailure(el);
       repairInvalidValues(panel);
-    };
+    }
+    el.onclick = retry;
+    el.onkeydown = function (ev) { if (ev && (ev.key === 'Enter' || ev.key === ' ')) retry(ev); };
   }
   function cqbClearRepairFailure(el) {
     if (!el || !el.getAttribute || el.getAttribute('data-cqb-repair-failed') !== '1') return;
@@ -3887,6 +3894,7 @@ function cqbSiteToolsDialog() {
     el.style.borderBottom = '';
     el.style.cursor = '';
     el.onclick = null;
+    el.onkeydown = null;
     el.title = '';
   }
 
