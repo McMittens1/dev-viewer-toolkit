@@ -3795,12 +3795,17 @@ function cqbSiteToolsDialog() {
       }
     }
     /* Some values are not table rows at all but inline "Label: <strong>value</strong>"
-     * (Fire, Area planner, Case planner). Key off the text immediately before the <strong>. */
+     * (Fire, Area planner, Case planner). Key off the text immediately before the <strong>:
+     * the text between it and the nearest element in front of it, and nothing further back.
+     * That element is a line break or the previous field's own value, and reading across it
+     * takes another field's text into this label (1.16.0, browser review BR-01). The native
+     * Services line "School: <strong>55-0001 Lincoln</strong><br>Fire: <strong>#INVALID</strong>"
+     * read as "School: 55-0001 LincolnFire:", the label came out as "LincolnFire", and the Fire
+     * repair never ran, so a failed Fire value stayed a bare #INVALID with no Retry. */
     if (el && el.tagName === 'STRONG') {
       var prev = el.previousSibling, txt = '';
-      while (prev && txt.length < 40) {
+      while (prev && prev.nodeType !== 1 && txt.length < 40) {
         if (prev.nodeType === 3) txt = prev.nodeValue + txt;
-        else if (prev.nodeType === 1) txt = (prev.textContent || '') + txt;
         prev = prev.previousSibling;
       }
       var m2 = txt.replace(/\s+/g, ' ').match(/([A-Za-z][A-Za-z .]{1,18}):\s*$/);
