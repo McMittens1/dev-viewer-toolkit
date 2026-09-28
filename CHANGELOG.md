@@ -1,8 +1,8 @@
 # Changelog
 
-## 1.16.0 — reliability repairs (release candidate, under review)
+## 1.16.0 — reliability repairs
 
-**Status: not released yet.** Everything below is checked by automated tests, many of them against deliberately broken replies. Checks in a real browser with only this version installed are still to come, so read these descriptions as provisional until then.
+**Standard build independently verified on September 28, 2026.** The review recorded 374 passing public checks, with no failures, and verified the repaired behavior in Chrome, including the final Fire-field failure and Retry check. The running userscript matched the reviewed artifact before testing, after normal startup and after cleanup.
 
 Five defects found in an independent review, each now covered by a regression test. A second review found four gaps in those fixes, follow-up checks found two more in the mobile-home lookup, and a check in a real browser found one in the popup repair. All of them are corrected and marked *Corrected after review* below. None of this changes a result on good data.
 
