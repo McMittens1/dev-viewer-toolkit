@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.15.0
+// @version      1.16.0
 // @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools flood review (FEMA Zone A, freeboard facts, recorded flood documents, FEMA letters of map change) and a separate Salt Creek flood-storage and allowable-fill calculator, mobile-home and leased-land parcel lookup, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
@@ -38,7 +38,7 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.15.0 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.16.0 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -56,7 +56,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.15.0', ready: false };
+  window.__dvToolkit = { version: '1.16.0', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -230,7 +230,8 @@ function applyPopup() {
  *     county's own public geometry service.
  * Accessibility: chips are keyboard buttons (Tab/Enter/Space), aria-pressed states.
  * Config: localStorage __claude_quick_layers = JSON [{"k":"flood","t":"Layer Title","l":"Chip"}, ...]
- * Snap slots: localStorage __claude_qb_preset1/2 = JSON {"name":"...", "snap":[[path,bool],...]} (legacy raw array still read)
+ * Snap slots: localStorage __claude_qb_preset1/2 = JSON {"v":2,"name":"...","sig":"<hash>.<count>","bits":"0101..."}
+ *   (since 1.16.0; older unversioned [[path,bool],...] records are kept as stored but refused -- section 4)
  * Bar visibility: localStorage __claude_qb_hidden = "1" when last hidden by the user
  * Search group: localStorage __claude_qb_nosearch = "1" to switch the parcel results in the
  *   native search box back off (Settings has a toggle for it).
@@ -279,6 +280,32 @@ function runQuickBar() {
   CQB_LOOKUP_LAYERS.forEach(function (spec) { CQB_TOOLKIT_TITLES[spec.title] = 1; });
   var CQB_BASE_KEY = '__claude_qb_baseline';
   var CQB_MAP_EXT = 'default';
+  /* Everything the durable-layer rules of section 4b read is set HERE, before the capture below
+   * (1.16.0 correction C-01). Those rules are function declarations, which JavaScript hoists,
+   * so the capture can call them this early -- but the values they read are ordinary var
+   * assignments, which are not hoisted. Until this correction they were assigned down in 4b,
+   * so the capture ran with the viewer-group id, the __OPT_ prefix and the start-up layer list
+   * all still undefined: an __OPT_ layer present at start-up, or on a re-run of the bar a layer
+   * added since, was counted into the stored baseline (and on a re-run replaced a good one).
+   * Links built later, with the rules in force, no longer matched that baseline, so the native
+   * layers- parameter was silently dropped from them. What the rules mean: section 4b. */
+  var CQB_VIEWER_GROUP_ID = '__GWV_SPECIAL_LAYER';
+  var CQB_OPTIONAL_ID_PREFIX = '__OPT_';
+  /* The top-level layers present when the toolkit first ran on this map, remembered per map
+   * object on window, so a re-run of the bar (the watchdog, or a fresh copy injected over an
+   * old one) keeps the first list instead of adopting layers added since. It is taken before
+   * this run adds its hidden lookup layers (step 2c); those are kept out of every shared or
+   * saved layer list by title in any case (cqbStockOps), whether or not they are in it. */
+  var cqbStartLayers = null;
+  try {
+    var cqbStartByMap = window.__cqbStartLayersByMap || (window.__cqbStartLayersByMap = new WeakMap());
+    cqbStartLayers = cqbStartByMap.get(v.map) || null;
+    if (!cqbStartLayers) {
+      cqbStartLayers = [];
+      v.map.layers.forEach(function (l) { cqbStartLayers.push(cqbLayerKey(l)); });
+      cqbStartByMap.set(v.map, cqbStartLayers);
+    }
+  } catch (e) { cqbStartLayers = null; }            /* no WeakMap: fall back to the id rules */
   try { cqbCaptureBaseline(false); } catch (e) { /* a link feature must never block the bar */ }
 
   /* ---- 1. re-apply improved popup from localStorage ---- */
@@ -346,29 +373,56 @@ function runQuickBar() {
     }
   }
 
-  /* ---- 4. snap slots: full-tree visibility snapshots ---- */
+  /* ---- 4. snap slots: layer visibility snapshots ----
+   * A snapshot records which layers are on. It is not a map view: centre and scale are not
+   * saved.
+   *
+   * Format (1.16.0 correction R-03). A snapshot declares what it is:
+   *     {"v":2, "sig":"<hash>.<count>", "bits":"0101..."}        plus "name" in a saved slot
+   * It describes the same durable layer list, with the same signature, that shared links and
+   * the start-up baseline use (section 4b): the layers of a clean load of this web map, in
+   * native index order, without the toolkit's own lookup layers, the viewer's identify
+   * graphics, layers other scripts added after start-up, or __OPT_ layers. So transient layers
+   * are never saved or switched, and none of them can shift another layer's place. Before a
+   * single layer changes, the version, the signature and the whole bit string are checked; a
+   * snapshot made for a different layer list is refused as a whole.
+   *
+   * Older snapshots are refused, not guessed at. Every earlier build stored an unversioned list
+   * of [path, visible] pairs. 1.15.x numbered the paths across ALL layers; the 1.16.0 review
+   * candidate numbered only durable layers. Neither recorded which layer a path meant, so an
+   * old record cannot be tied to layers with confidence: whenever an optional layer sat in
+   * front of real ones the two numberings name different layers, and the review found a
+   * 1.15.0 snapshot restored by the candidate switching the wrong ones. Matching counts or tree
+   * shape would not settle which numbering, or which historical layer order, produced a
+   * record. An old record is therefore left exactly as stored, nothing changes, and the chip
+   * says to save it again; a later Shift+click save replaces it normally. Declutter's own
+   * in-memory snapshot uses the same format and the same checks. */
+  var CQB_SNAP_VERSION = 2;
   function snapshot() {
-    var s = [];
-    (function walk(ls, path) {
-      ls.forEach(function (l, i) {
-        var p = path + '/' + i;
-        s.push([p, !!l.visible]);
-        if (l.layers) walk(l.layers, p);
-      });
-    })(v.map.layers, '');
-    return s;
+    var ops = cqbDurableOps();
+    return { v: CQB_SNAP_VERSION, sig: cqbOpsSig(ops), bits: cqbBitsOf(ops) };
   }
+  /* '' when snapshot s can be applied to the durable list ops as it stands, otherwise why not:
+   * 'legacy' (no version: every build before this one), 'version' (another format version),
+   * 'unreadable' (not a snapshot at all), or 'changed' (made for a different layer list). */
+  function cqbSnapProblem(s, ops) {
+    if (Array.isArray(s)) return 'legacy';
+    if (!s || typeof s !== 'object') return 'unreadable';
+    if (s.v === undefined) return Array.isArray(s.snap) ? 'legacy' : 'unreadable';
+    if (s.v !== CQB_SNAP_VERSION) return 'version';
+    if (typeof s.sig !== 'string' || typeof s.bits !== 'string' || !/^[01]*$/.test(s.bits)) return 'unreadable';
+    if (s.sig !== cqbOpsSig(ops) || s.bits.length !== ops.length) return 'changed';
+    return '';
+  }
+  /* Applies snapshot s in full, or changes nothing at all. Returns '' when it was applied,
+   * otherwise the reason it was refused (see cqbSnapProblem). */
   function applySnap(s) {
-    var byPath = {};
-    s.forEach(function (e) { byPath[e[0]] = e[1]; });
-    (function walk(ls, path) {
-      ls.forEach(function (l, i) {
-        var p = path + '/' + i;
-        if (p in byPath && l.visible !== byPath[p]) l.visible = byPath[p];
-        if (l.layers) walk(l.layers, p);
-      });
-    })(v.map.layers, '');
+    var ops = cqbDurableOps();
+    var why = cqbSnapProblem(s, ops);
+    if (why) return why;
+    cqbSetVisibility(ops, s.bits);
     refresh();
+    return '';
   }
 
 
@@ -425,6 +479,71 @@ function runQuickBar() {
     });
     return out;
   }
+  /* ---- durable vs. transient layers (1.16.0, repair H1) ----
+   * Only layers that exist on a clean load of this web map belong in shared or saved layer
+   * state. Two kinds of layer appear later, and both used to leak into it:
+   *
+   *   - The viewer's own group, id __GWV_SPECIAL_LAYER, is the LAST operational layer on a
+   *     clean load and has no children (measured 2026-09-25). A native identify -- clicking a
+   *     parcel -- adds __GCX_* highlight graphics INSIDE it. They changed the signature, so a
+   *     link made after any parcel click was refused by every fresh recipient, and they also
+   *     broke the match with the sender's own baseline, which silently dropped layers-default
+   *     from the link as well. Shared layer state was lost; centre, scale and parcel were not.
+   *   - Layers other scripts add. view.map.add() puts a layer on top, but VertiGIS then moves
+   *     its own group back to the top within about a second, so the added layer ends up just
+   *     BELOW __GWV_SPECIAL_LAYER, after every web-map layer (measured live 2026-09-25 during
+   *     this repair's visible-browser check; the first version of this fix only excluded layers
+   *     above the group and missed exactly this case). Such a layer is recognised because it
+   *     was not a top-level layer when the toolkit first ran on this map. A script that adds a
+   *     layer BEFORE the toolkit starts, or nests one inside a web-map group, must give it an
+   *     id starting __OPT_ -- the convention any future overlay script should follow.
+   *
+   * The durable list is cqbStockOps() without these. On a clean load nothing is removed, so
+   * the list, its signature, and therefore every baseline and link an older build made on a
+   * clean page are unchanged. A removed layer is one a recipient's viewer does not have when it
+   * applies layers-default at start-up, so taking it out leaves every remaining layer at the
+   * position a clean load gives it: the native indices are exactly what they were. */
+  /* CQB_VIEWER_GROUP_ID, CQB_OPTIONAL_ID_PREFIX and the start-up layer list cqbStartLayers are
+   * assigned in section 0, before the start-up baseline capture that already applies these
+   * rules (correction C-01). Nothing below may be moved into an assignment that section 0's
+   * capture depends on without moving it there too; test_links.js runs the real start-up
+   * order to catch exactly that. */
+  function cqbTransientId(l) {
+    var id = String((l && l.id) || '');
+    return id.indexOf('__GCX_') === 0 || id.indexOf(CQB_OPTIONAL_ID_PREFIX) === 0;
+  }
+  function cqbLayerKey(l) { return String((l && (l.uid || l.id)) || ''); }
+  function cqbLateLayer(l) {
+    return !!cqbStartLayers && cqbStartLayers.indexOf(cqbLayerKey(l)) < 0;
+  }
+  /* Every layer object that must stay out of shared and saved state: anything nested in the
+   * viewer's group (but not the group itself, which a clean load has), any top-level layer
+   * added after the toolkit started or sitting above that group, and anything carrying a
+   * transient id, together with everything nested inside those. */
+  function cqbNonDurableLayers() {
+    var out = [];
+    function all(l) { out.push(l); if (l.layers) l.layers.forEach(all); }
+    var above = false;
+    v.map.layers.forEach(function (l) {
+      if (above || cqbTransientId(l) || cqbLateLayer(l)) { all(l); return; }
+      if (String(l.id || '') === CQB_VIEWER_GROUP_ID) {
+        if (l.layers) l.layers.forEach(all);
+        above = true;
+        return;
+      }
+      (function inner(col) {
+        if (!col) return;
+        col.forEach(function (c) { if (cqbTransientId(c)) all(c); else inner(c.layers); });
+      })(l.layers);
+    });
+    return out;
+  }
+  /* the layers a link or baseline describes, in native layers- index order */
+  function cqbDurableOps() {
+    var skip = cqbNonDurableLayers();
+    return cqbStockOps().filter(function (l) { return skip.indexOf(l) < 0; });
+  }
+
   /* identity of the layer list itself, so a stale baseline or a link made against a different
    * version of this map is detected instead of applied to the wrong layers */
   function cqbOpsSig(ops) {
@@ -433,6 +552,23 @@ function runQuickBar() {
     return h + '.' + ops.length;
   }
   function cqbBitsOf(ops) { return ops.map(function (l) { return l.visible ? '1' : '0'; }).join(''); }
+  /* Sets each layer of ops to its bit in bits ('1' on), and touches no other layer. The caller
+   * has already checked that bits was made for exactly this list (a link's qbl, or a snapshot:
+   * section 4). Parents before children, or a child set visible under a still-hidden group
+   * stays hidden. */
+  function cqbSetVisibility(ops, bits) {
+    var order = [];
+    (function walk(col, depth) {
+      col.forEach(function (l) { order.push({ l: l, d: depth }); if (l.layers) walk(l.layers, depth + 1); });
+    })(v.map.layers, 0);
+    order.sort(function (a, b) { return a.d - b.d; });
+    order.forEach(function (e) {
+      var i = ops.indexOf(e.l);
+      if (i < 0) return;
+      var want = bits.charAt(i) === '1';
+      if (e.l.visible !== want) { try { e.l.visible = want; } catch (err) {} }
+    });
+  }
   function cqbBitsToHex(bits) {
     var out = '';
     for (var i = 0; i < bits.length; i += 4) out += parseInt((bits.substr(i, 4) + '0000').substr(0, 4), 2).toString(16);
@@ -462,7 +598,7 @@ function runQuickBar() {
    * itself opened from a shared link (its layers are already someone else's), and never silently
    * replaces a baseline that is still valid for this map -- force=true is the Settings button. */
   function cqbCaptureBaseline(force) {
-    var ops = cqbStockOps(), sig = cqbOpsSig(ops);
+    var ops = cqbDurableOps(), sig = cqbOpsSig(ops);
     if (!force) {
       if (cqbUrlHasLayerState()) return null;
       var have = cqbReadBaseline(sig);
@@ -485,7 +621,7 @@ function runQuickBar() {
   }
 
   function cqbBuildLink() {
-    var ops = cqbStockOps(), sig = cqbOpsSig(ops), bits = cqbBitsOf(ops);
+    var ops = cqbDurableOps(), sig = cqbOpsSig(ops), bits = cqbBitsOf(ops);
     var qs = new URLSearchParams(location.search || '');
     var parts = [];
     if (qs.get('app')) parts.push('app=' + encodeURIComponent(qs.get('app')));
@@ -551,22 +687,11 @@ function runQuickBar() {
     var qbl = qs.get('qbl'), pid = qs.get('pid');
 
     if (qbl) {
-      var ops = cqbStockOps(), sig = cqbOpsSig(ops);
+      var ops = cqbDurableOps(), sig = cqbOpsSig(ops);
       var split = qbl.split('~');
       var incoming = split.length === 2 ? cqbHexToBits(split[1], ops.length) : null;
       if (split[0] === sig && incoming) {
-        /* parents before children, or a child set visible under a still-hidden group stays hidden */
-        var order = [];
-        (function walk(col, depth) {
-          col.forEach(function (l) { order.push({ l: l, d: depth }); if (l.layers) walk(l.layers, depth + 1); });
-        })(v.map.layers, 0);
-        order.sort(function (a, b) { return a.d - b.d; });
-        order.forEach(function (e) {
-          var i = ops.indexOf(e.l);
-          if (i < 0) return;
-          var want = incoming.charAt(i) === '1';
-          if (e.l.visible !== want) { try { e.l.visible = want; } catch (err) {} }
-        });
+        cqbSetVisibility(ops, incoming);
         try { refresh(); } catch (e) {}
       } else {
         toast('Shared link: layer state skipped - this map is not the one the link was made from');
@@ -619,6 +744,10 @@ function runQuickBar() {
   var cqbSugCache = {};             /* upper-cased term -> array of {pid, addr, owner} */
   var cqbSugPending = null;
   var cqbSugSeq = 0;
+  /* Set by this toolbar's teardown (5a): a suggestion lookup still in flight then renders
+   * nothing into the new toolbar's dropdown (correction R-02). */
+  var cqbSugRetired = false;
+  function cqbSugRetire() { cqbSugRetired = true; cqbSugPending = null; }
 
   function cqbSearchInput() { return document.querySelector('input[aria-label="Type your search terms"]'); }
   function cqbSearchListbox() {
@@ -746,6 +875,7 @@ function runQuickBar() {
     cqbSugLookup(term).then(function (rows) {
       cqbSugCache[term] = rows;
       if (seq !== cqbSugSeq) return;                     /* a later keystroke superseded this */
+      if (cqbSugRetired) return;                         /* this toolbar was torn down (R-02) */
       var lb2 = cqbSearchListbox();
       if (lb2) cqbSugRender(lb2, term, rows);
     }).catch(function () {
@@ -756,6 +886,11 @@ function runQuickBar() {
   }
 
   /* ---- 5. the bar ---- */
+  /* A re-run of the bar (the 5 s watchdog, or a fresh copy injected over an old one) first
+   * undoes what the previous run left behind: the Find Parcel work it still had in flight
+   * (correction R-02), its open card and Site tools dialog, with their Escape handlers, and
+   * its window resize listener. Only toolkit-owned handlers are touched (1.16.0, repair H5). */
+  if (typeof window.__cqbTeardown === 'function') { try { window.__cqbTeardown(); } catch (e) {} }
   var old = document.getElementById('cqb'); if (old) old.remove();
   var oldHandle = document.getElementById('cqb-handle'); if (oldHandle) oldHandle.remove();
   if (window.__cqbRefreshTimer) { clearInterval(window.__cqbRefreshTimer); } /* a prior click's chip-repaint loop would otherwise run forever */
@@ -955,6 +1090,25 @@ function cqbBlank(v) {
   return v === null || v === undefined || String(v).trim() === '';
 }
 
+/* A usable flood elevation (feet, NAVD88), or null. Blank shapes, text that is
+ * not a number, and non-finite values are refused BEFORE Number() can turn them
+ * into 0 -- Number(' ') is 0, which is how a single-space ELEV became a
+ * sea-level BFE line before 1.16.0 (repair H4). Only numbers and numeric
+ * strings count; a boolean or an array is not an elevation even though Number()
+ * would accept it.
+ * Domain rule: an elevation at or below zero is treated as missing too. Ground
+ * in Lancaster County sits roughly 1,100 to 1,500 ft above NAVD88 datum, so a
+ * value <= 0 can only be a placeholder (0, or a sentinel such as -9999), never
+ * a real base flood elevation. Every positive finite value is kept as given --
+ * this is a data-shape guard, not a plausibility filter. */
+function cqbElevOrNull(raw) {
+  if (cqbBlank(raw)) return null;
+  if (typeof raw !== 'number' && typeof raw !== 'string') return null;
+  var e = Number(raw);
+  if (!isFinite(e) || e <= 0) return null;
+  return e;
+}
+
 /* Storage areas are shown by number; an unnumbered one must not read "#null". */
 function cqbSaLabel(n) {
   return cqbBlank(n) ? '(unnumbered)' : '#' + n;
@@ -966,28 +1120,77 @@ function cqbQs(o) {
   }).join('&');
 }
 
+/* How long a read waits for an answer before it counts as failed. */
+var CQB_GET_TIMEOUT_MS = 30000;
+
+/* A failure that says what kind of failure it is (1.16.0 correction R-01), in the same
+ * words the Quick Bar's strict reader uses: 'timeout', 'http', 'arcgis', 'malformed' or
+ * 'network'. A caller that has to tell a failed lookup from a real "none" reads e.cqbKind;
+ * it must never search the message for words such as "not found", because a service's own
+ * error text can contain them. */
+function cqbKindError(kind, msg) {
+  var e = new Error(msg);
+  e.cqbKind = kind;
+  return e;
+}
+
+/* Every failure rejects, tagged with its kind; only a JSON object without an ArcGIS error
+ * resolves. The messages are the ones this reader has always used, except that a body that
+ * is not JSON now says so instead of passing on the parser's own error text. */
 function cqbGetJson(url, timeoutMs, postBody) {
   return new Promise(function (resolve, reject) {
     var done = false;
+    function fail(e) {
+      if (done) return;
+      done = true; clearTimeout(t);
+      reject(e && e.cqbKind ? e : cqbKindError('network', String((e && e.message) || e)));
+    }
     var t = setTimeout(function () {
-      if (!done) { done = true; reject(new Error('timeout')); }
-    }, timeoutMs || 30000);
+      fail(cqbKindError('timeout', 'timeout'));
+    }, timeoutMs || CQB_GET_TIMEOUT_MS);
     fetch(url, postBody == null ? undefined : {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: postBody
     })
-      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        /* An HTTP error is a failure even when its body happens to parse (1.16.0, H3). */
+        if (!r.ok) throw cqbKindError('http', 'HTTP ' + r.status);
+        return Promise.resolve().then(function () { return r.json(); }).then(null, function () {
+          throw cqbKindError('malformed', 'the reply was not valid JSON');
+        });
+      })
       .then(function (j) {
         if (done) return;
-        done = true; clearTimeout(t);
-        /* ArcGIS reports failures as {"error":{...}} inside an HTTP 200, so the
-         * response status is not a reliable success test. */
-        if (j && j.error) reject(new Error(j.error.message || ('code ' + j.error.code)));
-        else resolve(j);
+        /* ArcGIS also reports failures as {"error":{...}} inside an HTTP 200, so the
+         * response status alone is not a reliable success test either. */
+        if (!j || typeof j !== 'object') fail(cqbKindError('malformed', 'the reply was empty'));
+        else if (j.error) fail(cqbKindError('arcgis', j.error.message || ('code ' + j.error.code)));
+        else { done = true; clearTimeout(t); resolve(j); }
       })
-      .catch(function (e) { if (!done) { done = true; clearTimeout(t); reject(e); } });
+      .catch(fail);
   });
+}
+
+/* A short reason for the screen, in the Quick Bar's words (cqbWhyFailed in app.js). */
+function cqbFailReason(e) {
+  var k = e && e.cqbKind;
+  if (k === 'timeout') return 'no answer from the county server';
+  if (k === 'http') return 'the county server returned ' + e.message;
+  if (k === 'arcgis') return 'the map service reported an error';
+  if (k === 'malformed') return 'the county server sent an unreadable reply';
+  return 'the request could not be completed';
+}
+
+/* The error a lookup rejects with when it FAILED, as opposed to finding nothing. It keeps
+ * the failure's kind, so a caller can offer a retry, and its message says plainly that this
+ * is not a "not found" answer -- the Site tools dialog shows messages as they are. */
+function cqbLookupFailure(what, e) {
+  var err = cqbKindError((e && e.cqbKind) || 'network',
+    what + ' could not be completed: ' + cqbFailReason(e) +
+    '. This is not a "not found" answer; try again.');
+  err.cqbReason = cqbFailReason(e);
+  return err;
 }
 
 /* Query one layer for whatever intersects the site envelope, in State Plane feet. */
@@ -1322,6 +1525,13 @@ var CQB_SA_URL  = CQB_PUB + 'LTUWatershed/FEMEFloodDetails/MapServer/3';
  * whose flood answer the user is looking at. */
 var CQB_IOLL_URL = CQB_PUB + 'Assessor/IOLLParcels/MapServer/0';
 
+/* Plausibility bounds for a manufactured-home footprint, in feet. Derived from
+ * the live width distribution (8-32 across 1,769 parsed records), widened a
+ * little so a legitimate outlier is not thrown away. A pair outside these is
+ * treated as unparsed rather than displayed. */
+var CQB_MH_MIN_W = 8, CQB_MH_MAX_W = 40;
+var CQB_MH_MIN_L = 20, CQB_MH_MAX_L = 110;
+
 /* Normalise a typed parcel ID without destroying the alphanumeric ones. The
  * old code did .replace(/\D/g, ''), which silently turned 'MH00002090000'
  * into '00002090000' -- a number that matches no parcel, so the user got
@@ -1339,47 +1549,156 @@ function cqbPidKind(pid) {
   return null;
 }
 
+/* A map coordinate, or null. Blank shapes are refused before Number() can turn them into 0
+ * (cqbBlank), so a point with null coordinates is "no mapped location", not a point at 0,0. */
+function cqbCoord(raw) {
+  if (typeof raw !== 'number' && typeof raw !== 'string') return null;
+  if (cqbBlank(raw)) return null;
+  var n = Number(raw);
+  return isFinite(n) ? n : null;
+}
+
+/* The attributes of a usable improvement record, or null (1.16.0 correction round 2).
+ * Usable means a feature object -- not a list -- whose attributes object names the
+ * improvement that was asked for, compared in normalised form. An entry such as {}, [] or
+ * {"error": ...} establishes nothing about the record, so it must never reach the "no mapped
+ * location" answer. Only the PID is required; the optional assessor fields are not. */
+function cqbIollRecord(f, clean) {
+  if (!f || typeof f !== 'object' || Array.isArray(f)) return null;
+  var a = f.attributes;
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return null;
+  return cqbPidNorm(a.PID) === clean ? a : null;
+}
+
+/* A usable record's map point (1.16.0 correction round 2): { x, y } when it has one; null when
+ * it genuinely has none -- no geometry at all, or an empty point, whose coordinates ArcGIS
+ * writes as null or "NaN"; false when a geometry is there but is not a readable point (text,
+ * a list, half a point, blank or non-numeric coordinates), which is an unusable reply. Only
+ * null supports the qualified "no mapped location" answer. */
+function cqbIollPoint(g) {
+  function none(v) { return v === undefined || v === null || v === 'NaN'; }
+  if (g === undefined || g === null) return null;
+  if (typeof g !== 'object' || Array.isArray(g)) return false;
+  var x = cqbCoord(g.x), y = cqbCoord(g.y);
+  if (x !== null && y !== null) return { x: x, y: y };
+  return none(g.x) && none(g.y) ? null : false;
+}
+
+/* The containing tax parcel as a usable record, or null (1.16.0 correction round 3, CR-01).
+ * Usable means a feature object -- not a list -- whose attributes object carries a PARCELID
+ * that is a tax-parcel id by the toolkit's own rule (cqbPidNorm, then cqbPidKind 'parcel':
+ * 8-16 digits), so an improvement id such as 'MH...' does not count. The id's TYPE is checked
+ * before it is normalised: only text or a whole positive number can be an id, so a list, an
+ * object or a boolean can never be turned into one by String(). The record handed on is a copy
+ * whose PARCELID is that normalised id, so Find Parcel's follow-up query and the Site tools
+ * review use -- and show -- exactly the id that was checked. Address, area and the other
+ * fields stay optional. The boundary is checked separately, as before. */
+function cqbLandRecord(pf) {
+  if (!pf || typeof pf !== 'object' || Array.isArray(pf)) return null;
+  var a = pf.attributes;
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return null;
+  var raw = a.PARCELID;
+  if (typeof raw === 'number') {
+    if (!Number.isSafeInteger(raw) || raw <= 0) return null;
+  } else if (typeof raw !== 'string') {
+    return null;
+  }
+  var id = cqbPidNorm(raw);
+  if (cqbPidKind(id) !== 'parcel') return null;
+  return Object.assign({}, pf, { attributes: Object.assign({}, a, { PARCELID: id }) });
+}
+
 /* Look an IOLL record up by PID and hand back both the record and the tax
- * parcel its point falls inside. Either half can come back missing: an IOLL
- * point that lands outside every mapped parcel is possible, and then there is
- * no polygon to review, which the caller must say rather than guess. */
+ * parcel its point falls inside. Every outcome is explicit (1.16.0 correction R-01):
+ *
+ *   resolves { ioll, land, landStatus: 'found' }           the land parcel under the point, its
+ *                                  PARCELID a checked, normalised tax-parcel id (cqbLandRecord)
+ *            { ioll, land: null, landStatus: 'outside' }   the containing-parcel query
+ *                                  succeeded and no mapped tax parcel contains the point
+ *   rejects  e.cqbKind 'absent'      the improvement query succeeded and holds no such PID
+ *            e.cqbKind 'nolocation'  a usable record for this PID carries no map point
+ *            any failure kind        either query failed or its reply was unusable -- an
+ *                                    HTTP error, an ArcGIS {error}, a body that is not
+ *                                    JSON, no features list, an entry that is not a usable
+ *                                    record for this PID or whose geometry is not a readable
+ *                                    point, a land parcel without a boundary or without a
+ *                                    usable tax-parcel id, or no answer in time -- with that kind
+ *                                    ('timeout', 'http', 'arcgis', 'malformed', 'network')
+ *
+ * A "none" is only ever concluded from a successful reply that carries a features list, and
+ * "no mapped location" only from a usable record (cqbIollRecord, cqbIollPoint).
+ * Before this correction, (j.features || []) turned a reply with no features list into
+ * "not found", and any failure of the containing-parcel query came back as land: null,
+ * which both callers present as "outside every mapped tax parcel" -- with no retry. Until
+ * round 2, any object as the first entry -- {}, [] or {"error": ...} -- was read as a record
+ * with no point: "on record but has no mapped location", again with no retry. Until round 3,
+ * a land parcel was accepted on its boundary alone, so one with no usable PARCELID reached
+ * Find Parcel as PARCELID = 'undefined' and Site tools as a finished review of "PID undefined". */
 function cqbIollResolve(pid, deps) {
   deps = deps || {};
   var getJson = deps.getJson || cqbGetJson;
   var clean = cqbPidNorm(pid);
+  var recWhat = 'The lookup for improvement ' + clean;
+  var landWhat = 'The lookup for the land parcel under improvement ' + clean;
+  function failed(what) {
+    return function (e) { throw cqbLookupFailure(what, e); };
+  }
+  function featureList(j, what) {
+    if (!j || typeof j !== 'object' || !Array.isArray(j.features)) {
+      throw cqbLookupFailure(what, cqbKindError('malformed', 'the reply had no features list'));
+    }
+    return j.features;
+  }
   return getJson(CQB_IOLL_URL + '/query?' + cqbQs({
     where: "PID='" + clean.replace(/'/g, "''") + "'",
     outFields: 'PID,ppTYPE,SITUS,LEGAL,SUB_NAME,PRIME_USE,PROP_CLASS,ACRES,OWNER',
     returnGeometry: 'true', outSR: CQB_SP_FT, f: 'json'
-  })).then(function (j) {
-    var f = (j.features || [])[0];
-    if (!f || !f.geometry || !isFinite(Number(f.geometry.x)) ||
-        !isFinite(Number(f.geometry.y))) {
-      throw new Error('Improvement ' + clean + ' not found, or it has no mapped location.');
+  })).then(null, failed(recWhat)).then(function (j) {
+    var list = featureList(j, recWhat);
+    if (!list.length) {
+      throw cqbKindError('absent', 'Improvement ' + clean + ' was not found in the county\'s ' +
+        'records of improvements on leased land.');
     }
-    var a = f.attributes || {};
+    var a = cqbIollRecord(list[0], clean);
+    if (!a) {
+      throw cqbLookupFailure(recWhat, cqbKindError('malformed', 'the reply held no usable record for this improvement'));
+    }
+    var pt = cqbIollPoint(list[0].geometry);
+    if (pt === false) {
+      throw cqbLookupFailure(recWhat, cqbKindError('malformed', 'the record\'s map point could not be read'));
+    }
+    if (!pt) {
+      throw cqbKindError('nolocation', 'Improvement ' + clean + ' is on record but has no mapped ' +
+        'location, so there is no point to show or to review.');
+    }
+    var x = pt.x, y = pt.y;
     var rec = {
-      pid: cqbBlank(a.PID) ? clean : String(a.PID),
+      pid: String(a.PID),
       type: cqbBlank(a.ppTYPE) ? null : String(a.ppTYPE),
       isMobileHome: String(a.ppTYPE || '').toUpperCase() === 'MH',
       address: cqbBlank(a.SITUS) ? '' : String(a.SITUS),
       legal: cqbBlank(a.LEGAL) ? null : String(a.LEGAL),
       park: cqbBlank(a.SUB_NAME) ? null : String(a.SUB_NAME),
       use: cqbBlank(a.PRIME_USE) ? null : String(a.PRIME_USE),
-      x: Number(f.geometry.x), y: Number(f.geometry.y)
+      x: x, y: y
     };
     rec.home = cqbIollHome(rec.legal);
     return getJson(CQB_SITE_SOURCES[0].url + '/query?' + cqbQs({
       geometry: rec.x + ',' + rec.y, geometryType: 'esriGeometryPoint',
       inSR: CQB_SP_FT, outSR: CQB_SP_FT, spatialRel: 'esriSpatialRelIntersects',
       outFields: 'PARCELID,SITEADDRESS,GIS_AREA', returnGeometry: 'true', f: 'json'
-    })).then(function (pj) {
-      var pf = (pj.features || [])[0];
-      var land = (pf && pf.geometry && pf.geometry.rings && pf.geometry.rings.length)
-        ? pf : null;
-      return { ioll: rec, land: land };
-    }, function () {
-      return { ioll: rec, land: null };
+    })).then(null, failed(landWhat)).then(function (pj) {
+      var lands = featureList(pj, landWhat);
+      if (!lands.length) return { ioll: rec, land: null, landStatus: 'outside' };
+      var pf = lands[0];
+      if (!pf || !pf.geometry || !Array.isArray(pf.geometry.rings) || !pf.geometry.rings.length) {
+        throw cqbLookupFailure(landWhat, cqbKindError('malformed', 'the land parcel came back without a boundary'));
+      }
+      var land = cqbLandRecord(pf);
+      if (!land) {
+        throw cqbLookupFailure(landWhat, cqbKindError('malformed', 'the land parcel came back without a usable parcel id'));
+      }
+      return { ioll: rec, land: land, landStatus: 'found' };
     });
   });
 }
@@ -1405,13 +1724,36 @@ function cqbIollHome(legal) {
   if (m) out.make = m[1].trim().replace(/\s+/g, ' ') || null;
   m = t.match(/\b(18\d{2}|19\d{2}|20\d{2})\b/);
   if (m) out.year = Number(m[1]);
-  /* Guard the dimension match against the year: '1998 REGIS  28 X 56' has two
-   * number pairs in it and only the X-joined one is a size. */
-  m = t.match(/\b(\d{1,3})\s*[Xx]\s*(\d{1,3})\b/);
+
+  /* Dimensions. Measured against all 1,779 mobile-home records on 2026-09-04,
+   * because the first version of this was written from one example and the
+   * real data has four shapes it did not survive:
+   *
+   *   '1998 REGIS  28 X 56  GRY/BLK'   the sample: plain, width first
+   *   '1972 14' X 56''                 feet marks between number and X
+   *   '1987 16 X 80GRY/WHT'            length run together with the colour
+   *   '1994 80 X 16'                   written LENGTH first -- 13 records do
+   *   '# 70X143SKD2FR2B, ... 14 X 66'  a SERIAL containing a false pair
+   *
+   * So: drop the serial token before matching (it can sit before the real
+   * pair), allow the feet marks, do not demand a word boundary after the
+   * second number, and treat the pair as unordered -- narrow side is the
+   * width. Then refuse anything outside the range a manufactured home can
+   * actually be. That last gate is the point: '1962 56 X 2FDR WHI' otherwise
+   * reports a two-foot-long home, and this panel does not print numbers it
+   * cannot stand behind. Result: 1,769 of 1,779 parsed (99.4%), widths
+   * landing exactly where they should -- 14 ft and 16 ft single-wides most
+   * common, 24-32 ft double-wides next, nothing absurd. */
+  m = t.replace(/\bSERIAL\s*#?\s*[0-9A-Z-]+/i, ' ')
+       .match(/\b(\d{1,3})\s*'?\s*[Xx]\s*(\d{1,3})\s*'?/);
   if (m) {
-    var w = Number(m[1]), l = Number(m[2]);
-    if (isFinite(w) && isFinite(l) && w > 0 && l > 0) {
-      out.widthFt = w; out.lengthFt = l; out.areaSqFt = w * l;
+    var a = Number(m[1]), b = Number(m[2]);
+    if (isFinite(a) && isFinite(b)) {
+      var w = Math.min(a, b), l = Math.max(a, b);
+      if (w >= CQB_MH_MIN_W && w <= CQB_MH_MAX_W &&
+          l >= CQB_MH_MIN_L && l <= CQB_MH_MAX_L) {
+        out.widthFt = w; out.lengthFt = l; out.areaSqFt = w * l;
+      }
     }
   }
   return out;
@@ -1452,16 +1794,16 @@ function cqbStorageAreaProbe(parcelGeom, deps) {
 
 var CQB_BFE_URL = CQB_PUB + 'LTUWatershed/FEMEFloodDetails/MapServer/1';
 
-/* Flatten BFE polylines into elevation-tagged segments. */
+/* Flatten BFE polylines into elevation-tagged segments. A line whose ELEV is not
+ * a usable elevation (see cqbElevOrNull) is left out and counted in `skipped`:
+ * Number(null) and Number(' ') are both 0, and a zero line would drag every
+ * interpolation near it toward sea level. Until 1.16.0 this guarded null,
+ * undefined and '' but not a single space (repair H4). */
 function cqbBfeSegments(features) {
-  var segs = [];
+  var segs = [], skipped = 0;
   (features || []).forEach(function (f) {
-    /* Number(null) is 0, so a null ELEV would otherwise become a sea-level BFE
-     * line and drag every interpolation near it. Reject the empty cases first. */
-    var raw = f.attributes ? f.attributes.ELEV : null;
-    if (raw === null || raw === undefined || raw === '') return;
-    var e = Number(raw);
-    if (!isFinite(e)) return;
+    var e = cqbElevOrNull(f && f.attributes ? f.attributes.ELEV : null);
+    if (e === null) { skipped++; return; }
     ((f.geometry && f.geometry.paths) || []).forEach(function (path) {
       for (var i = 0; i < path.length - 1; i++) segs.push({ e: e, a: path[i], b: path[i + 1] });
     });
@@ -1469,7 +1811,7 @@ function cqbBfeSegments(features) {
   var elevs = [];
   segs.forEach(function (s) { if (elevs.indexOf(s.e) < 0) elevs.push(s.e); });
   elevs.sort(function (a, b) { return a - b; });
-  return { segs: segs, elevs: elevs };
+  return { segs: segs, elevs: elevs, skipped: skipped };
 }
 
 /* BFE at a point: inverse-distance blend of the two nearest distinct contour
@@ -1599,7 +1941,14 @@ function cqbStorageCalc(pid, opts, deps) {
     }
     var bfe = cqbBfeSegments(fs);
     if (!bfe.elevs.length) { rep.noBfe = true; return null; }
-    rep.bfeLineCount = fs.length;
+    /* the lines actually used; a line with no usable elevation is not one of them */
+    rep.bfeLineCount = fs.length - bfe.skipped;
+    if (bfe.skipped) {
+      rep.bfeLinesSkipped = bfe.skipped;
+      rep.warnings.push(bfe.skipped + ' BFE line' + (bfe.skipped === 1 ? '' : 's') + ' near this parcel ' +
+        (bfe.skipped === 1 ? 'has' : 'have') + ' no usable elevation recorded (blank or not a number) ' +
+        'and ' + (bfe.skipped === 1 ? 'was' : 'were') + ' left out of the BFE surface.');
+    }
 
     var gspec = cqbGridSpec(cqbBounds(rep._clip.rings), opts.maxPoints || 3000, opts.gridStep || 5);
     rep.gridStep = gspec.step;
@@ -1833,7 +2182,8 @@ function cqbFreeboardAssess(parcelGeom, deps) {
     ((j && j.features) || []).forEach(function (f) {
       var a = f.attributes || {};
       /* Same Number(null)===0 trap as everywhere else in this file. */
-      if (!cqbBlank(a.ELEV) && isFinite(Number(a.ELEV))) elevs.push(Number(a.ELEV));
+      var e = cqbElevOrNull(a.ELEV);
+      if (e !== null) elevs.push(e);
       if (cqbBlank(a.V_DATUM)) undeclared++; else datums[String(a.V_DATUM).trim()] = 1;
     });
     return { ok: true, count: elevs.length,
@@ -1990,16 +2340,23 @@ function cqbFloodReview(pid, opts, deps) {
 
 /* Resolve whatever the user typed to the polygon the review actually runs on.
  * A tax parcel ID resolves to itself. An IOLL ID resolves to its point's
- * containing tax parcel, and the improvement rides along. */
+ * containing tax parcel, and the improvement rides along. A failed IOLL lookup
+ * rejects with the resolver's own "could not be completed" error (correction
+ * R-01), never with the "outside every mapped tax parcel" answer below, which
+ * only a successful containing-parcel query that found nothing can produce. */
 function cqbReviewSubject(pid, deps) {
   deps = deps || {};
   var getJson = deps.getJson || cqbGetJson;
   var clean = cqbPidNorm(pid);
   if (cqbPidKind(clean) === 'ioll') {
     return cqbIollResolve(clean, deps).then(function (r) {
-      if (!r.land) {
-        throw new Error('Improvement ' + clean + ' is mapped at a point that falls ' +
+      if (r.landStatus === 'outside') {
+        throw cqbKindError('outside', 'Improvement ' + clean + ' is mapped at a point that falls ' +
           'outside every mapped tax parcel, so there is no boundary to review.');
+      }
+      if (!r.land) {
+        throw cqbLookupFailure('The lookup for the land parcel under improvement ' + clean,
+          cqbKindError('malformed', 'no land parcel came back'));
       }
       return { parcel: r.land, ioll: r.ioll };
     });
@@ -2081,6 +2438,14 @@ function cqbSeGuessPid() {
       var mm = t.match(/\bPID\s*([0-9A-Za-z]{8,19})\b/);
       if (mm && cqbPidKind(mm[1])) return cqbPidNorm(mm[1]);
     }
+  } catch (e) {}
+  /* Last, the parcel from the toolkit's own Find Parcel card (1.16.0). Without this the dialog
+   * opened blank right after a Find Parcel search. Same order the Link chip uses: the app's own
+   * record first, then the last Find Parcel. For a mobile home this is the MH id, which the
+   * dialog resolves to its land parcel with the leased-land warning. */
+  try {
+    var last = window.__cqbLastPid;
+    if (last && cqbPidKind(String(last))) return cqbPidNorm(String(last));
   } catch (e) {}
   return '';
 }
@@ -2491,7 +2856,18 @@ function cqbSeLettersHtml(l) {
     'authoritative.</div>' + bits.join('');
 }
 
+/* The open Site tools dialog's close(), if one is open. Opening the dialog again replaces the
+ * open one instead of stacking a second copy (with duplicate element ids) on top of it, and
+ * every close path -- the Close button, a backdrop click, Escape, a plugin's api.close(),
+ * replacement, and toolbar teardown -- removes the dialog's Escape handler with it. Until
+ * 1.16.0 only Escape removed the handler (repair H5). */
+var cqbSeActiveClose = null;
+function cqbSeCloseActive() {
+  if (typeof cqbSeActiveClose === 'function') cqbSeActiveClose();
+}
+
 function cqbSiteToolsDialog() {
+  cqbSeCloseActive();
   cqbSeCss();
   var back = document.createElement('div');
   back.className = 'cqb-se-back';
@@ -2549,12 +2925,16 @@ function cqbSiteToolsDialog() {
     if (this.checked) $('cqb-se-optin').style.display = 'none';
   });
 
-  function close() { back.remove(); }
+  function esc(e) { if (e.key === 'Escape') close(); }
+  function close() {
+    document.removeEventListener('keydown', esc);
+    if (cqbSeActiveClose === close) cqbSeActiveClose = null;
+    if (back.parentNode) back.remove();
+  }
+  cqbSeActiveClose = close;
   $('cqb-se-x').addEventListener('click', close);
   back.addEventListener('click', function (e) { if (e.target === back) close(); });
-  document.addEventListener('keydown', function esc(e) {
-    if (e.key === 'Escape') { close(); document.removeEventListener('keydown', esc); }
-  });
+  document.addEventListener('keydown', esc);
 
   /* ---- Shared plumbing for both buttons -------------------------------- */
 
@@ -2716,25 +3096,35 @@ function cqbSiteToolsDialog() {
   renderChips();
   function refresh() { chips.forEach(function (x) { paint(x.c, x.lyr.visible); }); }
 
-  /* snap slots (named) */
+  /* snap slots (named). The stored format, and why older records are refused: section 4.
+   * Reading a slot never writes it; only an explicit Shift+click save replaces what is there. */
+  var CQB_SNAP_REFUSAL = {
+    legacy: 'was saved by an older version of the toolkit, which did not record which layers it meant',
+    version: 'was saved by a different version of the toolkit',
+    unreadable: 'cannot be read',
+    changed: 'was saved for a different set of map layers (the map has changed since)'
+  };
   [1, 2].forEach(function (n) {
     var key = '__claude_qb_preset' + n;
+    /* null when the slot is empty; otherwise its name and the stored record, as stored */
     function readPreset() {
       var rawp = localStorage.getItem(key);
       if (!rawp) return null;
-      try {
-        var parsed = JSON.parse(rawp);
-        return Array.isArray(parsed) ? { name: '', snap: parsed } : parsed; /* legacy raw-array snapshots still load */
-      } catch (e) { return null; }
+      var rec;
+      try { rec = JSON.parse(rawp); } catch (e) { rec = undefined; }
+      var nm = rec && !Array.isArray(rec) && typeof rec.name === 'string' ? rec.name : '';
+      return { name: nm, rec: rec };
     }
+    function label(nm) { return 'Snap ' + n + (nm ? ' ("' + nm + '")' : ''); }
     var c = chip('Snap ' + n, '');
     function retitle() {
       var p = readPreset();
-      c.title = p
-        ? 'Snap ' + n + (p.name ? ' ("' + p.name + '")' : '') + ': click applies; Shift+click re-saves'
-        : 'Snap ' + n + ' is empty: Shift+click to save the current layers';
+      var why = p ? cqbSnapProblem(p.rec, cqbDurableOps()) : '';
+      c.title = !p ? 'Snap ' + n + ' is empty: Shift+click to save the current layers'
+        : why ? label(p.name) + ' ' + CQB_SNAP_REFUSAL[why] + ', so it cannot be applied: Shift+click to save the current layers in its place'
+        : label(p.name) + ': click applies; Shift+click re-saves';
       c.setAttribute('aria-label', c.title);
-      c.style.color = p ? '#7cc4ff' : '#7a8ba0';
+      c.style.color = !p ? '#7a8ba0' : why ? '#ffcf87' : '#7cc4ff';
     }
     c.style.background = '#232b36';
     retitle();
@@ -2743,33 +3133,52 @@ function cqbSiteToolsDialog() {
         var existing = readPreset();
         var nm = prompt('Name this snapshot (optional, Cancel keeps the current name):', existing && existing.name || '');
         if (nm === null) nm = (existing && existing.name) || '';
-        localStorage.setItem(key, JSON.stringify({ name: nm, snap: snapshot() }));
+        var s = snapshot();
+        localStorage.setItem(key, JSON.stringify({ v: s.v, name: nm, sig: s.sig, bits: s.bits }));
         retitle();
-        toast('Saved to Snap ' + n + (nm ? ' ("' + nm + '")' : ''));
+        toast('Saved to ' + label(nm));
       } else {
         var p = readPreset();
         if (!p) { toast('Snap ' + n + ' is empty - Shift+click to save the current layers'); return; }
-        applySnap(p.snap);
-        toast('Snap ' + n + (p.name ? ' ("' + p.name + '")' : '') + ' applied');
+        var why = applySnap(p.rec);
+        if (why) {
+          retitle();
+          toast(label(p.name) + ' ' + CQB_SNAP_REFUSAL[why] + ', so it was not applied. Nothing changed. ' +
+            'Set up the layers you want, then Shift+click Snap ' + n + ' to save them again.', 7000);
+          return;
+        }
+        toast(label(p.name) + ' applied');
       }
     };
     bar.appendChild(c);
   });
 
-  /* Declutter / Restore */
-  var dc = chip('Declutter', 'Turn everything off except parcels and development; click again to restore');
+  /* Declutter / Restore. The layers to restore are kept on window, so they survive a re-run of
+   * the bar on the same page, and they are checked exactly like a saved slot before anything
+   * changes: what an older toolkit run on this page kept is refused, not guessed at. */
+  var dc = chip(window.__qbDeclutterSnap ? 'Restore' : 'Declutter', 'Turn everything off except parcels and development; click again to restore');
   dc.style.background = '#232b36'; dc.style.color = '#ffcf87';
   dc.onclick = function () {
     if (window.__qbDeclutterSnap) {
-      applySnap(window.__qbDeclutterSnap);
+      var why = applySnap(window.__qbDeclutterSnap);
       window.__qbDeclutterSnap = null;
       dc.textContent = 'Declutter';
-      toast('Layers restored');
+      if (why) {
+        toast('Restore skipped: the layers kept before Declutter ' + (why === 'changed'
+          ? 'were for a different set of map layers' : 'were kept by a different toolkit version on this page') +
+          ', so they cannot be applied. Nothing changed.', 7000);
+      } else {
+        toast('Layers restored');
+      }
     } else {
       window.__qbDeclutterSnap = snapshot();
       var keep = { 'Development': 1, 'Parcel Information': 1, 'City and Village Limits': 1, 'GWV Special Layer': 1 };
+      /* Layers outside the saved state -- another script's overlay, an __OPT_ layer -- are left
+       * alone: the snapshot does not hold them, so Restore could not turn them back on. */
+      var transient = cqbNonDurableLayers();
       v.map.layers.forEach(function (l) {
         if (l.opacity === 0) return;
+        if (transient.indexOf(l) >= 0) return;
         l.visible = !!keep[l.title];
       });
       refresh();
@@ -2842,6 +3251,16 @@ function cqbSiteToolsDialog() {
     window.__cqbResizeObserver = ro;
   }
   window.addEventListener('resize', positionBar);
+  window.__cqbTeardown = function () {
+    window.__cqbTeardown = null;
+    /* First retire everything this toolbar still has in flight, so no reply to it can reach
+     * the next toolbar's card, map or parcel selection -- then remove its UI (correction R-02). */
+    try { cqbRetireFinds(); } catch (e) {}
+    try { cqbSugRetire(); } catch (e) {}
+    window.removeEventListener('resize', positionBar);
+    try { closeCard(); } catch (e) {}
+    try { cqbSeCloseActive(); } catch (e) {}
+  };
 
   /* ---- 5b. remembered show/hide state ---- */
   function hideBar() {
@@ -2919,14 +3338,81 @@ function cqbSiteToolsDialog() {
   var CQB_SVC = 'https://gis.lincoln.ne.gov/public/rest/services';
   var cqbLayerUrl = {};      /* layer title -> ".../MapServer/<n>", resolved from the live map */
   var cqbGeomCache = {};     /* pid -> parcel geometry (one fetch per parcel, not per field) */
-  var cqbValueCache = {};    /* pid + "|" + label -> repaired string */
+  var cqbValueCache = {};    /* pid + "|" + label -> repaired string (successful answers only) */
   var cqbInFlight = {};
+  var cqbFailedAt = {};      /* pid + "|" + label -> time of the last FAILED attempt */
 
-  function cqbQuery(url, params) {
-    return fetch(url + '/query', {
+  /* ---- strict service reads (1.16.0, repair H3) ----
+   * A query answer is one of three things, and they must never be confused:
+   *   - a result with features       -> the value
+   *   - a result with NO features    -> a real absence: "None mapped" is TRUE
+   *   - a failure: an HTTP error, an ArcGIS {error} inside an HTTP 200, a body that is not
+   *     JSON, JSON without a features list, or no answer within CQB_HTTP_TIMEOUT_MS
+   * Until 1.16.0 both the popup repair and Find Parcel read (r.features || []), which turns
+   * every failure into the second case: a controlled {error} reply produced "Floodplain: None
+   * mapped" on the card, and the popup repair wrote it into the popup and cached it for the
+   * rest of the page. That was a failure-path defect; it is not evidence that the county
+   * services failed during any real review. Both paths now read through these two functions,
+   * and a failure rejects with e.cqbKind set, so callers can show "could not be checked". */
+  var CQB_HTTP_TIMEOUT_MS = 30000;
+  function cqbFetchError(kind, msg) { var e = new Error(msg); e.cqbKind = kind; return e; }
+  function cqbStrictJson(url, init, timeoutMs) {
+    var ms = timeoutMs || CQB_HTTP_TIMEOUT_MS;
+    var ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    var opts = Object.assign({}, init || {});
+    if (ctl) opts.signal = ctl.signal;
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      var timer = setTimeout(function () {
+        if (done) return;
+        done = true;
+        if (ctl) { try { ctl.abort(); } catch (e) {} }
+        reject(cqbFetchError('timeout', 'no answer within ' + Math.round(ms / 1000) + ' s'));
+      }, ms);
+      fetch(url, opts).then(function (r) {
+        if (!r.ok) throw cqbFetchError('http', 'HTTP ' + r.status);
+        return r.text();
+      }).then(function (txt) {
+        var j;
+        try { j = JSON.parse(txt); } catch (e) { throw cqbFetchError('malformed', 'the reply was not valid JSON'); }
+        if (!j || typeof j !== 'object') throw cqbFetchError('malformed', 'the reply was empty');
+        if (j.error) {
+          throw cqbFetchError('arcgis', 'service error' + (j.error.code ? ' ' + j.error.code : '') +
+            (j.error.message ? ': ' + j.error.message : ''));
+        }
+        return j;
+      }).then(function (j) {
+        if (done) return;
+        done = true; clearTimeout(timer); resolve(j);
+      }, function (e) {
+        if (done) return;
+        done = true; clearTimeout(timer);
+        reject(e && e.cqbKind ? e : cqbFetchError('network', (e && e.message) || String(e)));
+      });
+    });
+  }
+  /* A layer query: resolves only with a JSON object that carries a features array. */
+  function cqbStrictQuery(url, params, timeoutMs) {
+    return cqbStrictJson(url, {
       method: 'POST',
       body: new URLSearchParams(Object.assign({ f: 'json' }, params))
-    }).then(function (r) { return r.json(); });
+    }, timeoutMs).then(function (j) {
+      if (!Array.isArray(j.features)) throw cqbFetchError('malformed', 'the reply had no features list');
+      return j;
+    });
+  }
+  /* A short reason for the screen. */
+  function cqbWhyFailed(e) {
+    var k = e && e.cqbKind;
+    if (k === 'timeout') return 'no answer from the county server';
+    if (k === 'http') return 'the county server returned ' + e.message;
+    if (k === 'arcgis') return 'the map service reported an error';
+    if (k === 'malformed') return 'the county server sent an unreadable reply';
+    return 'the request could not be completed';
+  }
+
+  function cqbQuery(url, params) {
+    return cqbStrictQuery(url + '/query', params);
   }
 
   /* Resolve by the same title the Arcade passes to FeatureSetByName. Prefer a real
@@ -3240,9 +3726,9 @@ function cqbSiteToolsDialog() {
       where: "PARCELID='" + String(pid).replace(/'/g, "''") + "'",
       outSR: '3857', returnGeometry: 'true', outFields: 'PARCELID', resultRecordCount: '1'
     }).then(function (r) {
-      var g = r.features && r.features[0] && r.features[0].geometry;
+      var g = r.features[0] && r.features[0].geometry;
       if (g) cqbGeomCache[pid] = g;
-      return g;
+      return g || null;        /* no such parcel: a real answer. A failure has already rejected. */
     });
   }
 
@@ -3261,7 +3747,7 @@ function cqbSiteToolsDialog() {
           geometry: JSON.stringify(g), geometryType: 'esriGeometryPolygon', inSR: '3857',
           spatialRel: 'esriSpatialRelIntersects', returnGeometry: 'false',
           outFields: spec.fields, resultRecordCount: '50'
-        }).then(function (r) { return (r && r.features) || []; });
+        }).then(function (r) { return r.features; });
       }
       return run(geom).then(function (feats) {
         /* Exactly one distinct answer means the -10 ft buffer could not have changed it,
@@ -3275,10 +3761,17 @@ function cqbSiteToolsDialog() {
         });
       });
     }).then(function (val) {
+      /* Only an answer is cached -- a value, or null for "no such parcel". A failure rejects
+       * below and leaves nothing behind, so the next attempt asks the server again. */
       cqbValueCache[key] = val;
       delete cqbInFlight[key];
+      delete cqbFailedAt[key];
       return val;
-    }).catch(function () { delete cqbInFlight[key]; return null; });
+    }, function (e) {
+      delete cqbInFlight[key];
+      cqbFailedAt[key] = Date.now();
+      throw e;
+    });
 
     cqbInFlight[key] = p;
     return p;
@@ -3302,12 +3795,17 @@ function cqbSiteToolsDialog() {
       }
     }
     /* Some values are not table rows at all but inline "Label: <strong>value</strong>"
-     * (Fire, Area planner, Case planner). Key off the text immediately before the <strong>. */
+     * (Fire, Area planner, Case planner). Key off the text immediately before the <strong>:
+     * the text between it and the nearest element in front of it, and nothing further back.
+     * That element is a line break or the previous field's own value, and reading across it
+     * takes another field's text into this label (1.16.0, browser review BR-01). The native
+     * Services line "School: <strong>55-0001 Lincoln</strong><br>Fire: <strong>#INVALID</strong>"
+     * read as "School: 55-0001 LincolnFire:", the label came out as "LincolnFire", and the Fire
+     * repair never ran, so a failed Fire value stayed a bare #INVALID with no Retry. */
     if (el && el.tagName === 'STRONG') {
       var prev = el.previousSibling, txt = '';
-      while (prev && txt.length < 40) {
+      while (prev && prev.nodeType !== 1 && txt.length < 40) {
         if (prev.nodeType === 3) txt = prev.nodeValue + txt;
-        else if (prev.nodeType === 1) txt = (prev.textContent || '') + txt;
         prev = prev.previousSibling;
       }
       var m2 = txt.replace(/\s+/g, ' ').match(/([A-Za-z][A-Za-z .]{1,18}):\s*$/);
@@ -3341,18 +3839,63 @@ function cqbSiteToolsDialog() {
       if (!el) return;
       var label = cqbLabelFor(el);
       if (!label) return;
+      /* after a failed attempt, wait before asking again -- the observer sweeps often, and a
+       * down service must not be hammered. A click on the marked value retries at once. */
+      var at = cqbFailedAt[pid + '|' + label];
+      if (at && Date.now() - at < CQB_REPAIR_RETRY_MS) return;
       node.__cqbRepairing = true;
       cqbLookup(pid, label).then(function (val) {
         if (val === null || val === undefined) { node.__cqbRepairing = false; return; }
         if (!node.parentElement || !document.contains(node)) return;  /* panel re-rendered under us */
         node.nodeValue = node.nodeValue.replace(/#INVALID/g, val);
         var mark = node.parentElement;
+        cqbClearRepairFailure(mark);
         mark.style.borderBottom = '1px dotted #7cc4ff';
         mark.title = 'Recovered by Quick Bar: the app\'s own lookup for this field failed '
           + '(a known VertiGIS bug), so this value was read straight from the '
           + 'map service instead.';
+      }, function (err) {
+        node.__cqbRepairing = false;
+        if (!node.parentElement || !document.contains(node)) return;
+        cqbMarkRepairFailure(node.parentElement, panel, pid, label, err);
       });
     });
+  }
+  /* The value stays "#INVALID" -- the app's own failure marker, which nobody reads as an
+   * answer -- and says why, with a click to try again. It is never replaced by "None".
+   * The marked value is announced as a button and takes keyboard focus, so Enter and Space
+   * retry it too, exactly as a click does: the keys every other Retry here takes
+   * (cqbWireRetry). Both handlers are properties, not added listeners, so a value that fails
+   * again while still marked gets its handlers replaced, never a second pair, and clearing
+   * the mark removes both. */
+  var CQB_REPAIR_RETRY_MS = 20000;
+  function cqbMarkRepairFailure(el, panel, pid, label, err) {
+    el.style.borderBottom = '1px dashed #ffb74d';
+    el.style.cursor = 'pointer';
+    el.setAttribute('role', 'button');
+    el.setAttribute('tabindex', '0');
+    el.setAttribute('data-cqb-repair-failed', '1');
+    el.title = 'Quick Bar could not read the real value: ' + cqbWhyFailed(err) + '. This is not a '
+      + '"none" answer -- the value is unknown. Click to try again.';
+    function retry(ev) {
+      if (ev && ev.preventDefault) ev.preventDefault();
+      delete cqbFailedAt[pid + '|' + label];
+      cqbClearRepairFailure(el);
+      repairInvalidValues(panel);
+    }
+    el.onclick = retry;
+    el.onkeydown = function (ev) { if (ev && (ev.key === 'Enter' || ev.key === ' ')) retry(ev); };
+  }
+  function cqbClearRepairFailure(el) {
+    if (!el || !el.getAttribute || el.getAttribute('data-cqb-repair-failed') !== '1') return;
+    el.removeAttribute('data-cqb-repair-failed');
+    el.removeAttribute('role');
+    el.removeAttribute('tabindex');
+    el.style.borderBottom = '';
+    el.style.cursor = '';
+    el.onclick = null;
+    el.onkeydown = null;
+    el.title = '';
   }
 
 
@@ -3436,9 +3979,23 @@ function cqbSiteToolsDialog() {
 
   /* ---- 6. Find Parcel card + Settings popover ---- */
   var SVC = 'https://gis.lincoln.ne.gov/public/rest/services';
+  /* Every Find Parcel read goes through the strict reader (section 5c): a failure rejects,
+   * so it can never be displayed as an empty result. */
   function q(path, params) {
-    return fetch(SVC + path + '/query', { method: 'POST', body: new URLSearchParams(Object.assign({ f: 'json' }, params)) })
-      .then(function (r) { return r.json(); });
+    return cqbStrictQuery(SVC + path + '/query', params);
+  }
+  function cqbSettle(p) {
+    return p.then(function (j) { return { ok: true, j: j }; }, function (e) { return { ok: false, err: e }; });
+  }
+  function cqbRetryButton(id, label) {
+    return "<span role='button' tabindex='0' id='" + id + "' style='display:inline-block;margin-top:6px;cursor:pointer;" +
+      "color:#ffcf87;padding:2px 10px;border:1px solid #6b5222;border-radius:4px;'>" + label + '</span>';
+  }
+  function cqbWireRetry(d, id, fn) {
+    var el = d && d.querySelector('#' + id);
+    if (!el) return;
+    el.onclick = fn;
+    el.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); fn(); } });
   }
   function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/'/g, '&#39;'); }
   /* Where the parcel card starts, measured rather than assumed.
@@ -3474,8 +4031,22 @@ function cqbSiteToolsDialog() {
     } catch (e) { return floor; }
   }
 
+  /* Every way a card goes away runs through its own dismiss(): the close control, Enter/Space
+   * on it, Escape, a Settings action, a newer card replacing it, and toolbar teardown.
+   * dismiss() removes the card AND its document-level Escape handler. Until 1.16.0 only Escape removed
+   * the handler, so every other dismissal left one behind (repair H5).
+   * The three ways the PERSON closes a card -- the close control, Enter/Space on it, Escape --
+   * also retire the Find Parcel work that was loading into it (correction R-02; see
+   * cqbFindOp). A card replaced by the next step of its own search does not: that replacement
+   * uses closeCard() as well, which is why closeCard() itself cannot be the signal. */
+  function closeCard(d) {
+    d = d || document.getElementById('cqb-card');
+    if (!d) return;
+    if (typeof d.cqbClose === 'function') d.cqbClose();
+    else if (d.parentNode) d.remove();     /* a card left by a toolkit older than 1.16.0 */
+  }
   function card(html) {
-    var oldc = document.getElementById('cqb-card'); if (oldc) oldc.remove();
+    closeCard();
     var d = document.createElement('div');
     d.id = 'cqb-card';
     d.setAttribute('role', 'dialog');
@@ -3489,10 +4060,19 @@ function cqbSiteToolsDialog() {
     close.innerHTML = "<span role='button' tabindex='0' id='cqb-card-x' style='cursor:pointer;color:#a9bccf;padding:2px 10px;border:1px solid #2c3a4d;border-radius:4px;'>close</span>";
     d.appendChild(close);
     document.body.appendChild(d);
-    var cx = document.getElementById('cqb-card-x');
-    cx.onclick = function () { d.remove(); };
-    cx.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); d.remove(); } });
-    document.addEventListener('keydown', function esck(ev) { if (ev.key === 'Escape') { d.remove(); document.removeEventListener('keydown', esck); } });
+    /* named dismiss, not close: `close` above is the element that holds the close control */
+    function esck(ev) { if (ev.key === 'Escape') closedByUser(); }
+    function dismiss() {
+      document.removeEventListener('keydown', esck);
+      d.cqbClose = null;
+      if (d.parentNode) d.remove();
+    }
+    function closedByUser() { cqbRetireFinds(); dismiss(); }
+    d.cqbClose = dismiss;
+    var cx = d.querySelector('#cqb-card-x');
+    cx.onclick = closedByUser;
+    cx.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); closedByUser(); } });
+    document.addEventListener('keydown', esck);
     return d;
   }
   function row(label, val) {
@@ -3545,17 +4125,17 @@ function cqbSiteToolsDialog() {
       var off = localStorage.getItem('__claude_qb_nosearch') === '1';
       if (off) localStorage.removeItem('__claude_qb_nosearch'); else localStorage.setItem('__claude_qb_nosearch', '1');
       try { cqbSugRemove(null); } catch (e) {}
-      d.remove();
+      closeCard(d);
       toast('Parcel results in the search box: ' + (off ? 'on' : 'off'));
     };
     var recal = d.querySelector('#cqb-recal-btn');
     if (recal) recal.onclick = function () {
       if (!confirm('Record the layers that are on right now as this app\u2019s normal startup state?\n\nDo this on a freshly-loaded viewer you have not changed yet.')) return;
-      cqbCaptureBaseline(true); d.remove();
+      cqbCaptureBaseline(true); closeCard(d);
       toast('Layer baseline recorded');
     };
     d.querySelectorAll('.cqb-rm').forEach(function (r) {
-      r.onclick = function () { cfg.splice(+r.getAttribute('data-i'), 1); saveCfg(); renderChips(); d.remove(); openSettings(); };
+      r.onclick = function () { cfg.splice(+r.getAttribute('data-i'), 1); saveCfg(); renderChips(); closeCard(d); openSettings(); };
     });
     var addBtn = d.querySelector('#cqb-add-btn');
     if (addBtn) addBtn.onclick = function () {
@@ -3563,7 +4143,7 @@ function cqbSiteToolsDialog() {
       var t = sel.value, l = (lab.value || t.slice(0, 8)).trim();
       if (!t) return;
       cfg.push({ k: 'c' + Date.now(), t: t, l: l });
-      saveCfg(); renderChips(); d.remove(); openSettings();
+      saveCfg(); renderChips(); closeCard(d); openSettings();
     };
     var saveBtn = d.querySelector('#cqb-save-btn');
     saveBtn.onclick = function () {
@@ -3572,66 +4152,128 @@ function cqbSiteToolsDialog() {
         var inp = tr.querySelector('input[data-f="l"]');
         if (inp && cfg[i]) cfg[i].l = inp.value.trim() || cfg[i].l;
       });
-      saveCfg(); renderChips(); d.remove();
+      saveCfg(); renderChips(); closeCard(d);
       toast('Chip labels saved');
     };
     d.querySelector('#cqb-reset-btn').onclick = function () {
       if (!confirm('Reset to the default 7 layers? This clears your custom chip configuration.')) return;
-      cfg = DEFAULTS.slice(); saveCfg(); renderChips(); d.remove();
+      cfg = DEFAULTS.slice(); saveCfg(); renderChips(); closeCard(d);
       toast('Reset to default layers');
+    };
+  }
+
+  /* One Find Parcel at a time (1.16.0, repair H2; correction R-02). Every search and every card
+   * load is an operation with a number. Before this, a slow mobile-home lookup overtaken by an
+   * ordinary search replaced the ordinary card with the 74-acre park record, and a late
+   * floodplain percentage could land in the wrong parcel's row.
+   *
+   * An operation's asynchronous steps may change the card, the map or the selected parcel only
+   * while it is live:
+   *   - no newer operation has started. The counter is on window, not in this run of the bar,
+   *     so a search in a NEWER toolbar also retires the searches of the one it replaced;
+   *   - nothing retired it. Toolbar teardown retires everything outstanding before it removes
+   *     the old UI, and the person closing the card (close control, Enter/Space, Escape)
+   *     retires what was loading into it;
+   *   - the card it put up is still the card on screen. An operation's own next step (loading
+   *     card -> result, error or retry) replaces that card through op.card(), which keeps it
+   *     live; any other card replacing it -- Settings, the link fallback -- ends it.
+   * Until correction R-02 each run of the bar kept its own counter: after a toolbar restart a
+   * reply to the old toolbar could still replace the new toolbar's card, re-select its parcel
+   * and move the map, and a search closed while pending reopened its card when it finished. */
+  function cqbRetireFinds() { window.__cqbFindGen = (+window.__cqbFindGen || 0) + 1; }
+  function cqbFindOp() {
+    cqbRetireFinds();
+    var mine = window.__cqbFindGen;
+    return {
+      live: function () {
+        if (window.__cqbFindGen !== mine) return false;
+        var d = document.getElementById('cqb-card');
+        return !!d && d.cqbOp === mine;
+      },
+      card: function (html) {
+        var d = card(html);
+        d.cqbOp = mine;
+        return d;
+      }
     };
   }
 
   /* An improvement on leased land resolves to the tax parcel its point falls
    * inside -- for a mobile home that is the park's land parcel. The card then
    * describes that parcel, so a banner has to say so; a reviewer who reads a
-   * 74-acre park's record believing it is one home's lot has been misled. */
+   * 74-acre park's record believing it is one home's lot has been misled.
+   *
+   * 1.15.0 inserted the banner into the card that existed when the land parcel arrived --
+   * showParcel's "Loading..." card -- and showParcel's final render replaced that card, so the
+   * banner never survived (reproduced live 2026-09-25 on MH00002090000). The banner is now
+   * HTML that showParcel puts at the top of EVERY render it makes: loading, final, and error.
+   *
+   * What comes back is judged by its status, never by its wording (correction R-01). Only the
+   * resolver's successful answers say something is absent: e.cqbKind 'absent' (no such
+   * improvement), 'nolocation' (no mapped point) and landStatus 'outside' (no parcel under the
+   * point). Every other rejection is a failed lookup and gets the retry card, even when the
+   * service's own error text happens to say "not found". */
   function findIoll(pid, term, opts) {
-    card('<b>Find Parcel</b><br/>Looking up improvement ' + esc(pid) + ' &hellip;');
+    var op = cqbFindOp();
+    op.card('<b>Find Parcel</b><br/>Looking up improvement ' + esc(pid) + ' &hellip;');
     cqbIollResolve(pid, {}).then(function (r) {
-      if (!r.land) {
-        card('<b>Find Parcel</b><br/>' + esc(pid) + ' is mapped at a point that falls ' +
+      if (!op.live()) return;
+      if (r.landStatus === 'outside') {
+        op.card('<b>Find Parcel</b><br/>' + esc(pid) + ' is mapped at a point that falls ' +
           'outside every mapped tax parcel, so there is no boundary to show.');
         return;
       }
+      if (!r.land) throw cqbFetchError('malformed', 'no land parcel came back');
       return q('/Assessor/TaxParcels/MapServer/0', {
         where: "PARCELID = '" + String(r.land.attributes.PARCELID).replace(/'/g, "''") + "'",
         outSR: '3857', returnGeometry: 'true', resultRecordCount: '1',
         outFields: 'PARCELID,SITEADDRESS,OWNERNME1,GIS_AREA,PRPRTYDSCRP,CLASSDSCRP,RESYRBLT,RESSTRTYP,RESFLRAREA,CNTASSDVAL,CNVYNAME'
       }).then(function (pj) {
+        if (!op.live()) return;
         var f = (pj.features || [])[0];
         if (!f) {
-          card('<b>Find Parcel</b><br/>Could not load the land parcel under ' + esc(pid) + '.');
+          op.card('<b>Find Parcel</b><br/>Could not load the land parcel under ' + esc(pid) + '.');
           return;
         }
-        showParcel(f, 1, opts);
-        cqbIollBanner(r.ioll, f.attributes.PARCELID);
+        showParcel(f, 1, Object.assign({}, opts || {}, {
+          banner: cqbIollBannerHtml(r.ioll, f.attributes),
+          lastPid: r.ioll && r.ioll.pid       /* a shared link then reopens THIS card, warning included */
+        }));
       });
     }).catch(function (e) {
-      card('<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e));
+      if (!op.live()) return;
+      var kind = e && e.cqbKind;
+      if (kind === 'absent' || kind === 'nolocation') {   /* a successful reply said so */
+        op.card('<b>Find Parcel</b><br/>' + esc(e.message));
+        return;
+      }
+      var d = op.card('<b>Find Parcel</b><br/>The lookup for ' + esc(pid) + ' could not be completed: ' +
+        esc((e && e.cqbReason) || cqbWhyFailed(e)) + '. This is not a &ldquo;not found&rdquo; answer.<br/>' +
+        cqbRetryButton('cqb-find-retry', 'Retry the lookup'));
+      cqbWireRetry(d, 'cqb-find-retry', function () { findIoll(pid, term, opts); });
     });
   }
 
-  /* Prepended to the card showParcel just built, rather than threaded through
-   * showParcel, so the ordinary parcel path is untouched. */
-  function cqbIollBanner(rec, landPid) {
-    var d = document.getElementById('cqb-card');
-    if (!d || !rec) return;
+  /* The improvement and the land under it, kept distinct: the MH id and unit facts, then the
+   * PID and address of the parcel the record below actually describes. */
+  function cqbIollBannerHtml(rec, land) {
+    if (!rec) return '';
     var h = rec.home || {};
     var bits = [];
     if (h.space) bits.push('space ' + h.space);
     if (h.widthFt && h.lengthFt) bits.push(h.widthFt + ' \u00d7 ' + h.lengthFt + ' ft');
     if (h.year) bits.push(String(h.year));
     if (h.make) bits.push(h.make);
-    var b = document.createElement('div');
-    b.style.cssText = 'margin:-2px 0 8px;padding:7px 8px;border-radius:6px;' +
-      'background:#1b2a3a;border:1px solid #2f4a63;color:#c2d4e6;font-size:11px;line-height:1.5';
-    b.innerHTML = '<b style="color:#7cc4ff">' + esc(rec.pid) + '</b> is a ' +
+    var landPid = land && land.PARCELID, landAddr = land && land.SITEADDRESS;
+    return "<div data-cqb-ioll='1' role='note' style='margin:-2px 0 8px;padding:7px 8px;border-radius:6px;" +
+      "background:#1b2a3a;border:1px solid #2f4a63;color:#c2d4e6;font-size:11px;line-height:1.5;'>" +
+      "<b style='color:#7cc4ff'>" + esc(rec.pid) + '</b> is a ' +
       (rec.isMobileHome ? 'mobile home' : 'improvement') + ' on leased land' +
-      (rec.park ? ' in ' + esc(rec.park) : '') + ', mapped as a point. ' +
-      'The record below is the <b>land parcel</b> it stands on (' + esc(landPid) + ').' +
-      (bits.length ? '<br/>Unit: ' + esc(bits.join(' \u00b7 ')) : '');
-    d.insertBefore(b, d.firstChild);
+      (rec.park ? ' in ' + esc(rec.park) : '') + ', mapped as a point, not a boundary. ' +
+      'The record below describes the <b>underlying land parcel</b>' +
+      (landPid ? ', PID ' + esc(landPid) : '') + (landAddr ? ' (' + esc(landAddr) + ')' : '') +
+      ' &mdash; not this unit.' +
+      (bits.length ? '<br/>Unit: ' + esc(bits.join(' \u00b7 ')) : '') + '</div>';
   }
 
   /* Find Parcel: search -> (single result | picker) -> record card */
@@ -3655,14 +4297,21 @@ function cqbSiteToolsDialog() {
     var where = /^\d{10,14}$/.test(clean)
       ? "PARCELID = '" + clean + "'"
       : "UPPER(SITEADDRESS) LIKE '" + clean.split(',')[0] + "%'";
-    card('<b>Find Parcel</b><br/>Searching for &ldquo;' + esc(term) + '&rdquo; &hellip;');
+    var op = cqbFindOp();
+    op.card('<b>Find Parcel</b><br/>Searching for &ldquo;' + esc(term) + '&rdquo; &hellip;');
     q('/Assessor/TaxParcels/MapServer/0', { where: where, outSR: '3857', returnGeometry: 'true',
       outFields: 'PARCELID,SITEADDRESS,OWNERNME1,GIS_AREA,PRPRTYDSCRP,CLASSDSCRP,RESYRBLT,RESSTRTYP,RESFLRAREA,CNTASSDVAL,CNVYNAME', resultRecordCount: '8' })
     .then(function (pj) {
-      if (!pj.features || !pj.features.length) { card('<b>Find Parcel</b><br/>No parcel found for &ldquo;' + esc(term) + '&rdquo;. Try the street number + name only, or a 13-digit PID.'); return; }
+      if (!op.live()) return;
+      if (!pj.features || !pj.features.length) { op.card('<b>Find Parcel</b><br/>No parcel found for &ldquo;' + esc(term) + '&rdquo;. Try the street number + name only, or a 13-digit PID.'); return; }
       if (pj.features.length === 1) { showParcel(pj.features[0], 1, opts); return; }
       showPicker(pj.features, term);
-    }).catch(function (e) { card('<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e)); });
+    }).catch(function (e) {
+      if (!op.live()) return;
+      var d = op.card('<b>Find Parcel</b><br/>The parcel search could not be completed: ' + esc(cqbWhyFailed(e)) +
+        '. This is not a &ldquo;no match&rdquo; answer.<br/>' + cqbRetryButton('cqb-find-retry', 'Retry the search'));
+      cqbWireRetry(d, 'cqb-find-retry', function () { findParcel(term, opts); });
+    });
   }
 
   /* multiple address/PID matches: let the user pick which parcel before loading the full card */
@@ -3701,10 +4350,20 @@ function cqbSiteToolsDialog() {
 
   /* full record card for one chosen parcel feature */
   function showParcel(f, matchCount, opts) {
-    var at = f.attributes;
-    window.__cqbLastPid = at.PARCELID || window.__cqbLastPid;
-    var g = f.geometry;
-    var ring = g.rings[0];
+    var at = (f && f.attributes) || {};
+    var op = cqbFindOp();
+    var banner = (opts && opts.banner) || '';
+    var g = f && f.geometry;
+    var ring = g && g.rings && g.rings[0];
+    /* A record can come back with no polygon (rings: [] is real on this layer). Until
+     * correction R-02 this threw after the new operation had started, which left the
+     * "Searching..." card on screen for good. Nothing is zoomed or selected for it. */
+    if (!Array.isArray(ring) || !ring.length) {
+      op.card(banner + '<b>Find Parcel</b><br/>' + esc(at.SITEADDRESS || ('Parcel ' + (at.PARCELID || ''))) +
+        ' is on record but has no mapped boundary, so there is nothing to show on the map.');
+      return;
+    }
+    window.__cqbLastPid = (opts && opts.lastPid) || at.PARCELID || window.__cqbLastPid;
     var xs = ring.map(function (p) { return p[0]; }), ys = ring.map(function (p) { return p[1]; });
     var ext = { xmin: Math.min.apply(0, xs), ymin: Math.min.apply(0, ys), xmax: Math.max.apply(0, xs), ymax: Math.max.apply(0, ys) };
     var cx0 = (ext.xmin + ext.xmax) / 2, cy0 = (ext.ymin + ext.ymax) / 2;
@@ -3728,7 +4387,10 @@ function cqbSiteToolsDialog() {
     var lat = (Math.atan(Math.exp(cy0 / 6378137)) * 2 - Math.PI / 2) * 180 / Math.PI;
     var lon = cx0 * 180 / 20037508.342787;
     var geomP = { geometry: gp, geometryType: 'esriGeometryPolygon', spatialRel: 'esriSpatialRelIntersects', where: '1=1', returnGeometry: 'false' };
-    card('<b>Find Parcel</b><br/>Loading record for ' + esc(at.SITEADDRESS || at.PARCELID) + '&hellip;');
+    op.card(banner + '<b>Find Parcel</b><br/>Loading record for ' + esc(at.SITEADDRESS || at.PARCELID) + '&hellip;');
+    /* Each lookup settles on its own (1.16.0, repair H3). A failed one shows "could not be
+     * checked" in its own row and offers a retry; it never becomes an empty answer, and it no
+     * longer takes the rest of the card down with it. */
     Promise.all([
       q('/Planning/DevRevZoningandRegulations/MapServer/1', Object.assign({ outFields: 'ZONE' }, geomP)),
       q('/LTUWatershed/FEMAFlood/MapServer/1', Object.assign({ outFields: 'FLD_ZONE,FLOODWAY' }, geomP)),
@@ -3736,27 +4398,34 @@ function cqbSiteToolsDialog() {
       q('/Planning/DevRevLanduseAndGrowth/MapServer/13', Object.assign({ outFields: 'Tier' }, geomP)),
       q('/Planning/DevReviewAreas/MapServer/0', Object.assign({ outFields: 'Region,Planner,Phone' }, geomP)),
       q('/Planning/DevRevAPPLICATIONS/MapServer/1', Object.assign({ outFields: 'APPNUM,STATUS,PLANNER_ASSIGNED,HYPERLINK', resultRecordCount: '8' }, geomP)),
-      q('/Planning/HOANA2/MapServer/0', Object.assign({ outFields: 'na_name,first_name,last_name,phone,email', resultRecordCount: '10' }, geomP)).catch(function () { return { features: [] }; }),
-      q('/Planning/HOANA2/MapServer/1', Object.assign({ outFields: 'ASSOCNAME,SHORTNAME,first_name,last_name,phone,email', resultRecordCount: '10' }, geomP)).catch(function () { return { features: [] }; })
-    ]).then(function (rs) {
+      q('/Planning/HOANA2/MapServer/0', Object.assign({ outFields: 'na_name,first_name,last_name,phone,email', resultRecordCount: '10' }, geomP)),
+      q('/Planning/HOANA2/MapServer/1', Object.assign({ outFields: 'ASSOCNAME,SHORTNAME,first_name,last_name,phone,email', resultRecordCount: '10' }, geomP))
+    ].map(cqbSettle)).then(function (settled) {
+      if (!op.live()) return;
+      var failedWhy = null;
+      var rs = settled.map(function (x) {
+        if (x.ok) return x.j;
+        if (!failedWhy) failedWhy = cqbWhyFailed(x.err);
+        return null;
+      });
+      var UNKNOWN = "<span style='color:#ffcf87;font-weight:normal;'>could not be checked &mdash; " + esc(failedWhy || '') + '</span>';
       function vals(j, fld) {
         var s = [];
         (j.features || []).forEach(function (ff) { var vv = ff.attributes[fld]; if (vv != null && String(vv).trim() !== '' && s.indexOf(vv) < 0) s.push(vv); });
         return s;
       }
-      var zoning = vals(rs[0], 'ZONE').sort().join(', ');
-      var floodRows = (rs[1].features || []).map(function (ff) { return ff.attributes; });
-      var flood = cqbFloodShort(floodRows) !== 'None mapped'
-        ? cqbFloodShort(floodRows)
-        : 'None mapped';
-      var flu = vals(rs[2], 'CAT').join(', ');
-      var tier = vals(rs[3], 'Tier').join(', ');
-      var planner = (rs[4].features || []).map(function (ff) {
+      var zoning = rs[0] ? vals(rs[0], 'ZONE').sort().join(', ') : null;
+      var floodRows = rs[1] ? rs[1].features.map(function (ff) { return ff.attributes; }) : null;
+      /* null = the flood check FAILED; 'None mapped' only ever comes from a successful empty reply */
+      var flood = floodRows ? cqbFloodShort(floodRows) : null;
+      var flu = rs[2] ? vals(rs[2], 'CAT').join(', ') : null;
+      var tier = rs[3] ? vals(rs[3], 'Tier').join(', ') : null;
+      var planner = rs[4] === null ? null : (rs[4].features || []).map(function (ff) {
         var a = ff.attributes;
         var n = a.Region === 'Village' ? 'Village of ' + a.Planner : a.Planner;
         return a.Phone ? n + ' \u00b7 ' + a.Phone : n;
       }).filter(function (xv, i, arr) { return arr.indexOf(xv) === i; }).join(', ');
-      var apps = (rs[5].features || []).map(function (ff) {
+      var apps = rs[5] === null ? null : (rs[5].features || []).map(function (ff) {
         var a = ff.attributes;
         var lab = esc(a.APPNUM) + (a.STATUS ? ' \u00b7 ' + esc(a.STATUS) : '') + (a.PLANNER_ASSIGNED ? ' \u00b7 ' + esc(a.PLANNER_ASSIGNED) : '');
         return a.HYPERLINK ? "<a href='" + esc(a.HYPERLINK) + "' target='_blank' rel='noopener noreferrer' style='color:#7cc4ff;text-decoration:none;'>" + lab + '</a>' : lab;
@@ -3764,7 +4433,8 @@ function cqbSiteToolsDialog() {
       /* HOA/NA: field names confirmed live 2026-08-27 against Planning/HOANA2/0 ("Neighborhood
          Association Contacts": na_name) and /1 ("Homeowner Association Contacts": ASSOCNAME/SHORTNAME);
          both share first_name/last_name/phone/email for the contact person. */
-      var hoaFeats = (rs[6].features || []).concat(rs[7].features || []);
+      var hoaFailed = rs[6] === null || rs[7] === null;
+      var hoaFeats = ((rs[6] && rs[6].features) || []).concat((rs[7] && rs[7].features) || []);
       /* HOANA2 stores one feature per board contact, all sharing the same association name/boundary
          (live-confirmed: Country Meadows HOA returned 3 features -- Jeff Woita, Christine Kiewra, Steve
          Lovell -- for one parcel). Group by association name so multi-contact HOAs render as one line
@@ -3793,16 +4463,22 @@ function cqbSiteToolsDialog() {
       var money = at.CNTASSDVAL ? '$' + Math.round(at.CNTASSDVAL).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') : '';
       var flr = at.RESFLRAREA ? Math.round(at.RESFLRAREA).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' ft\u00b2' : '';
       var B = "display:inline-block;background:#24354d;color:#cfe8ff;text-decoration:none;font-size:11px;font-weight:bold;padding:4px 8px;border-radius:4px;margin:0 4px 4px 0;";
-      card(
+      var done = op.card(banner +
         "<div style='font-size:13px;font-weight:bold;color:#fff;'>" + esc(at.SITEADDRESS || 'Parcel ' + at.PARCELID) + '</div>' +
         "<div style='color:#8fa3ba;margin:1px 0 6px 0;'>PID " + esc(at.PARCELID) + ' \u00b7 ' + esc(at.OWNERNME1 || '') + '</div>' +
         "<table style='width:100%;border-collapse:collapse;'>" +
-        row('Zoning', esc(zoning)) + row('Floodplain', esc(flood) + "<span id='cqb-flood-pct' style='color:#8fa3ba;'></span>") + row('Future use', esc(flu)) + row('Growth tier', esc(tier)) +
+        row('Zoning', zoning === null ? UNKNOWN : esc(zoning)) +
+        row('Floodplain', flood === null ? UNKNOWN : esc(flood) + "<span id='cqb-flood-pct' style='color:#8fa3ba;'></span>") +
+        row('Future use', flu === null ? UNKNOWN : esc(flu)) + row('Growth tier', tier === null ? UNKNOWN : esc(tier)) +
         row('Area', ac + ' ac') + row('Class', esc(at.CLASSDSCRP)) + row('Built', built) + row('Floor area', flr) + row('Assessed', money) +
-        row('Area planner', esc(planner)) +
+        row('Area planner', planner === null ? UNKNOWN : esc(planner)) +
         '</table>' +
-        (apps.length ? "<div style='color:#6f8bb0;font-size:10px;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;margin:7px 0 3px 0;'>APPLICATIONS</div><div style='line-height:1.7;'>" + apps.join('<br/>') + '</div>' : '') +
-        (hoa.length ? "<div style='color:#6f8bb0;font-size:10px;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;margin:7px 0 3px 0;'>HOA / NEIGHBORHOOD ASSOC.</div><div style='line-height:1.6;font-size:11px;'>" + hoa.join('<br/>') + '</div>' : '') +
+        (apps === null ? "<div style='color:#6f8bb0;font-size:10px;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;margin:7px 0 3px 0;'>APPLICATIONS</div><div>" + UNKNOWN + '</div>' :
+         apps.length ? "<div style='color:#6f8bb0;font-size:10px;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;margin:7px 0 3px 0;'>APPLICATIONS</div><div style='line-height:1.7;'>" + apps.join('<br/>') + '</div>' : '') +
+        (hoaFailed ? "<div style='color:#6f8bb0;font-size:10px;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;margin:7px 0 3px 0;'>HOA / NEIGHBORHOOD ASSOC.</div><div style='font-size:11px;'>" + UNKNOWN + '</div>' :
+         hoa.length ? "<div style='color:#6f8bb0;font-size:10px;font-weight:bold;letter-spacing:1px;border-bottom:1px solid #2c3a4d;margin:7px 0 3px 0;'>HOA / NEIGHBORHOOD ASSOC.</div><div style='line-height:1.6;font-size:11px;'>" + hoa.join('<br/>') + '</div>' : '') +
+        (failedWhy ? "<div style='margin-top:6px;color:#ffcf87;font-size:11px;'>Some checks could not be completed. " +
+          'A row marked &ldquo;could not be checked&rdquo; is unknown, not empty.<br/>' + cqbRetryButton('cqb-card-retry', 'Retry the failed checks') + '</div>' : '') +
         "<div style='margin-top:8px;border-top:1px solid #2c3a4d;padding-top:7px;'>" +
         "<a style='" + B + "' target='_blank' rel='noopener noreferrer' href='https://orion.lancaster.ne.gov/appraisal/publicaccess/PropertyDetail.aspx?PropertyNumber=" + esc(at.PARCELID) + "'>Assessor</a>" +
         "<a style='" + B + "' target='_blank' rel='noopener noreferrer' href='https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent((at.SITEADDRESS || '') + ', Lancaster County, NE') + "'>Google Maps</a>" +
@@ -3810,25 +4486,32 @@ function cqbSiteToolsDialog() {
         '</div>' +
         "<div style='color:#6f8bb0;font-size:10px;margin-top:6px;'>Parcel is highlighted on the map - click it for the full Development Information popup." + (matchCount > 1 ? ' (' + matchCount + ' parcels matched this search.)' : '') + '</div>'
       );
+      if (failedWhy) {
+        cqbWireRetry(done, 'cqb-card-retry', function () {
+          showParcel(f, matchCount, Object.assign({}, opts || {}, { noZoom: true }));
+        });
+      }
       /* the share of the parcel in the floodplain arrives after the card, so the card is never
        * held up waiting on the geometry service */
-      if (flood !== 'None mapped') {
+      if (flood !== null && flood !== 'None mapped') {
         cqbFloodPercent(g, at.GIS_AREA).then(function (txt) {
-          var el = document.getElementById('cqb-flood-pct');
+          if (!op.live()) return;              /* closed, or the card now belongs to a newer search */
+          var el = done.querySelector('#cqb-flood-pct');
           if (el && txt) el.textContent = ' \u00b7 ' + txt;
         });
       }
-    }).catch(function (e) { card('<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e)); });
+    }).catch(function (e) { if (!op.live()) return; op.card(banner + '<b>Find Parcel</b><br/>Lookup failed: ' + esc(e && e.message ? e.message : e)); });
   }
   window.__qbFindParcel = findParcel;
 
-  function toast(msg) {
+  /* ms: how long it stays up; a message someone has to act on gets longer than the default */
+  function toast(msg, ms) {
     var e = document.createElement('div');
     e.setAttribute('role', 'status');
     e.textContent = msg;
-    e.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:99999;background:#1b5e20;color:#fff;padding:8px 14px;border-radius:6px;font:13px sans-serif';
+    e.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:99999;background:#1b5e20;color:#fff;padding:8px 14px;border-radius:6px;font:13px sans-serif;max-width:min(560px,90vw);';
     document.body.appendChild(e);
-    setTimeout(function () { e.remove(); }, 2200);
+    setTimeout(function () { e.remove(); }, ms || 2200);
   }
   toast('Quick Bar ready - popup applied, locators paused');
   try { cqbApplyIncomingLink(); } catch (e) { /* a malformed shared link must never break the bar */ }
