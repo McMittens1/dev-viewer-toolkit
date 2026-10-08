@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.16.0
+// @version      1.16.1
 // @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools flood review (FEMA Zone A, freeboard facts, recorded flood documents, FEMA letters of map change) and a separate Salt Creek flood-storage and allowable-fill calculator, mobile-home and leased-land parcel lookup, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
@@ -38,7 +38,7 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.16.0 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.16.1 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -56,7 +56,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.16.0', ready: false };
+  window.__dvToolkit = { version: '1.16.1', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -1120,6 +1120,19 @@ function cqbQs(o) {
   }).join('&');
 }
 
+/* A layer query, sent as GET -- or as a POST of the same parameters when the URL would be too
+ * long for the server (1.16.1). A parcel outline rides in the query string, and a big or
+ * intricate parcel makes it longer than the county server accepts: measured live 2026-10-08,
+ * parcel 0409100003000 (4 rings, 211 vertices) built a 10,269-character URL that died as a bare
+ * "Failed to fetch", so every Site tools check on it reported a lookup failure. The same query
+ * POSTed answered normally, on the county server and on FEMA's. Short queries stay GET. */
+var CQB_GET_URL_MAX = 4000;
+function cqbGetQuery(getJson, url, params) {
+  var q = cqbQs(params);
+  if (url.length + 7 + q.length <= CQB_GET_URL_MAX) return getJson(url + '/query?' + q);
+  return getJson(url + '/query', undefined, q);
+}
+
 /* How long a read waits for an answer before it counts as failed. */
 var CQB_GET_TIMEOUT_MS = 30000;
 
@@ -1649,11 +1662,11 @@ function cqbIollResolve(pid, deps) {
     }
     return j.features;
   }
-  return getJson(CQB_IOLL_URL + '/query?' + cqbQs({
+  return cqbGetQuery(getJson, CQB_IOLL_URL, {
     where: "PID='" + clean.replace(/'/g, "''") + "'",
     outFields: 'PID,ppTYPE,SITUS,LEGAL,SUB_NAME,PRIME_USE,PROP_CLASS,ACRES,OWNER',
     returnGeometry: 'true', outSR: CQB_SP_FT, f: 'json'
-  })).then(null, failed(recWhat)).then(function (j) {
+  }).then(null, failed(recWhat)).then(function (j) {
     var list = featureList(j, recWhat);
     if (!list.length) {
       throw cqbKindError('absent', 'Improvement ' + clean + ' was not found in the county\'s ' +
@@ -1771,12 +1784,12 @@ function cqbStorageAreaProbe(parcelGeom, deps) {
   if (!parcelGeom || !parcelGeom.rings || !parcelGeom.rings.length) {
     return Promise.resolve({ ok: false, inArea: false, areas: 0, saNumber: null, saLabel: null });
   }
-  return getJson(CQB_SA_URL + '/query?' + cqbQs({
+  return cqbGetQuery(getJson, CQB_SA_URL, {
     geometry: JSON.stringify({ rings: parcelGeom.rings, spatialReference: { wkid: CQB_SP_FT } }),
     geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT,
     spatialRel: 'esriSpatialRelIntersects', outFields: 'SA_NUMBER',
     returnGeometry: 'false', f: 'json'
-  })).then(function (j) {
+  }).then(function (j) {
     var fs = j.features || [];
     if (!fs.length) {
       return { ok: true, inArea: false, areas: 0, saNumber: null, saLabel: null };
@@ -1858,12 +1871,12 @@ function cqbStorageCalc(pid, opts, deps) {
     rep._parcel = f.geometry;
 
     say('Finding the storage area...');
-    return getJson(CQB_SA_URL + '/query?' + cqbQs({
+    return cqbGetQuery(getJson, CQB_SA_URL, {
       geometry: JSON.stringify({ rings: f.geometry.rings, spatialReference: { wkid: CQB_SP_FT } }),
       geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT, outSR: CQB_SP_FT,
       spatialRel: 'esriSpatialRelIntersects', outFields: 'SA_NUMBER,FILL_PRCNT',
       returnGeometry: 'true', f: 'json'
-    }));
+    });
   }).then(function (j) {
     var fs = j.features || [];
     if (!fs.length) { rep.noStorageArea = true; return null; }
@@ -1909,13 +1922,13 @@ function cqbStorageCalc(pid, opts, deps) {
 
     say('Reading the BFE lines...');
     var b = cqbExpand(cqbBounds(clip.rings), opts.bfeSearchFt || 2000);
-    return getJson(CQB_BFE_URL + '/query?' + cqbQs({
+    return cqbGetQuery(getJson, CQB_BFE_URL, {
       geometry: JSON.stringify({ xmin: b.minx, ymin: b.miny, xmax: b.maxx, ymax: b.maxy,
                                  spatialReference: { wkid: CQB_SP_FT } }),
       geometryType: 'esriGeometryEnvelope', inSR: CQB_SP_FT, outSR: CQB_SP_FT,
       spatialRel: 'esriSpatialRelIntersects', outFields: 'ELEV,V_DATUM',
       returnGeometry: 'true', f: 'json'
-    }));
+    });
   }).then(function (j) {
     if (rep.noStorageArea || rep.emptyClip) return null;
     var fs = (j && j.features) || [];
@@ -2074,12 +2087,12 @@ function cqbZoneAssess(parcelGeom, attrs, deps) {
     rep.acres = null;
     rep.acresUnknown = true;
   }
-  return getJson(CQB_FEMA_URL + '/query?' + cqbQs({
+  return cqbGetQuery(getJson, CQB_FEMA_URL, {
     geometry: JSON.stringify({ rings: parcelGeom.rings, spatialReference: { wkid: CQB_SP_FT } }),
     geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT,
     spatialRel: 'esriSpatialRelIntersects', outFields: 'FLD_ZONE,FLOODWAY',
     returnGeometry: 'false', f: 'json'
-  })).then(function (j) {
+  }).then(function (j) {
     (j.features || []).forEach(function (f) {
       var a = f.attributes || {};
       var z = cqbBlank(a.FLD_ZONE) ? '' : String(a.FLD_ZONE).trim();
@@ -2093,12 +2106,12 @@ function cqbZoneAssess(parcelGeom, attrs, deps) {
      * polygons touching the parcel and measure the overlap. Zone A polygons are
      * large rural reaches, so this response can be heavy -- which is why it is
      * not part of the first query and only Zone A parcels pay for it. */
-    return getJson(CQB_FEMA_URL + '/query?' + cqbQs({
+    return cqbGetQuery(getJson, CQB_FEMA_URL, {
       geometry: JSON.stringify({ rings: parcelGeom.rings, spatialReference: { wkid: CQB_SP_FT } }),
       geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT, outSR: CQB_SP_FT,
       spatialRel: 'esriSpatialRelIntersects', where: "FLD_ZONE='A'",
       outFields: 'FLD_ZONE', returnGeometry: 'true', f: 'json'
-    })).then(function (jz) {
+    }).then(function (jz) {
       var geoms = (jz.features || []).map(function (f) { return f.geometry; });
       return cqbClipArea(parcelGeom, geoms, post);
     }).then(function (sqft) {
@@ -2127,12 +2140,12 @@ function cqbRecordedFlood(parcelGeom, deps) {
   deps = deps || {};
   var getJson = deps.getJson || cqbGetJson;
   function lookup(url, outFields) {
-    return getJson(url + '/query?' + cqbQs({
+    return cqbGetQuery(getJson, url, {
       geometry: JSON.stringify({ rings: parcelGeom.rings, spatialReference: { wkid: CQB_SP_FT } }),
       geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT,
       spatialRel: 'esriSpatialRelIntersects', outFields: outFields,
       returnGeometry: 'false', f: 'json'
-    })).then(function (j) {
+    }).then(function (j) {
       return { ok: true, items: (j.features || []).map(function (f) { return f.attributes || {}; }) };
     }).catch(function () {
       return { ok: false, items: [] };
@@ -2162,7 +2175,7 @@ function cqbFreeboardAssess(parcelGeom, deps) {
                inSR: CQB_SP_FT, spatialRel: 'esriSpatialRelIntersects',
                returnGeometry: 'false', f: 'json' };
     for (var k in extra) qs[k] = extra[k];
-    return getJson(url + '/query?' + cqbQs(qs)).then(function (j) {
+    return cqbGetQuery(getJson, url, qs).then(function (j) {
       if (j && j.error) throw new Error('layer error');
       return { ok: true, features: (j && j.features) || [] };
     }).catch(function () { return { ok: false, features: [] }; });
@@ -2170,13 +2183,13 @@ function cqbFreeboardAssess(parcelGeom, deps) {
   /* BFE lines within 2,000 ft of the parcel box, same reach the storage
    * calculation reads. Attribute-only: the range is what freeboard needs. */
   var b = cqbExpand(cqbBounds(parcelGeom.rings), 2000);
-  var bfeQ = getJson(CQB_BFE_URL + '/query?' + cqbQs({
+  var bfeQ = cqbGetQuery(getJson, CQB_BFE_URL, {
     geometry: JSON.stringify({ xmin: b.minx, ymin: b.miny, xmax: b.maxx, ymax: b.maxy,
                                spatialReference: { wkid: CQB_SP_FT } }),
     geometryType: 'esriGeometryEnvelope', inSR: CQB_SP_FT,
     spatialRel: 'esriSpatialRelIntersects', outFields: 'ELEV,V_DATUM',
     returnGeometry: 'false', f: 'json'
-  })).then(function (j) {
+  }).then(function (j) {
     if (j && j.error) throw new Error('layer error');
     var elevs = [], datums = {}, undeclared = 0;
     ((j && j.features) || []).forEach(function (f) {
@@ -2237,7 +2250,7 @@ function cqbLomcLookup(parcelGeom, deps) {
   deps = deps || {};
   var getJson = deps.getJson || cqbGetJson;
   var b = cqbExpand(cqbBounds(parcelGeom.rings), CQB_REG.lomcSearchFt);
-  var lomaQ = getJson(CQB_NFHL_LOMA_URL + '/query?' + cqbQs({
+  var lomaQ = cqbGetQuery(getJson, CQB_NFHL_LOMA_URL, {
     geometry: JSON.stringify({ xmin: b.minx, ymin: b.miny, xmax: b.maxx, ymax: b.maxy,
                                spatialReference: { wkid: CQB_SP_FT } }),
     geometryType: 'esriGeometryEnvelope', inSR: CQB_SP_FT, outSR: CQB_SP_FT,
@@ -2245,7 +2258,7 @@ function cqbLomcLookup(parcelGeom, deps) {
     outFields: 'CASENUMBER,STATUS,PROJECTCATEGORY,DATEENDED,CID,COMMUNITYNAME,' +
                'PDFHYPERLINKID,REVAL_STAT,LOTTYPE,OUTCOME,PROJECTNAME',
     returnGeometry: 'true', f: 'json'
-  })).then(function (j) {
+  }).then(function (j) {
     if (j && j.error) throw new Error('layer error');
     var items = ((j && j.features) || []).map(function (f) {
       var a = f.attributes || {};
@@ -2266,14 +2279,14 @@ function cqbLomcLookup(parcelGeom, deps) {
     });
     return { ok: true, items: items };
   }).catch(function () { return { ok: false, items: [] }; });
-  var lomrQ = getJson(CQB_NFHL_LOMR_URL + '/query?' + cqbQs({
+  var lomrQ = cqbGetQuery(getJson, CQB_NFHL_LOMR_URL, {
     geometry: JSON.stringify({ rings: parcelGeom.rings,
                                spatialReference: { wkid: CQB_SP_FT } }),
     geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT,
     spatialRel: 'esriSpatialRelIntersects',
     outFields: 'CASE_NO,EFF_DATE,STATUS,LOMR_ID',
     returnGeometry: 'false', f: 'json'
-  })).then(function (j) {
+  }).then(function (j) {
     if (j && j.error) throw new Error('layer error');
     return { ok: true, items: ((j && j.features) || []).map(function (f) {
       return f.attributes || {};
@@ -2387,6 +2400,13 @@ var CQB_SITE_TOOLS_TIP = 'For one parcel: run a flood review, or compute the Sal
  * extra modules; never at runtime. */
 var CQB_SITE_PLUGINS = [];
 
+/* Layout (1.16.1). The dialog is a column: the title, a scrolling middle (the parcel box, any
+ * consent text and the results), then the status line and the buttons, which never scroll.
+ * Until 1.16.1 the whole dialog scrolled as one block, so after a long review the status and
+ * every button sat below the fold -- measured live after one parcel's flood review in a
+ * 1102 x 679 window, the buttons started 123 px below the bottom of the window. Sizes are capped by the window less a small margin rather than by
+ * a percentage, so at 200% zoom or in a short window the dialog still fits, and the buttons
+ * wrap onto a second row instead of being cut off at the side. */
 function cqbSeCss() {
   if (document.getElementById('cqb-se-css')) return;
   var s = document.createElement('style');
@@ -2394,10 +2414,14 @@ function cqbSeCss() {
   s.textContent =
     '.cqb-se-back{position:fixed;inset:0;background:rgba(10,16,24,.55);z-index:2147483600;' +
       'display:flex;align-items:center;justify-content:center;font:13px/1.45 system-ui,Segoe UI,Arial,sans-serif}' +
-    '.cqb-se{background:#12202e;color:#dbe7f3;border:1px solid #2b4257;border-radius:10px;' +
-      'width:460px;max-width:94vw;max-height:88vh;overflow:auto;box-shadow:0 18px 50px rgba(0,0,0,.5)}' +
-    '.cqb-se h2{margin:0;padding:14px 18px;font-size:15px;border-bottom:1px solid #2b4257;font-weight:600}' +
-    '.cqb-se .bd{padding:16px 18px}' +
+    '.cqb-se{background:#12202e;color:#dbe7f3;border:1px solid #2b4257;border-radius:10px;box-sizing:border-box;' +
+      'width:460px;max-width:calc(100vw - 16px);max-height:calc(100vh - 16px);display:flex;flex-direction:column;' +
+      'overflow:hidden;box-shadow:0 18px 50px rgba(0,0,0,.5)}' +
+    '.cqb-se:focus{outline:none}' +
+    '.cqb-se :focus-visible{outline:2px solid #7cc4ff;outline-offset:2px}' +
+    '.cqb-se h2{margin:0;padding:12px 18px;font-size:15px;border-bottom:1px solid #2b4257;font-weight:600;flex:none}' +
+    '.cqb-se .sc{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain}' +
+    '.cqb-se .bd{padding:14px 18px 6px}' +
     '.cqb-se label{display:block;margin:10px 0 4px;color:#9fb4c8;font-size:12px}' +
     '.cqb-se input[type=text],.cqb-se select{width:100%;box-sizing:border-box;background:#0b1622;' +
       'color:#dbe7f3;border:1px solid #2b4257;border-radius:5px;padding:7px 9px;font:inherit}' +
@@ -2406,17 +2430,43 @@ function cqbSeCss() {
     '.cqb-se .row span{font-size:12px;color:#c2d4e6}' +
     '.cqb-se .warn{background:#2a2113;border:1px solid #6b5320;border-radius:6px;padding:9px 11px;' +
       'margin:10px 0;font-size:12px;color:#e8d5a8}' +
-    '.cqb-se .ft{padding:13px 18px;border-top:1px solid #2b4257;display:flex;gap:9px;justify-content:flex-end}' +
+    '.cqb-se .ft{flex:none;padding:10px 18px;border-top:1px solid #2b4257;display:flex;flex-wrap:wrap;' +
+      'gap:8px;justify-content:flex-end}' +
     '.cqb-se button{background:#1d3346;border:1px solid #34506b;color:#dbe7f3;border-radius:6px;' +
       'padding:7px 15px;font:inherit;cursor:pointer}' +
     '.cqb-se button.go{background:#1e5b8a;border-color:#2b7cb8}' +
     '.cqb-se button:disabled{opacity:.5;cursor:default}' +
-    '.cqb-se .st{padding:0 18px 14px;color:#9fb4c8;font-size:12px;min-height:16px}' +
-    '.cqb-se .res{padding:0 18px 14px;font-size:12px}' +
+    '.cqb-se button[hidden]{display:none}' +
+    '.cqb-se .st{flex:none;padding:8px 18px;color:#9fb4c8;font-size:12px;min-height:16px;border-top:1px solid #2b4257}' +
+    '.cqb-se .st.busy{color:#dbe7f3}' +
+    '.cqb-se .st.busy::before{content:"";display:inline-block;width:9px;height:9px;margin-right:7px;' +
+      'border:2px solid #7cc4ff;border-right-color:transparent;border-radius:50%;vertical-align:-1px;' +
+      'animation:cqb-se-spin .8s linear infinite}' +
+    '@keyframes cqb-se-spin{to{transform:rotate(360deg)}}' +
+    '@media (prefers-reduced-motion:reduce){.cqb-se .st.busy::before{animation:none;border-right-color:#7cc4ff}}' +
+    '.cqb-se-sr{position:absolute;width:1px;height:1px;margin:-1px;padding:0;border:0;overflow:hidden;' +
+      'clip:rect(0 0 0 0);white-space:nowrap}' +
+    '.cqb-se .res{padding:0 18px 14px;font-size:12px;overflow-wrap:anywhere}' +
     '.cqb-se .res b{color:#fff}' +
+    '.cqb-se .cqb-se-rh{display:flex;gap:10px;align-items:flex-start;justify-content:space-between;margin-top:4px}' +
+    '.cqb-se .cqb-se-rh button{flex:none;padding:4px 10px;font-size:12px}' +
+    '.cqb-se .cqb-se-pidtag{color:#9fb4c8;white-space:nowrap}' +
+    '.cqb-se .cqb-se-copied{color:#9fd9b0;font-size:11px;margin-top:4px}' +
+    '.cqb-se .cqb-se-note{margin-top:6px;color:#e8d5a8}' +
+    '.cqb-se .cqb-se-state{display:inline-block;margin-left:6px;padding:0 6px;border:1px solid #34506b;' +
+      'border-radius:8px;color:#c2d4e6;font-weight:500;letter-spacing:0;text-transform:none;font-size:11px}' +
+    '.cqb-se .cqb-se-state-failed,.cqb-se .cqb-se-state-partial{border-color:#6b5320;color:#e8d5a8}' +
+    '.cqb-se details{margin-top:4px}' +
+    '.cqb-se summary{cursor:pointer;color:#7cc4ff}' +
+    '.cqb-se details[open] summary{margin-bottom:4px}' +
+    '.cqb-se textarea{display:block;width:100%;box-sizing:border-box;min-height:9em;margin-top:6px;background:#0b1622;' +
+      'color:#dbe7f3;border:1px solid #2b4257;border-radius:5px;padding:6px 8px;font:12px/1.4 Consolas,monospace}' +
     '.cqb-se table{width:100%;border-collapse:collapse;margin-top:6px}' +
     '.cqb-se td{padding:2px 0;color:#c2d4e6}' +
-    '.cqb-se td.n{text-align:right;color:#9fb4c8}';
+    '.cqb-se td.n{text-align:right;color:#9fb4c8}' +
+    '@media (max-height:520px),(max-width:520px){.cqb-se h2{padding:8px 12px;font-size:14px}' +
+      '.cqb-se .bd{padding:8px 12px 4px}.cqb-se .res{padding:0 12px 10px}.cqb-se .st{padding:6px 12px}' +
+      '.cqb-se .ft{padding:8px 12px;gap:6px}.cqb-se button{padding:6px 11px}}';
   document.head.appendChild(s);
 }
 
@@ -2464,13 +2514,79 @@ function cqbSeEsc(v) {
  * Added v1.14.0: the blocks used to run together with no headings, which read as one
  * undifferentiated wall and made the Salt Creek storage numbers look like part of the
  * floodplain determination. They are separate questions and now look it. */
-function cqbSeSection(title, body) {
+function cqbSeSection(title, body, state) {
   if (!body || !String(body).trim()) return '';
-  return '<div style="margin-top:12px;padding-top:9px;border-top:1px solid #2b4257">' +
-    '<div style="color:#7cc4ff;font-size:11px;font-weight:600;letter-spacing:.04em;' +
-      'text-transform:uppercase;margin-bottom:2px">' + cqbSeEsc(title) + '</div>' +
+  var word = state && CQB_SE_STATE[state] ? CQB_SE_STATE[state] : '';
+  return '<div class="cqb-se-sec" data-cqb-sec="' + cqbSeEsc(title) + '"' +
+      (word ? ' data-cqb-state="' + cqbSeEsc(word) + '"' : '') +
+      ' style="margin-top:12px;padding-top:9px;border-top:1px solid #2b4257">' +
+    '<div class="cqb-se-sect" style="color:#7cc4ff;font-size:11px;font-weight:600;letter-spacing:.04em;' +
+      'text-transform:uppercase;margin-bottom:2px">' + cqbSeEsc(title) +
+      (word ? ' <span class="cqb-se-state cqb-se-state-' + state + '">' + cqbSeEsc(word) + '</span>' : '') +
+    '</div>' +
     body + '</div>';
 }
+
+/* What kind of answer a section holds (1.16.1). Shown beside each section title and carried
+ * into the copied summary, so that "looked and found nothing", "did not look" and "could not
+ * look" never read alike -- on this panel silence or a missing block reads as an all-clear. */
+var CQB_SE_STATE = {
+  found: 'Found',
+  none: 'No mapped match',
+  notChecked: 'Not checked',
+  failed: 'Lookup failed',
+  partial: 'Partly checked',
+  computed: 'Computed',
+  notComputed: 'Not computed'
+};
+
+/* The state of each flood-review block, from the same reports the renderers read. "partial"
+ * means some lookups answered and some did not, so the block is incomplete; "failed" means
+ * the question it answers could not be settled at all. */
+function cqbSeFloodState(z, fb) {
+  var zoneOk = !!z && !z.failed;
+  var fpOk = !!fb && fb.floodProne && fb.floodProne.ok;
+  var touches = (zoneOk && z.zones && z.zones.length > 0) ||
+    (!!fb && fb.floodProne && (fb.floodProne.ids || []).length > 0);
+  if (touches) {
+    var gaps = !zoneOk || !fb || !fpOk || !fb.bfe || !fb.bfe.ok ||
+      (z && z.inZoneA && z.zoneAAcres == null);
+    return gaps ? 'partial' : 'found';
+  }
+  if (zoneOk && fpOk) return 'none';
+  return zoneOk || fpOk ? 'partial' : 'failed';
+}
+function cqbSeRecordsState(rec) {
+  if (!rec) return 'failed';
+  var n = (rec.bra.items || []).length + (rec.wse.items || []).length;
+  var oks = (rec.bra.ok ? 1 : 0) + (rec.wse.ok ? 1 : 0);
+  if (n) return oks === 2 ? 'found' : 'partial';
+  return oks === 2 ? 'none' : (oks ? 'partial' : 'failed');
+}
+function cqbSeLettersState(l) {
+  if (!l) return 'notChecked';
+  var n = (l.loma.items || []).length + (l.lomr.items || []).length;
+  var oks = (l.loma.ok ? 1 : 0) + (l.lomr.ok ? 1 : 0);
+  if (n) return oks === 2 ? 'found' : 'partial';
+  return oks === 2 ? 'none' : (oks ? 'partial' : 'failed');
+}
+function cqbSeStorageAreaState(sa) {
+  if (!sa || !sa.ok) return 'failed';
+  return sa.inArea ? 'found' : 'none';
+}
+function cqbSeStorageState(r) {
+  if (!r || r.failed) return 'failed';
+  if (r.noStorageArea || r.emptyClip) return 'none';
+  if (r.noBfe || r.tooSmall || r.noElevation) return 'notComputed';
+  return 'computed';
+}
+
+/* Said when the floodplain lookups all answered and nothing touched the parcel. Until 1.16.1
+ * that block was simply left out, which on a copied summary cannot be told apart from a block
+ * that was never checked. */
+var CQB_SE_NO_FLOOD_HTML = '<div style="margin-top:6px;color:#c2d4e6">No FEMA flood zone (A or AE) ' +
+  'and no mapped flood prone area touches this parcel in the county\u2019s layers. That is what ' +
+  'the map shows, not a site survey.</div>';
 
 /* The Zone A block. Empty string when there is nothing regulatory to say
  * (AE-only parcels are covered by the popup's floodplain rows already).
@@ -2594,10 +2710,13 @@ function cqbSeFreeboardHtml(z, fb) {
   zoneFact(fb.zoningCity.rows, 'city');
   zoneFact(fb.zoningCounty.rows, 'county');
   if (!fb.zoningCity.ok || !fb.zoningCounty.ok) facts.push('some zoning layers could not be checked');
+  /* 1.16.1: the map evidence folds away under the rule it supports. The rule -- staff decide
+   * the chapter per application -- stays in view; it is the qualification. */
   bits.push('<div style="margin-top:6px;color:#9fb4c8">Which chapter applies (Existing Urban ' +
-    '27.52, New Growth 27.53, or County Art. 11) is determined per application by staff. ' +
+    '27.52, New Growth 27.53, or County Art. 11) is determined per application by staff.' +
+    '<details class="cqb-se-more"><summary>Map evidence for the chapter</summary>' +
     'Map evidence: ' + facts.join('; ') + '. The chapters are fixed as of ' +
-    CQB_REG.chapterFreezeDate + '.</div>');
+    CQB_REG.chapterFreezeDate + '.</details></div>');
   return bits.join('');
 }
 
@@ -2759,21 +2878,26 @@ function cqbSeStorageHtml(r) {
         ? '<tr><td>Allowable fill at ' + r.fillPercent + '%</td><td class="n"><b>' +
           f(r.allowableCY) + ' CY</b></td></tr>' : '') +
     '</table>' +
-    '<div style="margin-top:8px;color:#9fb4c8">Method: USGS 3DEP bare-earth lidar sampled on ' +
+    /* 1.16.1: the qualification stays beside the numbers; the method and the reasons behind
+     * it fold away. Every sentence is still on the page (and in the copied summary). */
+    '<div style="margin-top:8px;color:#9fb4c8">' +
+    '<b>Preliminary, and a floor rather than a ceiling.</b> The figure above is for this parcel ' +
+    'alone and current ground; verify against an engineering study before relying on it.' +
+    '<details class="cqb-se-more"><summary>Method and limits</summary>' +
+    'Method: USGS 3DEP bare-earth lidar sampled on ' +
     'a ' + r.gridStep + ' ft grid over the parcel inside the storage area (' + r.cells +
     ' cells, ' + r.wetCells + ' below the BFE); the BFE surface is interpolated between the ' +
     'county\u2019s ' + r.bfeLineCount + ' mapped BFE lines. Both are NAVD88.<br>' +
-    '<b>Preliminary, and a floor rather than a ceiling.</b> LMC 27.52.035 assesses the whole ' +
+    'LMC 27.52.035 assesses the whole ' +
     'DEVELOPMENT AREA, which can span multiple parcels in one storage area and shift fill ' +
-    'between them by easement &mdash; the figure above is for this parcel alone. The ordinance ' +
+    'between them by easement. The ordinance ' +
     'baseline is the storage that existed on ' + CQB_REG.storageBaselineDate + ' (Ord. 18893); ' +
     'the lidar here is current ground, so any fill placed since then is already invisible to ' +
     'it and the true remaining allowance may be smaller. "Fill" includes buildings (27.52.020), ' +
     'which this calculation does not count. Two proposal-dependent exemptions ' +
     '(wet-floodproofed single-family, shed or garage; single-family non-substantial ' +
     'improvements) cannot be detected from mapping. It also ignores floodway rules and ' +
-    'compensatory-storage design requirements. Verify against an engineering study before ' +
-    'relying on it.</div>';
+    'compensatory-storage design requirements.</details></div>';
   if (r.warnings.length) {
     html += '<div class="warn">' + r.warnings.map(function (w) {
       return cqbSeEsc(w);
@@ -2859,61 +2983,185 @@ function cqbSeLettersHtml(l) {
 /* The open Site tools dialog's close(), if one is open. Opening the dialog again replaces the
  * open one instead of stacking a second copy (with duplicate element ids) on top of it, and
  * every close path -- the Close button, a backdrop click, Escape, a plugin's api.close(),
- * replacement, and toolbar teardown -- removes the dialog's Escape handler with it. Until
+ * replacement, and toolbar teardown -- removes the dialog's key handler with it. Until
  * 1.16.0 only Escape removed the handler (repair H5). */
 var cqbSeActiveClose = null;
 function cqbSeCloseActive() {
   if (typeof cqbSeActiveClose === 'function') cqbSeActiveClose();
 }
 
+/* What Tab can reach inside root, in document order (1.16.1, U-02). Disabled, hidden and
+ * folded-away controls are left out: a control inside a closed details element is not
+ * reachable, its summary is. Decided from attributes and inline display, not from layout,
+ * so the answer is the same in a test DOM as on the page. */
+function cqbSeFocusables(root) {
+  var sel = 'a[href],button,input,select,textarea,summary,[tabindex]';
+  return Array.prototype.filter.call(root.querySelectorAll(sel), function (el) {
+    if (el.disabled || el.type === 'hidden') return false;
+    var ti = el.getAttribute('tabindex');
+    if (ti !== null && Number(ti) < 0) return false;
+    for (var n = el; n && n !== root; n = n.parentNode) {
+      if (n.nodeType !== 1) continue;
+      if (n.hidden || (n.style && n.style.display === 'none')) return false;
+      if (n !== el && n.tagName === 'DETAILS' && !n.open) {
+        var s = el.tagName === 'SUMMARY' ? el : (el.closest ? el.closest('summary') : null);
+        if (!s || s.parentNode !== n) return false;
+      }
+    }
+    return true;
+  });
+}
+
+/* Somewhere sensible for focus to go back to (1.16.1, U-02): whatever opened the dialog if it
+ * is still on the page and showing, otherwise the Site tools chip. */
+function cqbSeFocusable(el) {
+  if (!el || el === document.body || el === document.documentElement) return false;
+  if (!el.isConnected || typeof el.focus !== 'function') return false;
+  for (var n = el; n && n.nodeType === 1; n = n.parentNode) {
+    if (n.hidden || (n.style && n.style.display === 'none')) return false;
+  }
+  return true;
+}
+function cqbSeReturnFocus(opener) {
+  var t = cqbSeFocusable(opener) ? opener : null;
+  if (!t) {
+    try { t = document.querySelector('[data-cqb-chip="site-tools"]'); } catch (e) { t = null; }
+    if (!cqbSeFocusable(t)) t = null;
+  }
+  if (t) { try { t.focus(); } catch (e) {} }
+}
+
+/* The copied summary (1.16.1). It is the result panel itself, read as text, so what is
+ * copied is what is on screen: folded detail included, the copy controls left out. Section
+ * titles carry their state word and a blank line before them; a table row reads
+ * "label: value"; a link keeps its address. */
+var CQB_SE_GAP = '\u0000gap';
+function cqbSeTextLines(node, out) {
+  function nl() { if (out[out.length - 1] !== '') out.push(''); }
+  function add(t) { out[out.length - 1] += t; }
+  if (!out.length) out.push('');
+  Array.prototype.forEach.call(node.childNodes, function (n) {
+    if (n.nodeType === 3) { add(n.nodeValue.replace(/\s+/g, ' ')); return; }
+    if (n.nodeType !== 1) return;
+    if (n.hasAttribute('data-cqb-nocopy')) return;
+    var tag = n.tagName;
+    if (tag === 'BR') { nl(); return; }
+    if (n.classList && n.classList.contains('cqb-se-sect')) {
+      var sec = n.parentNode;
+      nl(); out.pop(); out.push(CQB_SE_GAP, '');
+      add(String(sec.getAttribute('data-cqb-sec') || n.textContent).toUpperCase() +
+        (sec.getAttribute('data-cqb-state') ? ': ' + sec.getAttribute('data-cqb-state') : ''));
+      nl();
+      return;
+    }
+    if (tag === 'TR') {
+      nl();
+      add(Array.prototype.map.call(n.children, function (c) {
+        return c.textContent.replace(/\s+/g, ' ').trim();
+      }).filter(Boolean).join(': '));
+      nl();
+      return;
+    }
+    if (tag === 'A' && n.getAttribute('href')) {
+      add(n.textContent.replace(/\s+/g, ' ').trim() + ' (' + n.getAttribute('href') + ')');
+      return;
+    }
+    var block = /^(DIV|P|TABLE|TBODY|DETAILS|SUMMARY|UL|OL|LI|H\d|SECTION|LABEL)$/.test(tag);
+    if (block) nl();
+    cqbSeTextLines(n, out);
+    if (tag === 'SUMMARY') add(':');
+    if (block) nl();
+  });
+  return out;
+}
+function cqbSeSummaryText(res, meta) {
+  var lines = [];
+  cqbSeTextLines(res, []).forEach(function (l) {
+    if (l === CQB_SE_GAP) { if (lines.length && lines[lines.length - 1] !== '') lines.push(''); return; }
+    l = l.replace(/\s+/g, ' ').trim();
+    if (l) lines.push(l);
+  });
+  var v = '';
+  try { v = (window.__dvToolkit && window.__dvToolkit.version) || ''; } catch (e) {}
+  var head = [
+    'Development Viewer Toolkit' + (v ? ' ' + v : '') + ' -- Site tools: ' + meta.label,
+    'Requested PID: ' + meta.pid,
+    'Read: ' + meta.when + ' (this computer\'s clock). ' + meta.sources,
+    'Status words: Found = mapped and returned. No mapped match = the lookup answered and ' +
+      'found nothing mapped (not proof of what is on the ground). Not checked = not run. ' +
+      'Lookup failed = no usable answer, so unknown -- not an all-clear. Partly checked = ' +
+      'some lookups failed.',
+    ''
+  ];
+  return head.concat(lines, ['', 'Map facts for review, not a determination.']).join('\n');
+}
+function cqbSeStamp(d) {
+  function p(n) { return (n < 10 ? '0' : '') + n; }
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+    p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
 function cqbSiteToolsDialog() {
   cqbSeCloseActive();
   cqbSeCss();
+  /* U-02 (1.16.1): remember what had focus, so closing can give it back. */
+  var opener = document.activeElement;
   var back = document.createElement('div');
   back.className = 'cqb-se-back';
   var optedIn = false;
   try { optedIn = localStorage.getItem(CQB_SE_OPTIN) === '1'; } catch (e) {}
 
   back.innerHTML =
-    '<div class="cqb-se" role="dialog" aria-modal="true" aria-label="Site tools">' +
+    '<div class="cqb-se" role="dialog" aria-modal="true" aria-label="Site tools" tabindex="-1">' +
       '<h2>Site tools</h2>' +
-      '<div class="bd">' +
-        '<label for="cqb-se-pid">Parcel ID</label>' +
-        '<input type="text" id="cqb-se-pid" placeholder="10 to 14 digits">' +
-        /* Build-time extras (a private module's controls) land here. */
-        '<div id="cqb-se-ext"></div>' +
-        /* The one consent that gates everything leaving the county server:
-         * USGS ground elevations and the FEMA letters lookup. One box, both
-         * services named, nothing sent before it is ticked. */
-        '<div class="warn" id="cqb-se-optin" style="display:none">' +
-          '<b>These are the only things that leave the county server.</b><br>' +
-          'Two external services, both federal, both receiving only the lot outline ' +
-          '(public parcel coordinates, nothing about you):<br><br>' +
-          '<b>1. USGS 3D Elevation Program</b> (elevation.nationalmap.gov) &mdash; ground ' +
-          'heights for the fill-capacity number, because the county publishes no elevation ' +
-          'data. Bare-earth lidar, <b>not a survey</b>: it predates recent grading and fill, ' +
-          'omits structures, and must not be used for finished floor elevations, drainage ' +
-          'design, or floodplain compliance.<br><br>' +
-          '<b>2. FEMA National Flood Hazard Layer</b> (hazards.fema.gov) &mdash; letters of ' +
-          'map change (LOMA/LOMR) on or near the parcel: FEMA determinations that removed ' +
-          'property from, or revised, the mapped floodplain. Letter locations are ' +
-          'approximate; the letter itself governs.' +
-          '<div class="row" style="margin-top:9px"><input type="checkbox" id="cqb-se-ok">' +
-            '<span>Understood, use both services</span></div>' +
+      '<div class="sc" id="cqb-se-sc">' +
+        '<div class="bd">' +
+          '<label for="cqb-se-pid">Parcel ID</label>' +
+          '<input type="text" id="cqb-se-pid" placeholder="10 to 14 digits" autocomplete="off">' +
+          /* Build-time extras (a private module's controls) land here. */
+          '<div id="cqb-se-ext"></div>' +
+          /* The one consent that gates everything leaving the county server:
+           * USGS ground elevations and the FEMA letters lookup. One box, both
+           * services named, nothing sent before it is ticked. */
+          '<div class="warn" id="cqb-se-optin" style="display:none">' +
+            '<b>These are the only things that leave the county server.</b><br>' +
+            'Two external services, both federal, both receiving only the lot outline ' +
+            '(public parcel coordinates, nothing about you):<br><br>' +
+            '<b>1. USGS 3D Elevation Program</b> (elevation.nationalmap.gov) &mdash; ground ' +
+            'heights for the fill-capacity number, because the county publishes no elevation ' +
+            'data. Bare-earth lidar, <b>not a survey</b>: it predates recent grading and fill, ' +
+            'omits structures, and must not be used for finished floor elevations, drainage ' +
+            'design, or floodplain compliance.<br><br>' +
+            '<b>2. FEMA National Flood Hazard Layer</b> (hazards.fema.gov) &mdash; letters of ' +
+            'map change (LOMA/LOMR) on or near the parcel: FEMA determinations that removed ' +
+            'property from, or revised, the mapped floodplain. Letter locations are ' +
+            'approximate; the letter itself governs.' +
+            '<div class="row" style="margin-top:9px"><input type="checkbox" id="cqb-se-ok">' +
+              '<span>Understood, use both services</span></div>' +
+          '</div>' +
         '</div>' +
+        '<div class="res" id="cqb-se-res"></div>' +
       '</div>' +
+      /* The status line stays in view below the scrolling part. It is not itself a live
+       * region -- it changes at every step -- the hidden one after it carries the few
+       * transitions worth announcing (U-01/busy, 1.16.1). */
       '<div class="st" id="cqb-se-st"></div>' +
-      '<div class="res" id="cqb-se-res"></div>' +
+      '<div class="cqb-se-sr" id="cqb-se-live" role="status" aria-live="polite" aria-atomic="true"></div>' +
       '<div class="ft">' +
-        '<button id="cqb-se-x">Close</button>' +
-        '<button class="go" id="cqb-se-review">Flood review</button>' +
-        '<button class="go" id="cqb-se-fill">Fill capacity</button>' +
+        '<button type="button" id="cqb-se-x">Close</button>' +
+        '<button type="button" id="cqb-se-stop" hidden>Stop</button>' +
+        '<button type="button" class="go" id="cqb-se-review">Flood review</button>' +
+        '<button type="button" class="go" id="cqb-se-fill">Fill capacity</button>' +
       '</div>' +
     '</div>';
   document.body.appendChild(back);
 
   var $ = function (id) { return back.querySelector('#' + id); };
-  $('cqb-se-pid').value = cqbSeGuessPid();
+  var dlg = back.querySelector('.cqb-se');
+  var foot = back.querySelector('.ft');
+  var pidIn = $('cqb-se-pid'), st = $('cqb-se-st'), res = $('cqb-se-res'), live = $('cqb-se-live');
+  var stopBtn = $('cqb-se-stop'), reviewBtn = $('cqb-se-review'), fillBtn = $('cqb-se-fill');
+  pidIn.value = cqbSeGuessPid();
   if (optedIn) { $('cqb-se-ok').checked = true; }
 
   /* Shown whenever something on this dialog is about to reach outside the
@@ -2925,34 +3173,214 @@ function cqbSiteToolsDialog() {
     if (this.checked) $('cqb-se-optin').style.display = 'none';
   });
 
-  function esc(e) { if (e.key === 'Escape') close(); }
-  function close() {
-    document.removeEventListener('keydown', esc);
-    if (cqbSeActiveClose === close) cqbSeActiveClose = null;
-    if (back.parentNode) back.remove();
+  /* ---- One request at a time (1.16.1, U-01) ------------------------------
+   * Flood review and Fill capacity used to run side by side, each writing the shared status
+   * and result panes whenever its replies happened to land: an earlier, slower request could
+   * replace a later one's answer (even for a different parcel) under a status of "Done.".
+   * Now there is one active request. While it runs both buttons are disabled and Stop is
+   * offered; the request carries the PID it was started for, and only the active request may
+   * touch the status, the results, the busy state or the copied summary. Stop, Close, a
+   * newer request and toolbar teardown all retire it. A retired request's replies are
+   * ignored when they land, whatever order they land in -- so correctness never depends on
+   * the network calls actually stopping. They usually do stop early: a retired request's
+   * next progress report throws (see progress()), which ends its promise chain before it
+   * sends anything further. */
+  var closed = false, seq = 0, active = null, shown = null, said = '';
+  function status(t) { st.textContent = t; }
+  /* Announce a transition through the polite live region. A repeat of the same words gets a
+   * counter, so it is announced again rather than swallowed as "no change". */
+  function announce(t) {
+    if (closed) return;
+    if (t === said.replace(/ \(\d+\)$/, '')) {
+      var m = said.match(/ \((\d+)\)$/);
+      t = t + ' (' + ((m ? +m[1] : 1) + 1) + ')';
+    }
+    said = t;
+    live.textContent = t;
   }
-  cqbSeActiveClose = close;
-  $('cqb-se-x').addEventListener('click', close);
-  back.addEventListener('click', function (e) { if (e.target === back) close(); });
-  document.addEventListener('keydown', esc);
+  function pluginBusy() {
+    return Array.prototype.some.call(foot.querySelectorAll('button'), function (b) {
+      return !b.hasAttribute('data-cqb-core') && b.disabled;
+    });
+  }
+  function setBusy(req) {
+    var on = !!req;
+    if (st.classList) st.classList.toggle('busy', on);
+    if (on) res.setAttribute('aria-busy', 'true'); else res.removeAttribute('aria-busy');
+    reviewBtn.disabled = on; fillBtn.disabled = on;
+    stopBtn.hidden = !on;
+  }
+  function isCurrent(req) { return !closed && active === req; }
+  function retire(why) {
+    var req = active;
+    if (!req) return null;
+    active = null;
+    req.retired = why;
+    setBusy(null);
+    return req;
+  }
+  function begin(kind, label, pid, fromEl) {
+    var req = { id: ++seq, kind: kind, label: label, pid: pid, at: new Date() };
+    active = req;
+    shown = null;
+    res.innerHTML = '';
+    try { $('cqb-se-sc').scrollTop = 0; } catch (e) {}
+    setBusy(req);
+    status(label + ' for PID ' + pid + ': reading the parcel...');
+    announce(label + ' started for parcel ' + pid + '.');
+    /* The button that started this is now disabled (or, for Retry, gone); give focus to Stop
+     * rather than lose it to the page. */
+    var a = document.activeElement;
+    if ((fromEl && a === fromEl) || !a || a === document.body || !dlg.contains(a)) {
+      try { stopBtn.focus(); } catch (e) {}
+    }
+    return req;
+  }
+  /* A request's onStatus. Writes only while the request is active; once it is retired the
+   * next report throws, so the work stops at its next step instead of running on unseen. */
+  function progress(req) {
+    return function (t) {
+      if (!isCurrent(req)) {
+        var e = new Error('This request was stopped.');
+        e.cqbKind = 'cancelled';
+        throw e;
+      }
+      status(req.label + ' for PID ' + req.pid + ': ' + String(t).replace(/^(\w)/, function (c) { return c.toLowerCase(); }));
+    };
+  }
+  /* Ends the active request. Returns false -- and touches nothing -- for any other. */
+  function settle(req) {
+    if (!isCurrent(req)) return false;
+    active = null;
+    setBusy(null);
+    var a = document.activeElement;
+    if (a === stopBtn || a === document.body || !a || !dlg.contains(a)) {
+      try { (req.kind === 'fill' ? fillBtn : reviewBtn).focus(); } catch (e) {}
+    }
+    return true;
+  }
+
+  /* The heading of a finished result: whose answer this is, and Copy summary. */
+  function headHtml(req, pid, address) {
+    return '<div class="cqb-se-rh"><div><b>' + cqbSeEsc(address || ('PID ' + pid)) + '</b>' +
+      (address ? ' <span class="cqb-se-pidtag">PID ' + cqbSeEsc(pid) + '</span>' : '') + '</div>' +
+      '<button type="button" class="cqb-se-copy" id="cqb-se-copy" data-cqb-nocopy>Copy summary</button></div>' +
+      '<div class="cqb-se-note" id="cqb-se-note" data-cqb-nocopy style="display:none"></div>';
+  }
+  /* The box can be edited while a request runs or after it finished; say whose answer is
+   * on screen whenever the box no longer matches it. */
+  function syncNote() {
+    var n = $('cqb-se-note');
+    if (!n || !shown) return;
+    var now = cqbPidNorm(pidIn.value);
+    if (now && now !== shown.pid) {
+      n.textContent = 'These results are for PID ' + shown.pid + '. The Parcel ID box now says ' +
+        now + '; press a button to check that parcel.';
+      n.style.display = 'block';
+    } else {
+      n.textContent = '';
+      n.style.display = 'none';
+    }
+  }
+  pidIn.addEventListener('input', syncNote);
+
+  function sourcesFor(req) {
+    if (req.kind === 'fill') {
+      return 'Sources: Salt Creek storage areas and base flood elevation lines from the county GIS ' +
+        '(gis.lincoln.ne.gov), as published when read; ground heights from USGS 3DEP bare-earth ' +
+        'lidar (elevation.nationalmap.gov), whose collection dates vary by area.';
+    }
+    return 'Sources: county GIS layers (gis.lincoln.ne.gov) as published when read -- FEMA flood ' +
+      'zones as mapped in the county\u2019s floodplain layer, flood prone areas, base flood ' +
+      'elevation lines, 2004 city limits, zoning, recorded flood documents and Salt Creek ' +
+      'storage areas' + (req.fema ? '; FEMA letters of map change from FEMA\u2019s National ' +
+      'Flood Hazard Layer (hazards.fema.gov).' : '. FEMA letters were not checked.');
+  }
+
+  function wireCopy(req) {
+    var btn = $('cqb-se-copy');
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+      if (shown !== req) return;
+      var text = cqbSeSummaryText(res, { label: req.label, pid: req.pid,
+        when: cqbSeStamp(req.at), sources: sourcesFor(req) });
+      copyText(text, req);
+    });
+  }
+  function copied(req, ok, text) {
+    if (closed || shown !== req) return;
+    var old = $('cqb-se-copied');
+    if (old) old.parentNode.removeChild(old);
+    var box = document.createElement('div');
+    box.id = 'cqb-se-copied';
+    box.setAttribute('data-cqb-nocopy', '');
+    if (ok) {
+      box.className = 'cqb-se-copied';
+      box.textContent = 'Summary copied to the clipboard.';
+      $('cqb-se-note').parentNode.insertBefore(box, $('cqb-se-note'));
+      announce('Summary copied to the clipboard.');
+      return;
+    }
+    /* The browser refused the clipboard (or has none): leave the text where it can be copied
+     * by hand, selected, with focus on it. */
+    box.innerHTML = '<label for="cqb-se-mtext">The browser did not allow copying. The summary is ' +
+      'selected in the box below: press Ctrl+C (Cmd+C on a Mac) to copy it.</label>' +
+      '<textarea id="cqb-se-mtext" readonly rows="8"></textarea>';
+    $('cqb-se-note').parentNode.insertBefore(box, $('cqb-se-note'));
+    var ta = $('cqb-se-mtext');
+    ta.value = text;
+    try { ta.focus(); ta.select(); } catch (e) {}
+    announce('Copying was blocked. The summary is selected in a text box; press Control C to copy it.');
+  }
+  function copyText(text, req) {
+    var cb = null;
+    try { cb = window.navigator && window.navigator.clipboard; } catch (e) { cb = null; }
+    if (cb && typeof cb.writeText === 'function') {
+      var p;
+      try { p = cb.writeText(text); } catch (e) { p = null; }
+      if (p && typeof p.then === 'function') {
+        p.then(function () { copied(req, true, text); }, function () { copied(req, false, text); });
+        return;
+      }
+    }
+    copied(req, false, text);
+  }
+
+  function showFailure(req, e) {
+    if (!settle(req)) return;
+    shown = null;
+    status(req.label + ' for PID ' + req.pid + ' could not be completed.');
+    res.innerHTML = '<div class="warn">' + cqbSeEsc(String((e && e.message) || e)) + '</div>' +
+      '<button type="button" id="cqb-se-retry">Retry ' + cqbSeEsc(req.label.toLowerCase()) +
+      ' for PID ' + cqbSeEsc(req.pid) + '</button>';
+    $('cqb-se-retry').addEventListener('click', function () {
+      /* the PID this request was for, not whatever the box says now */
+      if (req.kind === 'fill') runFill(req.pid, this); else runReview(req.pid, this);
+    });
+    announce(req.label + ' for parcel ' + req.pid + ' could not be completed. Retry is available.');
+  }
+  function showResult(req, html) {
+    if (!settle(req)) return;
+    shown = req;
+    status('Done: ' + req.label.toLowerCase() + ' for PID ' + req.pid + '.');
+    res.innerHTML = html;
+    wireCopy(req);
+    syncNote();
+    var n = res.querySelectorAll('.cqb-se-sec').length;
+    announce(req.label + ' for parcel ' + req.pid + ' is done: ' + n + ' section' +
+      (n === 1 ? '' : 's') + ' below.');
+  }
 
   /* ---- Shared plumbing for both buttons -------------------------------- */
 
-  function readPid(st) {
-    var pid = cqbPidNorm($('cqb-se-pid').value);
+  function readPid() {
+    var pid = cqbPidNorm(pidIn.value);
     if (!cqbPidKind(pid)) {
-      st.textContent = 'Enter a parcel ID first.';
+      status('Enter a parcel ID first.');
+      announce('Enter a parcel ID first.');
       return null;
     }
     return pid;
-  }
-
-  function fail(btn, st, res) {
-    return function (e) {
-      btn.disabled = false;
-      st.textContent = '';
-      res.innerHTML = '<div class="warn">' + cqbSeEsc(String((e && e.message) || e)) + '</div>';
-    };
   }
 
   /* ---- Flood review (county data, no consent needed) ---------------------
@@ -2962,74 +3390,134 @@ function cqbSiteToolsDialog() {
    * consent to -- the elevation sampling to find out. Nothing this button
    * does leaves the county server unless the box is ticked, and then only for
    * the FEMA letters, so it runs either way and says which is which. */
-  $('cqb-se-review').addEventListener('click', function () {
-    var st = $('cqb-se-st'), res = $('cqb-se-res');
-    res.innerHTML = '';
-    var pid = readPid(st);
-    if (!pid) return;
-
+  function runReview(pid, fromEl) {
     var wantFema = $('cqb-se-ok').checked;
     if (wantFema) { try { localStorage.setItem(CQB_SE_OPTIN, '1'); } catch (e) {} }
-
-    var btn = this;
-    btn.disabled = true;
-    st.textContent = 'Reading the parcel...';
-
-    cqbFloodReview(pid, { includeFema: wantFema,
-                          onStatus: function (t) { st.textContent = t; } }).then(function (rv) {
-      btn.disabled = false;
-      st.textContent = 'Done.';
-      var head = '<b>' + cqbSeEsc(rv.address || ('PID ' + rv.pid)) + '</b>' +
-        cqbSeSubjectHtml(rv.subject, rv.pid, rv.address);
-      res.innerHTML = head +
-        cqbSeSection('Floodplain and required floor elevation',
-          cqbSeZoneHtml(rv.zone) + cqbSeFreeboardHtml(rv.zone, rv.freeboard)) +
-        cqbSeSection('Recorded flood documents', cqbSeRecordsHtml(rv.records)) +
-        cqbSeSection('FEMA letters of map change', cqbSeLettersHtml(rv.letters)) +
-        cqbSeSection('Salt Creek flood storage', cqbSeStorageAreaHtml(rv.storageArea));
-    }).catch(fail(btn, st, res));
-  });
+    var req = begin('review', 'Flood review', pid, fromEl);
+    req.fema = wantFema;
+    var p;
+    try {
+      p = cqbFloodReview(pid, { includeFema: wantFema, onStatus: progress(req) });
+    } catch (e) { p = Promise.reject(e); }
+    p.then(function (rv) {
+      if (!isCurrent(req)) return;
+      var head = headHtml(req, rv.pid, rv.address) + cqbSeSubjectHtml(rv.subject, rv.pid, rv.address);
+      var floodBody = cqbSeZoneHtml(rv.zone) + cqbSeFreeboardHtml(rv.zone, rv.freeboard);
+      var floodState = cqbSeFloodState(rv.zone, rv.freeboard);
+      if (!floodBody.trim() && floodState === 'none') floodBody = CQB_SE_NO_FLOOD_HTML;
+      showResult(req, head +
+        cqbSeSection('Floodplain and required floor elevation', floodBody, floodState) +
+        cqbSeSection('Recorded flood documents', cqbSeRecordsHtml(rv.records), cqbSeRecordsState(rv.records)) +
+        cqbSeSection('FEMA letters of map change', cqbSeLettersHtml(rv.letters), cqbSeLettersState(rv.letters)) +
+        cqbSeSection('Salt Creek flood storage', cqbSeStorageAreaHtml(rv.storageArea),
+          cqbSeStorageAreaState(rv.storageArea)));
+    }).then(null, function (e) { showFailure(req, e); });
+  }
 
   /* ---- Fill capacity (Salt Creek flood storage) --------------------------
    * It only means anything inside one of the county's mapped Salt Creek
    * storage areas, so the honest outcomes are "here is the number" and "this
    * parcel is not in one" -- never a quiet zero. This half keeps the consent
    * gate, because this is the half that samples ground elevations. */
-  $('cqb-se-fill').addEventListener('click', function () {
-    var st = $('cqb-se-st'), res = $('cqb-se-res');
-    res.innerHTML = '';
-    var pid = readPid(st);
-    if (!pid) return;
+  function runFill(pid, fromEl) {
     if (!$('cqb-se-ok').checked) {
       needElevation(true);
-      st.textContent = 'Fill capacity needs ground elevations. Tick the box to confirm.';
+      status('Fill capacity needs ground elevations. Tick the box to confirm.');
+      announce('Fill capacity needs ground elevations. Tick the box above to confirm.');
       return;
     }
     try { localStorage.setItem(CQB_SE_OPTIN, '1'); } catch (e) {}
-
-    var btn = this;
-    btn.disabled = true;
-    st.textContent = 'Reading the parcel...';
-
+    var req = begin('fill', 'Fill capacity', pid, fromEl);
+    var say = progress(req);
     /* An IOLL id has to become its land parcel first: the calculation needs a
      * polygon and the improvement is a point. */
-    cqbReviewSubject(pid, {}).then(function (subj) {
+    var p;
+    try { p = cqbReviewSubject(pid, {}); } catch (e) { p = Promise.reject(e); }
+    p.then(function (subj) {
       return cqbStorageCalc(subj.parcel.attributes.PARCELID, {
         parcelFeature: subj.parcel,
-        onStatus: function (t) { st.textContent = t; }
+        onStatus: say
       }).then(function (r) { return { r: r, subj: subj }; });
     }).then(function (o) {
-      btn.disabled = false;
-      st.textContent = 'Done.';
+      if (!isCurrent(req)) return;
       var rv = o.r;
-      var head = '<b>' + cqbSeEsc(rv.address || ('PID ' + rv.pid)) + '</b>' +
+      var head = headHtml(req, rv.pid, rv.address) +
         cqbSeSubjectHtml(o.subj.ioll ? { kind: 'ioll', ioll: o.subj.ioll } : null,
                          rv.pid, rv.address);
-      res.innerHTML = head +
+      showResult(req, head +
         cqbSeSection('Salt Creek flood storage and allowable fill',
-          cqbSeStorageHtml(rv));
-    }).catch(fail(btn, st, res));
+          cqbSeStorageHtml(rv), cqbSeStorageState(rv)));
+    }).then(null, function (e) { showFailure(req, e); });
+  }
+
+  function guard() {
+    if (active) return false;  /* the buttons are disabled; a scripted click changes nothing */
+    if (pluginBusy()) {
+      status('Another tool in this dialog is still working. Wait for it to finish, or close the dialog.');
+      announce('Another tool in this dialog is still working.');
+      return false;
+    }
+    return true;
+  }
+  reviewBtn.setAttribute('data-cqb-core', '');
+  fillBtn.setAttribute('data-cqb-core', '');
+  stopBtn.setAttribute('data-cqb-core', '');
+  $('cqb-se-x').setAttribute('data-cqb-core', '');
+  reviewBtn.addEventListener('click', function () {
+    if (!guard()) return;
+    var pid = readPid();
+    if (pid) runReview(pid, this);
   });
+  fillBtn.addEventListener('click', function () {
+    if (!guard()) return;
+    var pid = readPid();
+    if (pid) runFill(pid, this);
+  });
+  stopBtn.addEventListener('click', function () {
+    var req = retire('stopped');
+    if (!req) return;
+    status('Stopped: ' + req.label.toLowerCase() + ' for PID ' + req.pid + '. Nothing from it will be shown.');
+    announce('Stopped. The ' + req.label.toLowerCase() + ' for parcel ' + req.pid + ' will not be shown.');
+    try { (req.kind === 'fill' ? fillBtn : reviewBtn).focus(); } catch (e) {}
+  });
+  /* A plugin's own button (bubbling here after its handler ran) takes the panes over: retire
+   * whatever core request is still running so its late reply cannot overwrite the plugin's.
+   * The plugin's status text is left as the plugin wrote it. */
+  foot.addEventListener('click', function (ev) {
+    var b = ev.target && ev.target.closest ? ev.target.closest('button') : null;
+    if (b && !b.hasAttribute('data-cqb-core') && active) { retire('plugin'); shown = null; }
+  });
+
+  /* ---- Closing, Escape and Tab (U-02, 1.16.1) ----------------------------
+   * Focus moves into the dialog when it opens and returns to whatever opened it (or the Site
+   * tools chip, if that is gone) on every close path. Tab and Shift+Tab cycle inside the
+   * dialog; the page behind it is inert while it is open. */
+  function onKey(e) {
+    if (e.key === 'Escape') { close(); return; }
+    if (e.key !== 'Tab') return;
+    var f = cqbSeFocusables(dlg);
+    var a = document.activeElement;
+    if (!f.length) { e.preventDefault(); try { dlg.focus(); } catch (x) {} return; }
+    var first = f[0], last = f[f.length - 1];
+    if (!dlg.contains(a)) { e.preventDefault(); (e.shiftKey ? last : first).focus(); return; }
+    if (e.shiftKey && (a === first || a === dlg)) { e.preventDefault(); last.focus(); return; }
+    if (!e.shiftKey && a === last) { e.preventDefault(); first.focus(); }
+  }
+  function close() {
+    if (closed) return;
+    retire('closed');
+    closed = true;
+    document.removeEventListener('keydown', onKey);
+    if (cqbSeActiveClose === close) cqbSeActiveClose = null;
+    var hadFocus = dlg.contains(document.activeElement) || document.activeElement === document.body ||
+      !document.activeElement;
+    if (back.parentNode) back.remove();
+    if (hadFocus) cqbSeReturnFocus(opener);
+  }
+  cqbSeActiveClose = close;
+  $('cqb-se-x').addEventListener('click', close);
+  back.addEventListener('click', function (e) { if (e.target === back) close(); });
+  document.addEventListener('keydown', onKey);
 
   /* Let build-time extras add their controls and buttons. A broken extra must
    * not take the core dialog down with it. */
@@ -3037,12 +3525,12 @@ function cqbSiteToolsDialog() {
     root: back,
     $: $,
     ext: $('cqb-se-ext'),
-    foot: back.querySelector('.ft'),
-    statusEl: $('cqb-se-st'),
-    resultEl: $('cqb-se-res'),
+    foot: foot,
+    statusEl: st,
+    resultEl: res,
     needElevation: needElevation,
     optKey: CQB_SE_OPTIN,
-    getPid: function () { return cqbPidNorm($('cqb-se-pid').value); },
+    getPid: function () { return cqbPidNorm(pidIn.value); },
     close: close
   };
   CQB_SITE_PLUGINS.forEach(function (p) {
@@ -3050,6 +3538,7 @@ function cqbSiteToolsDialog() {
       if (typeof console !== 'undefined' && console.warn) console.warn('site-tools plugin failed', e);
     }
   });
+  try { pidIn.focus(); } catch (e) {}
 }
 
   function chip(label, title) {
@@ -3210,6 +3699,8 @@ function cqbSiteToolsDialog() {
 
   /* Settings: reconfigure which layers appear as chips */
   var se = chip('Site tools', CQB_SITE_TOOLS_TIP);
+  /* where focus returns when the dialog closes and whatever opened it is gone (1.16.1, U-02) */
+  se.setAttribute('data-cqb-chip', 'site-tools');
   se.addEventListener('click', function () { try { cqbSiteToolsDialog(); } catch (e) { toast('Site tools failed to open: ' + (e && e.message ? e.message : e)); } });
   bar.appendChild(se);
 
