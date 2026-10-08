@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.16.1
+// @version      1.16.2
 // @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools flood review (FEMA Zone A, freeboard facts, recorded flood documents, FEMA letters of map change) and a separate Salt Creek flood-storage and allowable-fill calculator, mobile-home and leased-land parcel lookup, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
@@ -38,7 +38,7 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.16.1 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.16.2 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -56,7 +56,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.16.1', ready: false };
+  window.__dvToolkit = { version: '1.16.2', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -2028,20 +2028,30 @@ function cqbStorageCalc(pid, opts, deps) {
  * unchecked instead of taking the others down or -- worse -- reading as a
  * clean answer. */
 
-/* The one place a parcel is fetched by PID. Throws (message must keep the
- * words 'not found' -- the UI and tests rely on it) when the parcel does not
- * exist or carries no polygon. The empty-rings case is real: a PARCELID can
- * resolve to a record whose geometry has rings: []. */
+/* The one place a parcel is fetched by PID. Rejects with e.cqbKind 'absent' (message must
+ * keep the words 'not found' -- the UI and tests rely on it) when the lookup answered and the
+ * parcel does not exist or carries no polygon. The empty-rings case is real: a PARCELID can
+ * resolve to a record whose geometry has rings: [].
+ * 1.16.2: only a reply that carries a features list can say "no such parcel" (the rule of
+ * correction R-01). A reply without one, and a lookup that failed outright, reject as a
+ * failed lookup that keeps its kind and says it is not a "not found" answer, so Site tools
+ * offers Retry for those and only for those. */
 function cqbParcelByPid(pid, outFields, getJson) {
   var g = getJson || cqbGetJson;
+  var what = 'The lookup for parcel ' + pid;
   return g(CQB_SITE_SOURCES[0].url + '/query?' + cqbQs({
     where: "PARCELID='" + String(pid).replace(/'/g, "''") + "'",
     outFields: outFields || 'PARCELID,SITEADDRESS,GIS_AREA',
     returnGeometry: 'true', outSR: CQB_SP_FT, f: 'json'
-  })).then(function (j) {
-    var f = (j.features || [])[0];
+  })).then(null, function (e) {
+    throw cqbLookupFailure(what, e);
+  }).then(function (j) {
+    if (!j || typeof j !== 'object' || !Array.isArray(j.features)) {
+      throw cqbLookupFailure(what, cqbKindError('malformed', 'the reply had no features list'));
+    }
+    var f = j.features[0];
     if (!f || !f.geometry || !f.geometry.rings || !f.geometry.rings.length) {
-      throw new Error('Parcel ' + pid + ' not found, or it has no mapped boundary.');
+      throw cqbKindError('absent', 'Parcel ' + pid + ' not found, or it has no mapped boundary.');
     }
     return f;
   });
@@ -2711,11 +2721,13 @@ function cqbSeFreeboardHtml(z, fb) {
   zoneFact(fb.zoningCounty.rows, 'county');
   if (!fb.zoningCity.ok || !fb.zoningCounty.ok) facts.push('some zoning layers could not be checked');
   /* 1.16.1: the map evidence folds away under the rule it supports. The rule -- staff decide
-   * the chapter per application -- stays in view; it is the qualification. */
+   * the chapter per application -- stays in view; it is the qualification. 1.16.2: the folded
+   * text no longer repeats "Map evidence" after its own heading (it read twice when copied). */
+  var evidence = facts.join('; ');
   bits.push('<div style="margin-top:6px;color:#9fb4c8">Which chapter applies (Existing Urban ' +
     '27.52, New Growth 27.53, or County Art. 11) is determined per application by staff.' +
     '<details class="cqb-se-more"><summary>Map evidence for the chapter</summary>' +
-    'Map evidence: ' + facts.join('; ') + '. The chapters are fixed as of ' +
+    evidence.charAt(0).toUpperCase() + evidence.slice(1) + '. The chapters are fixed as of ' +
     CQB_REG.chapterFreezeDate + '.</details></div>');
   return bits.join('');
 }
@@ -3101,6 +3113,16 @@ function cqbSeStamp(d) {
     p(d.getHours()) + ':' + p(d.getMinutes());
 }
 
+/* True when a request ended because there is nothing to review behind the ID -- the county
+ * has no such parcel or improvement, the improvement has no mapped point, or its point lies
+ * in no tax parcel (1.16.2). These are answers: retrying cannot change them. Decided by the
+ * error's kind alone, never by searching its message (see cqbKindError): a failed lookup
+ * whose message happens to say "not found" stays a failure with Retry. */
+function cqbSeNoSubject(e) {
+  var k = e && e.cqbKind;
+  return k === 'absent' || k === 'outside' || k === 'nolocation';
+}
+
 function cqbSiteToolsDialog() {
   cqbSeCloseActive();
   cqbSeCss();
@@ -3349,6 +3371,15 @@ function cqbSiteToolsDialog() {
   function showFailure(req, e) {
     if (!settle(req)) return;
     shown = null;
+    /* 1.16.2: an ID with nothing behind it to review is an answer, not a failed lookup. It
+     * keeps its own words, is not called a failure, and offers no Retry. */
+    if (cqbSeNoSubject(e)) {
+      var why = String((e && e.message) || e);
+      status(req.label + ' for PID ' + req.pid + ': no parcel to review.');
+      res.innerHTML = '<div class="warn" data-cqb-nosubject>' + cqbSeEsc(why) + '</div>';
+      announce(req.label + ' for parcel ' + req.pid + ': no parcel to review. ' + why);
+      return;
+    }
     status(req.label + ' for PID ' + req.pid + ' could not be completed.');
     res.innerHTML = '<div class="warn">' + cqbSeEsc(String((e && e.message) || e)) + '</div>' +
       '<button type="button" id="cqb-se-retry">Retry ' + cqbSeEsc(req.label.toLowerCase()) +
