@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.17.0
-// @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools flood review (FEMA Zone A, freeboard facts, recorded flood documents, FEMA letters of map change) and a separate Salt Creek flood-storage and allowable-fill calculator, mapped building footprint coverage, mobile-home and leased-land parcel lookup, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
+// @version      1.16.3
+// @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools flood review (FEMA Zone A, freeboard facts, recorded flood documents, FEMA letters of map change) and a separate Salt Creek flood-storage and allowable-fill calculator, mobile-home and leased-land parcel lookup, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
 // @updateURL    https://raw.githubusercontent.com/McMittens1/dev-viewer-toolkit/main/DV_Toolkit.user.js
@@ -38,7 +38,7 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.17.0 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.16.3 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -56,7 +56,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.17.0', ready: false };
+  window.__dvToolkit = { version: '1.16.3', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -1199,11 +1199,62 @@ function cqbFailReason(e) {
  * the failure's kind, so a caller can offer a retry, and its message says plainly that this
  * is not a "not found" answer -- the Site tools dialog shows messages as they are. */
 function cqbLookupFailure(what, e) {
+  var reason = cqbFailReason(e) + (e && e.cqbDetail ? '; ' + e.cqbDetail : '');
   var err = cqbKindError((e && e.cqbKind) || 'network',
-    what + ' could not be completed: ' + cqbFailReason(e) +
+    what + ' could not be completed: ' + reason +
     '. This is not a "not found" answer; try again.');
-  err.cqbReason = cqbFailReason(e);
+  err.cqbReason = reason;
   return err;
+}
+
+/* A reply that answered but cannot be used (1.16.3). Tagged 'malformed', with a short detail
+ * that cqbLookupFailure adds to its reason, e.g. "...sent an unreadable reply; it had no
+ * features list". */
+function cqbReplyError(detail) {
+  var e = cqbKindError('malformed', 'the county server sent an unreadable reply; ' + detail);
+  e.cqbDetail = detail;
+  return e;
+}
+
+/* A readable polygon (1.16.3; the rule the 1.17.0 coverage reader introduced): a geometry
+ * object whose rings are a non-empty list, each ring at least four points of two finite
+ * numbers. */
+function cqbRingOk(r) {
+  if (!Array.isArray(r) || r.length < 4) return false;
+  for (var i = 0; i < r.length; i++) {
+    var p = r[i];
+    if (!Array.isArray(p) || p.length < 2 || typeof p[0] !== 'number' || typeof p[1] !== 'number' ||
+        !isFinite(p[0]) || !isFinite(p[1])) return false;
+  }
+  return true;
+}
+function cqbPolygonOk(g) {
+  return !!g && typeof g === 'object' && !Array.isArray(g) && Array.isArray(g.rings) &&
+    g.rings.length > 0 && g.rings.every(cqbRingOk);
+}
+
+/* The records of a layer query's reply, checked before anything is concluded from them
+ * (1.16.3, coordinator review C-NEXT-03). A reply that answered must carry a features list
+ * and no ArcGIS error, and every entry in it must be a feature object with an attributes
+ * object -- every query read this way names its outFields, so a real record always has one.
+ * Anything else throws (cqbReplyError), so the caller reports that check as not completed.
+ * Until 1.16.3 the flood review read (j.features || []): an HTTP 200 {} came out as "nothing
+ * mapped", and an entry such as {}, null, [] or {"error": ...} as a record with no values.
+ * Only an empty list in a reply that has one means "none". Metadata, id lists and
+ * geometry-service results have other shapes and are checked where they are read, not here. */
+function cqbFeatures(j) {
+  if (j && typeof j === 'object' && j.error) throw cqbReplyError('it reported an error');
+  if (!j || typeof j !== 'object' || Array.isArray(j) || !Array.isArray(j.features)) {
+    throw cqbReplyError('it had no features list');
+  }
+  for (var i = 0; i < j.features.length; i++) {
+    var f = j.features[i];
+    if (!f || typeof f !== 'object' || Array.isArray(f) || !f.attributes ||
+        typeof f.attributes !== 'object' || Array.isArray(f.attributes)) {
+      throw cqbReplyError('it held an entry that is not a feature record');
+    }
+  }
+  return j.features;
 }
 
 /* Query one layer for whatever intersects the site envelope, in State Plane feet. */
@@ -1790,17 +1841,18 @@ function cqbStorageAreaProbe(parcelGeom, deps) {
     spatialRel: 'esriSpatialRelIntersects', outFields: 'SA_NUMBER',
     returnGeometry: 'false', f: 'json'
   }).then(function (j) {
-    var fs = j.features || [];
+    var fs = cqbFeatures(j);
     if (!fs.length) {
       return { ok: true, inArea: false, areas: 0, saNumber: null, saLabel: null };
     }
-    var n = fs[0].attributes ? fs[0].attributes.SA_NUMBER : null;
+    var n = fs[0].attributes.SA_NUMBER;
     var num = cqbBlank(n) ? null : n;
     return { ok: true, inArea: true, areas: fs.length, saNumber: num,
              saLabel: num === null ? null : cqbSaLabel(num) };
-  }, function () {
+  }).then(null, function () {
     /* Degrade the same way every other independent lookup in the review does:
-     * say the check did not run, never imply the parcel is outside. */
+     * say the check did not run, never imply the parcel is outside. Since 1.16.3 an
+     * unusable reply (cqbFeatures) lands here too, instead of reading as "outside". */
     return { ok: false, inArea: false, areas: 0, saNumber: null, saLabel: null };
   });
 }
@@ -1876,12 +1928,19 @@ function cqbStorageCalc(pid, opts, deps) {
       geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT, outSR: CQB_SP_FT,
       spatialRel: 'esriSpatialRelIntersects', outFields: 'SA_NUMBER,FILL_PRCNT',
       returnGeometry: 'true', f: 'json'
+    }).then(cqbFeatures).then(null, function (e) {
+      throw cqbLookupFailure('The storage-area lookup for parcel ' + rep.pid, e);
     });
-  }).then(function (j) {
-    var fs = j.features || [];
+  }).then(function (fs) {
+    /* 1.16.3: fs is a checked list (cqbFeatures). Until then a reply without one read as
+     * "not inside a mapped storage area". */
     if (!fs.length) { rep.noStorageArea = true; return null; }
     rep.storageAreas = fs.length;
     var sa = fs[0];
+    if (!cqbPolygonOk(sa.geometry)) {
+      throw cqbLookupFailure('The storage-area lookup for parcel ' + rep.pid,
+        cqbReplyError('the storage area\u2019s boundary could not be read'));
+    }
     rep.saNumber = cqbBlank(sa.attributes.SA_NUMBER) ? null : sa.attributes.SA_NUMBER;
     rep.saLabel = cqbSaLabel(rep.saNumber);
     /* Same Number(null) === 0 trap cqbBfeSegments guards for ELEV, and it bit
@@ -1915,9 +1974,17 @@ function cqbStorageCalc(pid, opts, deps) {
     });
   }).then(function (ix) {
     if (rep.noStorageArea) return null;
-    if (!ix || ix.error) throw new Error('The geometry service could not clip the parcel to the storage area.');
-    var clip = (ix.geometries || []).filter(function (g) { return g && g.rings && g.rings.length; })[0];
-    if (!clip) { rep.emptyClip = true; return null; }
+    /* One parcel in, one clip out (1.16.3): a reply without its geometries list, or with an
+     * entry that is not a polygon, is a failed clip -- until 1.16.3 it read as "the parcel only
+     * touches the edge of the storage area". An empty polygon (rings: []) is that answer. */
+    var clips = ix && !ix.error && Array.isArray(ix.geometries) ? ix.geometries : null;
+    var clip = clips && clips.length === 1 ? clips[0] : null;
+    if (!clip || typeof clip !== 'object' || !Array.isArray(clip.rings) ||
+        (clip.rings.length && !cqbPolygonOk(clip))) {
+      throw new Error('The geometry service could not clip the parcel to the storage area, so the ' +
+        'fill capacity could not be completed. This is not a "no storage" answer; try again.');
+    }
+    if (!clip.rings.length) { rep.emptyClip = true; return null; }
     rep._clip = clip;
 
     say('Reading the BFE lines...');
@@ -1928,10 +1995,12 @@ function cqbStorageCalc(pid, opts, deps) {
       geometryType: 'esriGeometryEnvelope', inSR: CQB_SP_FT, outSR: CQB_SP_FT,
       spatialRel: 'esriSpatialRelIntersects', outFields: 'ELEV,V_DATUM',
       returnGeometry: 'true', f: 'json'
+    }).then(cqbFeatures).then(null, function (e) {
+      throw cqbLookupFailure('The base flood elevation lookup for parcel ' + rep.pid, e);
     });
-  }).then(function (j) {
+  }).then(function (fs) {
     if (rep.noStorageArea || rep.emptyClip) return null;
-    var fs = (j && j.features) || [];
+    /* 1.16.3: a checked list; until then a reply without one read as "no BFE lines". */
     if (!fs.length) { rep.noBfe = true; return null; }
     /* Datum has to match 3DEP or the subtraction is meaningless. */
     var datums = {}, undeclared = 0;
@@ -2028,32 +2097,76 @@ function cqbStorageCalc(pid, opts, deps) {
  * unchecked instead of taking the others down or -- worse -- reading as a
  * clean answer. */
 
-/* The one place a parcel is fetched by PID. Rejects with e.cqbKind 'absent' (message must
- * keep the words 'not found' -- the UI and tests rely on it) when the lookup answered and the
- * parcel does not exist or carries no polygon. The empty-rings case is real: a PARCELID can
- * resolve to a record whose geometry has rings: [].
- * 1.16.2: only a reply that carries a features list can say "no such parcel" (the rule of
- * correction R-01). A reply without one, and a lookup that failed outright, reject as a
- * failed lookup that keeps its kind and says it is not a "not found" answer, so Site tools
- * offers Retry for those and only for those. */
+/* The one usable tax-parcel record in a reply to a PARCELID query, checked before its
+ * boundary is used or any other layer is asked about it (1.16.3, coordinator review
+ * C-NEXT-01 and C-NEXT-02). clean is the requested id, already normalised (cqbPidNorm).
+ *
+ *   resolves the record -- a copy whose PARCELID is the checked id (cqbLandRecord) -- when the
+ *            reply holds exactly one entry, that entry is a feature object with an attributes
+ *            object, its PARCELID is a tax-parcel id by the toolkit's own rule and equals the
+ *            id asked for, and its boundary is a readable polygon (cqbPolygonOk)
+ *   rejects  e.cqbKind 'absent'      the reply's features list is empty: no such parcel
+ *            e.cqbKind 'noboundary'  the one record names this parcel and has no boundary at
+ *                                    all -- geometry missing or null, or rings: [] (a real
+ *                                    shape in this county's data). An answer, not a failure.
+ *            a failed lookup         anything else, with Retry: no features list; more than
+ *                                    one entry (this tool does not choose between them); an
+ *                                    entry that is not a feature record ({}, null, [],
+ *                                    {"error": ...}); a PARCELID that is missing, not text or
+ *                                    a whole number, or not a tax-parcel id; a record naming
+ *                                    a different parcel; a boundary that cannot be read
+ *
+ * Identity is decided before anything else is read from the record, and the requested id is
+ * never written into a record that lacks one. Ids are compared as text after cqbPidNorm, so
+ * leading zeros count: a numeric PARCELID that lost its leading zero does not match.
+ * Until 1.16.3 the first entry was used whenever it had any rings, whatever it named: {},
+ * null, [] and {"error": ...} read as "not found" with no Retry, and a record for a different
+ * parcel was reviewed under the requested PID. */
+function cqbParcelRecord(j, clean, what) {
+  function failed(detail) { return cqbLookupFailure(what, cqbReplyError(detail)); }
+  if (j && typeof j === 'object' && j.error) throw failed('it reported an error');
+  if (!j || typeof j !== 'object' || Array.isArray(j) || !Array.isArray(j.features)) {
+    throw failed('it had no features list');
+  }
+  var list = j.features;
+  if (!list.length) {
+    throw cqbKindError('absent', 'Parcel ' + clean + ' was not found in the county\u2019s tax parcels.');
+  }
+  if (list.length > 1) throw failed('it held ' + list.length + ' records where one was expected');
+  var f = list[0];
+  if (!f || typeof f !== 'object' || Array.isArray(f) || !f.attributes ||
+      typeof f.attributes !== 'object' || Array.isArray(f.attributes)) {
+    throw failed('it held an entry that is not a parcel record');
+  }
+  var rec = cqbLandRecord(f);
+  if (!rec) throw failed('its record has no usable parcel ID');
+  var got = rec.attributes.PARCELID;
+  if (got !== clean) throw failed('it named parcel ' + got + ', not ' + clean);
+  var g = rec.geometry;
+  if (g === undefined || g === null ||
+      (typeof g === 'object' && !Array.isArray(g) && Array.isArray(g.rings) && !g.rings.length)) {
+    throw cqbKindError('noboundary', 'Parcel ' + clean + ' is on the county\u2019s records but has ' +
+      'no mapped boundary, so there is no boundary to review.');
+  }
+  if (!cqbPolygonOk(g)) throw failed('the parcel\u2019s boundary could not be read');
+  return rec;
+}
+
+/* The one place a tax parcel is fetched by PID. Every outcome is cqbParcelRecord's; a lookup
+ * that failed outright rejects as a failed lookup that keeps its kind and says it is not a
+ * "not found" answer (1.16.2), so Site tools offers Retry for failures and only for those. */
 function cqbParcelByPid(pid, outFields, getJson) {
   var g = getJson || cqbGetJson;
-  var what = 'The lookup for parcel ' + pid;
+  var clean = cqbPidNorm(pid);
+  var what = 'The lookup for parcel ' + clean;
   return g(CQB_SITE_SOURCES[0].url + '/query?' + cqbQs({
-    where: "PARCELID='" + String(pid).replace(/'/g, "''") + "'",
+    where: "PARCELID='" + clean.replace(/'/g, "''") + "'",
     outFields: outFields || 'PARCELID,SITEADDRESS,GIS_AREA',
     returnGeometry: 'true', outSR: CQB_SP_FT, f: 'json'
   })).then(null, function (e) {
     throw cqbLookupFailure(what, e);
   }).then(function (j) {
-    if (!j || typeof j !== 'object' || !Array.isArray(j.features)) {
-      throw cqbLookupFailure(what, cqbKindError('malformed', 'the reply had no features list'));
-    }
-    var f = j.features[0];
-    if (!f || !f.geometry || !f.geometry.rings || !f.geometry.rings.length) {
-      throw cqbKindError('absent', 'Parcel ' + pid + ' not found, or it has no mapped boundary.');
-    }
-    return f;
+    return cqbParcelRecord(j, clean, what);
   });
 }
 
@@ -2068,6 +2181,36 @@ function cqbDateStr(raw) {
   var d = new Date(n);
   if (isNaN(d.getTime())) return null;
   return d.toISOString().slice(0, 10);
+}
+
+/* The geometry service's replies, checked by their own shapes before cqbClipArea reads them
+ * (1.16.3, coordinator review C-NEXT-03): union answers one polygon object, intersect a
+ * geometries list with one polygon object per input, areasAndLengths one finite number per
+ * polygon. A reply of any other shape rejects, so the measurement comes out unknown (null)
+ * where a missing list used to come out as 0. cqbClipArea is shared with the private export
+ * and is not changed; the check rides on the poster handed to it. */
+function cqbCheckedPoster(post) {
+  function count(json, key) {
+    try { var v = JSON.parse(json); v = key ? v[key] : v; return Array.isArray(v) ? v.length : -1; }
+    catch (e) { return -1; }
+  }
+  function poly(g) { return !!g && typeof g === 'object' && !Array.isArray(g) && Array.isArray(g.rings); }
+  return function (op, params) {
+    return Promise.resolve(post(op, params)).then(function (r) {
+      var ok = !!r && typeof r === 'object' && !Array.isArray(r) && !r.error;
+      if (ok && op === 'union') ok = poly(r.geometry || r);
+      if (ok && op === 'intersect') {
+        ok = Array.isArray(r.geometries) && r.geometries.length === count(params.geometries, 'geometries') &&
+          r.geometries.every(poly);
+      }
+      if (ok && op === 'areasAndLengths') {
+        ok = Array.isArray(r.areas) && r.areas.length === count(params.polygons) &&
+          r.areas.every(function (a) { return typeof a === 'number' && isFinite(a); });
+      }
+      if (!ok) throw cqbReplyError('the geometry service sent an unreadable ' + op + ' reply');
+      return r;
+    });
+  };
 }
 
 /* FEMA zones touching the parcel, and the Zone A acreage facts.
@@ -2103,8 +2246,9 @@ function cqbZoneAssess(parcelGeom, attrs, deps) {
     spatialRel: 'esriSpatialRelIntersects', outFields: 'FLD_ZONE,FLOODWAY',
     returnGeometry: 'false', f: 'json'
   }).then(function (j) {
-    (j.features || []).forEach(function (f) {
-      var a = f.attributes || {};
+    /* 1.16.3: a checked list (cqbFeatures); an unusable reply is a failed lookup below. */
+    cqbFeatures(j).forEach(function (f) {
+      var a = f.attributes;
       var z = cqbBlank(a.FLD_ZONE) ? '' : String(a.FLD_ZONE).trim();
       if (z && rep.zones.indexOf(z) < 0) rep.zones.push(z);
       if (!cqbBlank(a.FLOODWAY) && String(a.FLOODWAY).trim() === 'FLOODWAY') rep.floodway = true;
@@ -2122,8 +2266,16 @@ function cqbZoneAssess(parcelGeom, attrs, deps) {
       spatialRel: 'esriSpatialRelIntersects', where: "FLD_ZONE='A'",
       outFields: 'FLD_ZONE', returnGeometry: 'true', f: 'json'
     }).then(function (jz) {
-      var geoms = (jz.features || []).map(function (f) { return f.geometry; });
-      return cqbClipArea(parcelGeom, geoms, post);
+      /* 1.16.3: the first query found Zone A on this parcel, so a reply with no usable Zone A
+       * polygon makes the overlap unknown -- never 0 acres. The geometry service's own replies
+       * are checked by their shapes (cqbCheckedPoster); cqbClipArea itself is unchanged. */
+      var zf = cqbFeatures(jz);
+      if (!zf.length) throw cqbReplyError('it held no Zone A polygon');
+      var geoms = zf.map(function (f) {
+        if (!cqbPolygonOk(f.geometry)) throw cqbReplyError('a Zone A polygon could not be read');
+        return f.geometry;
+      });
+      return cqbClipArea(parcelGeom, geoms, cqbCheckedPoster(post));
     }).then(function (sqft) {
       rep.zoneAAcres = (sqft === null || sqft === undefined)
         ? null : sqft / CQB_REG.sqFtPerAcre;
@@ -2156,7 +2308,8 @@ function cqbRecordedFlood(parcelGeom, deps) {
       spatialRel: 'esriSpatialRelIntersects', outFields: outFields,
       returnGeometry: 'false', f: 'json'
     }).then(function (j) {
-      return { ok: true, items: (j.features || []).map(function (f) { return f.attributes || {}; }) };
+      /* 1.16.3: a checked list; an unusable reply is ok:false, never "none recorded". */
+      return { ok: true, items: cqbFeatures(j).map(function (f) { return f.attributes; }) };
     }).catch(function () {
       return { ok: false, items: [] };
     });
@@ -2186,8 +2339,8 @@ function cqbFreeboardAssess(parcelGeom, deps) {
                returnGeometry: 'false', f: 'json' };
     for (var k in extra) qs[k] = extra[k];
     return cqbGetQuery(getJson, url, qs).then(function (j) {
-      if (j && j.error) throw new Error('layer error');
-      return { ok: true, features: (j && j.features) || [] };
+      /* 1.16.3: a checked list; an unusable reply is ok:false, never "none mapped". */
+      return { ok: true, features: cqbFeatures(j) };
     }).catch(function () { return { ok: false, features: [] }; });
   }
   /* BFE lines within 2,000 ft of the parcel box, same reach the storage
@@ -2200,10 +2353,9 @@ function cqbFreeboardAssess(parcelGeom, deps) {
     spatialRel: 'esriSpatialRelIntersects', outFields: 'ELEV,V_DATUM',
     returnGeometry: 'false', f: 'json'
   }).then(function (j) {
-    if (j && j.error) throw new Error('layer error');
     var elevs = [], datums = {}, undeclared = 0;
-    ((j && j.features) || []).forEach(function (f) {
-      var a = f.attributes || {};
+    cqbFeatures(j).forEach(function (f) {   /* 1.16.3: a checked list */
+      var a = f.attributes;
       /* Same Number(null)===0 trap as everywhere else in this file. */
       var e = cqbElevOrNull(a.ELEV);
       if (e !== null) elevs.push(e);
@@ -2269,9 +2421,8 @@ function cqbLomcLookup(parcelGeom, deps) {
                'PDFHYPERLINKID,REVAL_STAT,LOTTYPE,OUTCOME,PROJECTNAME',
     returnGeometry: 'true', f: 'json'
   }).then(function (j) {
-    if (j && j.error) throw new Error('layer error');
-    var items = ((j && j.features) || []).map(function (f) {
-      var a = f.attributes || {};
+    var items = cqbFeatures(j).map(function (f) {   /* 1.16.3: a checked list */
+      var a = f.attributes;
       var g = f.geometry || {};
       var onParcel = null, distFt = null;
       if (isFinite(g.x) && isFinite(g.y)) {
@@ -2297,9 +2448,8 @@ function cqbLomcLookup(parcelGeom, deps) {
     outFields: 'CASE_NO,EFF_DATE,STATUS,LOMR_ID',
     returnGeometry: 'false', f: 'json'
   }).then(function (j) {
-    if (j && j.error) throw new Error('layer error');
-    return { ok: true, items: ((j && j.features) || []).map(function (f) {
-      return f.attributes || {};
+    return { ok: true, items: cqbFeatures(j).map(function (f) {   /* 1.16.3: a checked list */
+      return f.attributes;
     }) };
   }).catch(function () { return { ok: false, items: [] }; });
   return Promise.all([lomaQ, lomrQ]).then(function (r) {
@@ -2388,277 +2538,6 @@ function cqbReviewSubject(pid, deps) {
     .then(function (pf) { return { parcel: pf, ioll: null }; });
 }
 
-/* ---- Mapped building coverage (1.17.0) --------------------------------------
- * What share of a parcel the county's mapped building footprints cover. Validated live from
- * the viewer's origin 2026-10-08 before any of this was written (see 2_REFERENCE/
- * COVERAGE_VALIDATION.md):
- *
- *   - BuildingSafety/BuildingFootprints/MapServer holds one layer per flight year, 2007 to
- *     2026. Layer 8, Footprints2026, is the newest and the one the viewer itself draws by
- *     default; 160,473 outlines county-wide, maxRecordCount 2,000, pagination supported.
- *   - Its `status` is existing / new / changed / demolished. Demolished outlines (1,589) are
- *     still IN the layer, so they are excluded by the query; Footprints2024 had none.
- *   - `PID` attributes a footprint to a parcel, but one outline can span several parcels
- *     (attached townhouses, condominium lots) and is then recorded against one of them only.
- *     So footprints are found SPATIALLY and clipped to the parcel; the PID is a cross-check.
- *   - A parcel outline in a GET can exceed the server's URL limit (cqbGetQuery POSTs those).
- *   - The county geometry service answers union, intersect and areasAndLengths anonymously.
- *     Planar areas in State Plane feet (102704) agreed with an independent point-sampling
- *     estimate to within 0.01% on the validation parcels. The Assessor's GIS_AREA and the
- *     footprints' own area fields are stored in the county's ground-scaled coordinates and
- *     read 0.05-0.07% larger; numerator and denominator here use ONE method, so the
- *     percentage does not depend on that.
- *
- * Every failure rejects -- a failed or malformed reply, a list cut short by the transfer
- * limit or inconsistent between pages, an unusable outline, a geometry answer of the wrong
- * shape, an unmeasurable parcel. Nothing unknown is ever counted as zero. An empty list from
- * a successful query is the one answer that means "no mapped footprints". */
-var CQB_FOOTPRINT_URL = CQB_PUB + 'BuildingSafety/BuildingFootprints/MapServer/8';
-var CQB_FOOTPRINT_LAYER = 'Footprints2026';
-var CQB_FOOTPRINT_WHERE = "status <> 'demolished'";
-var CQB_COVER_PAGE = 1000;
-var CQB_COVER_MAX = 10000;
-var CQB_COVER_TIMEOUT_MS = 45000;
-var cqbFootprintMeta = null;   /* the layer check, once per page once it has passed */
-
-/* A failure that says plainly it is not a "no buildings" answer. */
-function cqbCoverFailure(why, kind) {
-  var e = cqbKindError(kind || 'malformed', 'The building coverage could not be completed: ' + why +
-    '. This is not a "no buildings" answer; try again.');
-  return e;
-}
-function cqbCoverRing(r) {
-  if (!Array.isArray(r) || r.length < 4) return false;
-  for (var i = 0; i < r.length; i++) {
-    var p = r[i];
-    if (!Array.isArray(p) || p.length < 2 || typeof p[0] !== 'number' || typeof p[1] !== 'number' ||
-        !isFinite(p[0]) || !isFinite(p[1])) return false;
-  }
-  return true;
-}
-function cqbCoverPolygon(g) {
-  return !!g && typeof g === 'object' && Array.isArray(g.rings) && g.rings.length > 0 &&
-    g.rings.every(cqbCoverRing);
-}
-function cqbCoverIsOwn(e) { return /building coverage could not be completed/.test(e && e.message); }
-function cqbCoverPost(getJson, op, params) {
-  return getJson(CQB_GEOM_URL + '/' + op, CQB_COVER_TIMEOUT_MS, cqbQs(Object.assign({ f: 'json' }, params)))
-    .then(null, function (e) {
-      if (cqbCoverIsOwn(e)) throw e;
-      var k = e && e.cqbKind;
-      throw cqbCoverFailure('the county geometry service ' + (k === 'arcgis' ? 'reported an error' :
-        k === 'timeout' ? 'did not answer in time' : 'could not be reached or sent an unreadable reply') +
-        ' (' + op + ')', k);
-    });
-}
-
-/* The footprint layer is the one this module was validated against: its name and the two
- * fields it relies on. A renumbered or renamed layer stops the calculation rather than
- * quietly measuring a different year. */
-function cqbFootprintLayerCheck(getJson) {
-  if (cqbFootprintMeta) return Promise.resolve(cqbFootprintMeta);
-  return getJson(CQB_FOOTPRINT_URL + '?f=json').then(function (j) {
-    var names = Array.isArray(j.fields) ? j.fields.map(function (f) { return f && f.name; }) : [];
-    if (j.name !== CQB_FOOTPRINT_LAYER || names.indexOf('PID') < 0 || names.indexOf('status') < 0) {
-      throw cqbCoverFailure('the county\u2019s footprint layer is not the one this tool was checked against ' +
-        '(expected ' + CQB_FOOTPRINT_LAYER + ' with PID and status fields; found ' +
-        (typeof j.name === 'string' ? '"' + j.name + '"' : 'no layer name') + ')');
-    }
-    var max = Number(j.maxRecordCount);
-    cqbFootprintMeta = { name: j.name, page: isFinite(max) && max > 0 ? Math.min(CQB_COVER_PAGE, max) : CQB_COVER_PAGE };
-    return cqbFootprintMeta;
-  }, function (e) {
-    throw cqbCoverFailure('the footprint layer could not be read (' + cqbFailReason(e) + ')', e && e.cqbKind);
-  });
-}
-
-/* Every non-demolished footprint that intersects the parcel, page by page in OBJECTID order.
- * A page is complete only when it is shorter than asked for and not flagged as cut short. */
-function cqbFootprintsOn(parcelGeom, page, getJson, say) {
-  var out = [], seen = {};
-  function next(offset) {
-    if (offset > 0) say('Reading building footprints... ' + out.length + ' so far');
-    return cqbGetQuery(getJson, CQB_FOOTPRINT_URL, {
-      geometry: JSON.stringify({ rings: parcelGeom.rings, spatialReference: { wkid: CQB_SP_FT } }),
-      geometryType: 'esriGeometryPolygon', inSR: CQB_SP_FT, outSR: CQB_SP_FT,
-      spatialRel: 'esriSpatialRelIntersects', where: CQB_FOOTPRINT_WHERE,
-      outFields: 'OBJECTID,PID,status', returnGeometry: 'true', orderByFields: 'OBJECTID',
-      resultOffset: offset, resultRecordCount: page, f: 'json'
-    }).then(function (j) {
-      if (!j || !Array.isArray(j.features)) throw cqbCoverFailure('the footprint reply had no features list');
-      j.features.forEach(function (f) {
-        var a = f && f.attributes;
-        var id = a && typeof a.OBJECTID === 'number' && isFinite(a.OBJECTID) ? a.OBJECTID : null;
-        if (id === null || !cqbCoverPolygon(f.geometry)) {
-          throw cqbCoverFailure('a footprint record came back without a usable outline');
-        }
-        if (String(a.status || '').toLowerCase() === 'demolished') {
-          throw cqbCoverFailure('the footprint layer returned an outline marked demolished');
-        }
-        if (seen[id]) throw cqbCoverFailure('the footprint list came back inconsistent between pages');
-        seen[id] = 1;
-        out.push({ id: id, pid: cqbBlank(a.PID) ? null : String(a.PID).trim(), geometry: f.geometry });
-      });
-      if (out.length > CQB_COVER_MAX) {
-        throw cqbCoverFailure('more than ' + CQB_COVER_MAX.toLocaleString() + ' footprints touch this parcel, ' +
-          'which is more than this tool will measure');
-      }
-      if (j.exceededTransferLimit && !j.features.length) {
-        throw cqbCoverFailure('the footprint list came back cut short');
-      }
-      if (j.exceededTransferLimit || j.features.length >= page) return next(offset + j.features.length);
-      return out;
-    });
-  }
-  return next(0);
-}
-
-function cqbCoverageCalc(pid, opts, deps) {
-  opts = opts || {};
-  deps = deps || {};
-  var getJson = deps.getJson || cqbGetJson;
-  var say = opts.onStatus || function () {};
-  var clean = cqbPidNorm(pid);
-  var rep = { vintage: CQB_FOOTPRINT_LAYER, layerUrl: CQB_FOOTPRINT_URL };
-
-  var subjectP = cqbPidKind(clean) === 'ioll'
-    ? cqbReviewSubject(clean, deps)
-    : getJson(CQB_SITE_SOURCES[0].url + '/query?' + cqbQs({
-        where: "PARCELID='" + clean.replace(/'/g, "''") + "'",
-        outFields: 'PARCELID,SITEADDRESS,GIS_AREA,HighRise',
-        returnGeometry: 'true', outSR: CQB_SP_FT, f: 'json'
-      })).then(function (j) {
-        if (!j || !Array.isArray(j.features)) throw cqbKindError('malformed', 'the reply had no features list');
-        var pf = j.features[0];
-        if (!pf) throw cqbKindError('absent', 'Parcel ' + clean + ' was not found in the county\u2019s tax parcels.');
-        if (!pf.attributes || !cqbCoverPolygon(pf.geometry)) {
-          throw cqbKindError('malformed', 'the parcel came back without a usable boundary');
-        }
-        return { parcel: pf, ioll: null };
-      });
-
-  /* "not found", "outside every parcel" and "no mapped location" are answers and keep their own
-   * words; anything else that stopped the parcel lookup is a failure of this calculation. */
-  subjectP = subjectP.then(null, function (e) {
-    var k = e && e.cqbKind;
-    if (k === 'absent' || k === 'outside' || k === 'nolocation' || cqbCoverIsOwn(e)) throw e;
-    throw cqbCoverFailure('the parcel lookup failed (' + ((e && e.cqbReason) || cqbFailReason(e)) + ')', k);
-  });
-
-  return subjectP.then(function (subj) {
-    var a = subj.parcel.attributes || {};
-    rep.pid = a.PARCELID;
-    rep.address = a.SITEADDRESS || '';
-    rep.ioll = subj.ioll || null;
-    rep.highRise = String(a.HighRise) === '1';
-    var ga = cqbBlank(a.GIS_AREA) ? NaN : Number(a.GIS_AREA);
-    rep.gisArea = isFinite(ga) && ga > 0 ? ga : null;
-    rep._parcel = subj.parcel.geometry;
-    if (!cqbCoverPolygon(rep._parcel)) throw cqbCoverFailure('the parcel came back without a usable boundary');
-    say('Checking the footprint layer...');
-    return cqbFootprintLayerCheck(getJson);
-  }).then(function (meta) {
-    say('Reading building footprints...');
-    return cqbFootprintsOn(rep._parcel, meta.page, getJson, say).then(null, function (e) {
-      if (cqbCoverIsOwn(e) || (e && e.cqbKind === 'cancelled')) throw e;
-      throw cqbCoverFailure('the footprint query failed (' + cqbFailReason(e) + ')', e && e.cqbKind);
-    });
-  }).then(function (feats) {
-    rep.footprints = feats.length;
-    rep.otherPid = feats.filter(function (f) { return f.pid !== rep.pid; })
-      .map(function (f) { return { id: f.id, pid: f.pid }; });
-    /* the PID cross-check is a qualification, not part of the number: if it fails the
-     * coverage still stands and the panel says the check did not run */
-    var pidCheck = getJson(CQB_FOOTPRINT_URL + '/query?' + cqbQs({
-      where: "PID='" + String(rep.pid).replace(/'/g, "''") + "' AND " + CQB_FOOTPRINT_WHERE,
-      returnIdsOnly: 'true', f: 'json'
-    })).then(function (j) {
-      var ids = j && j.objectIds === null ? [] : (j && j.objectIds);
-      if (!Array.isArray(ids)) throw new Error('no id list');
-      var on = {};
-      feats.forEach(function (f) { on[f.id] = 1; });
-      return { ok: true, total: ids.length, outside: ids.filter(function (id) { return !on[id]; }).length };
-    }).then(null, function () { return { ok: false }; });
-
-    say('Measuring...');
-    var geomP;
-    if (!feats.length) {
-      geomP = cqbCoverPost(getJson, 'areasAndLengths', {
-        sr: CQB_SP_FT, polygons: JSON.stringify([rep._parcel]),
-        areaUnit: JSON.stringify({ areaUnit: 'esriSquareFeet' }), calculationType: 'planar'
-      }).then(function (al) {
-        if (!al || !Array.isArray(al.areas) || al.areas.length !== 1) throw cqbCoverFailure('the area service sent an unreadable reply');
-        return { parcel: al.areas[0], covered: 0, clipped: [], full: [] };
-      });
-    } else {
-      geomP = cqbCoverPost(getJson, 'intersect', {
-        sr: CQB_SP_FT,
-        geometries: JSON.stringify({ geometryType: 'esriGeometryPolygon', geometries: feats.map(function (f) { return f.geometry; }) }),
-        geometry: JSON.stringify({ geometryType: 'esriGeometryPolygon', geometry: rep._parcel })
-      }).then(function (ix) {
-        if (!ix || !Array.isArray(ix.geometries) || ix.geometries.length !== feats.length) {
-          throw cqbCoverFailure('the geometry service sent an unreadable clip');
-        }
-        var pieces = [], at = [];
-        ix.geometries.forEach(function (g, i) {
-          if (g && Array.isArray(g.rings) && g.rings.length === 0) return;   /* touches only */
-          if (!cqbCoverPolygon(g)) throw cqbCoverFailure('the geometry service sent an unreadable clip');
-          pieces.push(g); at.push(i);
-        });
-        var unionP = pieces.length > 1
-          ? cqbCoverPost(getJson, 'union', { sr: CQB_SP_FT,
-              geometries: JSON.stringify({ geometryType: 'esriGeometryPolygon', geometries: pieces }) })
-            .then(function (u) {
-              var g = u && (u.geometry || u);
-              if (!cqbCoverPolygon(g)) throw cqbCoverFailure('the geometry service sent an unreadable merge');
-              return g;
-            })
-          : Promise.resolve(pieces[0] || null);
-        return unionP.then(function (merged) {
-          var polys = [rep._parcel].concat(merged ? [merged] : [], pieces, feats.map(function (f) { return f.geometry; }));
-          return cqbCoverPost(getJson, 'areasAndLengths', {
-            sr: CQB_SP_FT, polygons: JSON.stringify(polys),
-            areaUnit: JSON.stringify({ areaUnit: 'esriSquareFeet' }), calculationType: 'planar'
-          }).then(function (al) {
-            if (!al || !Array.isArray(al.areas) || al.areas.length !== polys.length) {
-              throw cqbCoverFailure('the area service sent an unreadable reply');
-            }
-            var A = al.areas, k = merged ? 2 : 1;
-            var clipped = feats.map(function () { return 0; });
-            at.forEach(function (fi, n) { clipped[fi] = A[k + n]; });
-            return { parcel: A[0], covered: merged ? A[1] : 0, clipped: clipped,
-                     full: A.slice(k + pieces.length) };
-          });
-        });
-      });
-    }
-    return Promise.all([geomP, pidCheck]).then(function (r) {
-      var m = r[0];
-      var nums = [m.parcel, m.covered].concat(m.clipped, m.full);
-      if (!nums.every(function (v) { return typeof v === 'number' && isFinite(v); })) {
-        throw cqbCoverFailure('the area service sent an unreadable reply');
-      }
-      var parcelSqFt = Math.abs(m.parcel), covered = Math.abs(m.covered);
-      if (!(parcelSqFt > 0)) throw cqbCoverFailure('the parcel\u2019s own area could not be measured');
-      if (covered > parcelSqFt * 1.0001) throw cqbCoverFailure('the measured footprint area exceeds the parcel area');
-      rep.parcelSqFt = parcelSqFt;
-      rep.coveredSqFt = covered;
-      rep.pct = 100 * covered / parcelSqFt;
-      var sumClip = m.clipped.reduce(function (s, v) { return s + Math.abs(v); }, 0);
-      rep.overlapSqFt = Math.max(0, sumClip - covered);
-      rep.crossing = [];
-      feats.forEach(function (f, i) {
-        var out = Math.abs(m.full[i]) - Math.abs(m.clipped[i]);
-        if (out > Math.max(0.5, 0.001 * Math.abs(m.full[i]))) rep.crossing.push({ id: f.id, outsideSqFt: out });
-      });
-      rep.pidCheck = r[1];
-      rep.gisRatio = rep.gisArea ? rep.gisArea / parcelSqFt : null;
-      delete rep._parcel;
-      return rep;
-    });
-  });
-}
-
 /* Development Viewer -- Site tools dialog (shared).
  *
  * The dialog every user gets: one parcel field, the USGS elevation opt-in, and
@@ -2674,8 +2553,7 @@ function cqbCoverageCalc(pid, opts, deps) {
 var CQB_SE_OPTIN = '__claude_qb_ext_optin';
 
 /* Chip tooltip. A build that adds tools overwrites this with a fuller wording. */
-var CQB_SITE_TOOLS_TIP = 'For one parcel: run a flood review, compute the Salt Creek allowable fill, ' +
-  'or measure mapped building coverage';
+var CQB_SITE_TOOLS_TIP = 'For one parcel: run a flood review, or compute the Salt Creek allowable fill';
 
 /* Build-time extension point. Each entry is a function (api) that may add
  * controls and buttons to the dialog. Populated only in builds that include
@@ -2685,10 +2563,12 @@ var CQB_SITE_PLUGINS = [];
 /* Layout (1.16.1). The dialog is a column: the title, a scrolling middle (the parcel box, any
  * consent text and the results), then the status line and the buttons, which never scroll.
  * Until 1.16.1 the whole dialog scrolled as one block, so after a long review the status and
- * every button sat below the fold -- measured live after one parcel's flood review in a
- * 1102 x 679 window, the buttons started 123 px below the bottom of the window. Sizes are capped by the window less a small margin rather than by
- * a percentage, so at 200% zoom or in a short window the dialog still fits, and the buttons
- * wrap onto a second row instead of being cut off at the side. */
+ * every button sat below the fold -- measured live on 1.16.0 after one parcel's flood review
+ * in a 1102 x 679 window, the top edge of the buttons sat 137 px below the bottom of the
+ * window (re-measured 2026-10-08; an earlier "123 px" had no surviving measurement). Sizes
+ * are capped by the window less a small margin rather than by a percentage, so at 200% zoom
+ * or in a short window the dialog still fits, and the buttons wrap onto a second row instead
+ * of being cut off at the side. */
 function cqbSeCss() {
   if (document.getElementById('cqb-se-css')) return;
   var s = document.createElement('style');
@@ -2831,8 +2711,11 @@ function cqbSeFloodState(z, fb) {
   var touches = (zoneOk && z.zones && z.zones.length > 0) ||
     (!!fb && fb.floodProne && (fb.floodProne.ids || []).length > 0);
   if (touches) {
+    /* 1.16.3: the chapter facts (2004 city limits, zoning) count too -- the block shows them */
     var gaps = !zoneOk || !fb || !fpOk || !fb.bfe || !fb.bfe.ok ||
-      (z && z.inZoneA && z.zoneAAcres == null);
+      (z && z.inZoneA && z.zoneAAcres == null) ||
+      fb.city2004 === null || !fb.zoningCity || !fb.zoningCity.ok ||
+      !fb.zoningCounty || !fb.zoningCounty.ok;
     return gaps ? 'partial' : 'found';
   }
   if (zoneOk && fpOk) return 'none';
@@ -3264,86 +3147,6 @@ function cqbSeLettersHtml(l) {
     'authoritative.</div>' + bits.join('');
 }
 
-/* ---- Mapped building coverage (1.17.0) ----------------------------------
- * r is a cqbCoverageCalc report; a failed calculation never reaches here (it rejects, and the
- * dialog shows the failure with Retry). Numbers first, the qualification that this is mapped
- * building outlines only right under them, anything unusual about this parcel's footprints
- * beside the numbers, and the method folded away. */
-function cqbSeCoverageState(r) {
-  if (!r) return 'failed';
-  return r.footprints ? 'computed' : 'none';
-}
-function cqbSePct(p) {
-  if (!(p > 0)) return '0%';
-  if (p < 0.1) return 'less than 0.1%';
-  return (Math.round(p * 10) / 10).toFixed(1) + '%';
-}
-function cqbSeCoverageHtml(r) {
-  if (!r) return '';
-  var esc = cqbSeEsc, n = cqbSeNum;
-  var vin = esc(r.vintage);
-  var plural = function (k, one, many) { return k + ' ' + (k === 1 ? one : many); };
-  var notes = [];
-  if (r.highRise) {
-    notes.push('This parcel is a condominium unit. Its mapped boundary is the shared lot, so these ' +
-      'figures describe the whole lot, not the unit.');
-  }
-  if (r.crossing && r.crossing.length) {
-    var out = r.crossing.reduce(function (s, c) { return s + c.outsideSqFt; }, 0);
-    notes.push(plural(r.crossing.length, 'footprint crosses', 'footprints cross') + ' the parcel line; only the ' +
-      'part inside this parcel is counted (' + n(out) + ' sq ft lies outside).');
-  }
-  if (r.otherPid && r.otherPid.length) {
-    var ids = [];
-    r.otherPid.forEach(function (f) { var s = f.pid || '(none)'; if (ids.indexOf(s) < 0) ids.push(s); });
-    notes.push(plural(r.otherPid.length, 'footprint counted here is', 'footprints counted here are') +
-      ' recorded against another PID (' + esc(ids.slice(0, 3).join(', ')) + (ids.length > 3 ? ', ...' : '') +
-      ') -- typically one outline drawn across attached units or a lot line.');
-  }
-  if (r.pidCheck && r.pidCheck.ok && r.pidCheck.outside) {
-    notes.push(plural(r.pidCheck.outside, 'footprint recorded against this PID lies', 'footprints recorded against this PID lie') +
-      ' outside its mapped boundary and ' + (r.pidCheck.outside === 1 ? 'is' : 'are') + ' not counted.');
-  }
-  if (r.overlapSqFt > 1) {
-    notes.push('Overlapping outlines covering about ' + n(r.overlapSqFt) + ' sq ft are counted once.');
-  }
-  if (r.gisRatio && Math.abs(r.gisRatio - 1) > 0.01) {
-    notes.push('The Assessor\u2019s GIS_AREA (' + n(r.gisArea) + ' sq ft) differs from the measured parcel ' +
-      'area by ' + (Math.round(Math.abs(r.gisRatio - 1) * 1000) / 10) + '%.');
-  }
-  var html = r.footprints
-    ? '<table>' +
-        '<tr><td>Mapped building footprint area on this parcel</td><td class="n"><b>' + n(r.coveredSqFt) + ' sq ft</b></td></tr>' +
-        '<tr><td>Parcel area (same method)</td><td class="n">' + n(r.parcelSqFt) + ' sq ft</td></tr>' +
-        '<tr><td>Mapped building coverage</td><td class="n"><b>' + cqbSePct(r.pct) + '</b></td></tr>' +
-        '<tr><td>Footprints counted</td><td class="n">' + n(r.footprints) + '</td></tr>' +
-      '</table>'
-    : '<div style="margin-top:6px;color:#c2d4e6">No mapped building footprints were returned for this parcel ' +
-        'in ' + vin + '. That is not proof the parcel has no buildings: anything built since that mapping, ' +
-        'and anything the layer does not show, would be missing. Parcel area: ' + n(r.parcelSqFt) + ' sq ft.</div>';
-  if (notes.length) html += '<div class="warn">' + notes.map(esc).join('<br><br>').replace(/ -- /g, ' &mdash; ') + '</div>';
-  var pidLine = !r.pidCheck || !r.pidCheck.ok
-    ? 'The cross-check of footprints recorded against this PID could not be completed; the figures above do not depend on it.'
-    : (r.pidCheck.total + ' non-demolished footprint' + (r.pidCheck.total === 1 ? ' is' : 's are') +
-       ' recorded against this PID' + (r.pidCheck.outside ? '; ' + r.pidCheck.outside + ' of them lie outside its boundary.' : ', all on this parcel.'));
-  html += '<div style="margin-top:8px;color:#9fb4c8"><b>Mapped building outlines only</b> (' + vin +
-    ', outlines marked demolished left out). Driveways, patios, walks and other paving are not in this ' +
-    'layer, so this is not impervious coverage, and it is not a zoning determination.' +
-    '<details class="cqb-se-more"><summary>Method and checks</summary>' +
-    'Every footprint outline in ' + vin + ' (county BuildingFootprints map service, layer 8) that touches ' +
-    'the parcel is clipped to the parcel boundary and the pieces are merged, so overlapping outlines count ' +
-    'once. The merged area and the parcel area are both measured by the county\u2019s geometry service: ' +
-    'planar, NAD 1983 State Plane Nebraska, square feet. One method measures both, so the percentage does ' +
-    'not depend on the projection. Areas are rounded to the square foot and the percentage to one decimal; ' +
-    'the outlines\u2019 positional accuracy is not published, and it limits precision more than the ' +
-    'arithmetic does. Footprints are found by location, not by the PID recorded on them, because one ' +
-    'outline can span several parcels and is recorded against only one. ' + esc(pidLine) +
-    (r.gisArea ? ' Assessor GIS_AREA: ' + n(r.gisArea) + ' sq ft, a cross-check only -- stored in the ' +
-      'county\u2019s own coordinates, it reads about 0.05-0.07% larger on the parcels checked.' : '') +
-    '</details></div>';
-  return html.replace(/ -- /g, ' &mdash; ');
-}
-
 /* The open Site tools dialog's close(), if one is open. Opening the dialog again replaces the
  * open one instead of stacking a second copy (with duplicate element ids) on top of it, and
  * every close path -- the Close button, a backdrop click, Escape, a plugin's api.close(),
@@ -3457,6 +3260,12 @@ function cqbSeSummaryText(res, meta) {
       'some lookups failed.',
     ''
   ];
+  /* 1.16.3: an incomplete review says so before anything else is read */
+  if (meta.gaps && meta.gaps.length) {
+    head.splice(3, 0, 'Result: INCOMPLETE -- ' + meta.gaps.length + ' lookup' +
+      (meta.gaps.length === 1 ? '' : 's') + ' did not answer (' + meta.gaps.join(', ') +
+      '). Their answers are unknown, not an all-clear.');
+  }
   return head.concat(lines, ['', 'Map facts for review, not a determination.']).join('\n');
 }
 function cqbSeStamp(d) {
@@ -3467,12 +3276,62 @@ function cqbSeStamp(d) {
 
 /* True when a request ended because there is nothing to review behind the ID -- the county
  * has no such parcel or improvement, the improvement has no mapped point, or its point lies
- * in no tax parcel (1.16.2). These are answers: retrying cannot change them. Decided by the
- * error's kind alone, never by searching its message (see cqbKindError): a failed lookup
- * whose message happens to say "not found" stays a failure with Retry. */
+ * in no tax parcel (1.16.2); or the parcel is on record with no mapped boundary (1.16.3).
+ * These are answers: retrying cannot change them. Decided by the error's kind alone, never by
+ * searching its message (see cqbKindError): a failed lookup whose message happens to say "not
+ * found" stays a failure with Retry. */
 function cqbSeNoSubject(e) {
   var k = e && e.cqbKind;
-  return k === 'absent' || k === 'outside' || k === 'nolocation';
+  return k === 'absent' || k === 'outside' || k === 'nolocation' || k === 'noboundary';
+}
+
+/* The lookups of a finished flood review that did not answer (1.16.3, coordinator review
+ * C-NEXT-03), in the panel's words; empty when every lookup that matters answered. It agrees
+ * with the section states: a review has gaps exactly when some section is "Lookup failed" or
+ * "Partly checked". The BFE lines and the chapter facts (2004 city limits, zoning) count for a
+ * parcel that touches a flood zone or flood prone area, or that might -- when one of those two
+ * lookups did not answer; on a parcel that touches neither, the panel shows nothing from them.
+ * FEMA letters that were not asked for (no consent) are "Not checked", not a gap. */
+function cqbSeReviewGaps(rv) {
+  var g = [];
+  var z = rv.zone, fb = rv.freeboard, rec = rv.records, l = rv.letters, sa = rv.storageArea;
+  var zoneOk = !!z && !z.failed, fpOk = !!fb && !!fb.floodProne && fb.floodProne.ok;
+  if (!zoneOk) g.push('FEMA flood zones');
+  if (!fb) g.push('the freeboard lookups (flood prone areas, base flood elevation lines, ' +
+    '2004 city limits, zoning)');
+  else if (!fpOk) g.push('flood prone areas');
+  var touches = (zoneOk && z.zones && z.zones.length > 0) ||
+    (!!fb && fb.floodProne && (fb.floodProne.ids || []).length > 0);
+  /* the chapter facts matter where the parcel touches a zone -- or might, when the zone or
+   * flood prone area lookup itself did not answer */
+  if (touches || !zoneOk || !fpOk) {
+    if (z && z.inZoneA && z.zoneAAcres == null) g.push('the Zone A area measurement');
+    if (fb) {
+      if (!fb.bfe || !fb.bfe.ok) g.push('base flood elevation lines');
+      if (fb.city2004 === null) g.push('2004 city limits');
+      if (!fb.zoningCity || !fb.zoningCity.ok) g.push('city zoning');
+      if (!fb.zoningCounty || !fb.zoningCounty.ok) g.push('county zoning');
+    }
+  }
+  if (!rec || !rec.bra || !rec.bra.ok) g.push('building restriction agreements');
+  if (!rec || !rec.wse || !rec.wse.ok) g.push('watershed encumbrances');
+  if (l) {
+    if (!l.loma || !l.loma.ok) g.push('FEMA letters of map amendment');
+    if (!l.lomr || !l.lomr.ok) g.push('FEMA letters of map revision');
+  }
+  if (!sa || !sa.ok) g.push('Salt Creek storage areas');
+  return g;
+}
+
+/* Said at the top of a review that has gaps, with Retry beside it. The words are copied with
+ * the summary; the button is not. */
+function cqbSeGapsHtml(req, gaps) {
+  return '<div class="warn" data-cqb-gaps>Not every lookup answered: ' + cqbSeEsc(gaps.join(', ')) +
+    '. What ' + (gaps.length === 1 ? 'it' : 'they') + ' would have shown is unknown &mdash; not an ' +
+    'all-clear. The sections that depend on ' + (gaps.length === 1 ? 'it' : 'them') + ' are marked ' +
+    'Lookup failed or Partly checked.' +
+    '<div style="margin-top:6px" data-cqb-nocopy><button type="button" id="cqb-se-retry">Retry ' +
+    cqbSeEsc(req.label.toLowerCase()) + ' for PID ' + cqbSeEsc(req.pid) + '</button></div></div>';
 }
 
 function cqbSiteToolsDialog() {
@@ -3526,7 +3385,6 @@ function cqbSiteToolsDialog() {
         '<button type="button" id="cqb-se-stop" hidden>Stop</button>' +
         '<button type="button" class="go" id="cqb-se-review">Flood review</button>' +
         '<button type="button" class="go" id="cqb-se-fill">Fill capacity</button>' +
-        '<button type="button" class="go" id="cqb-se-cover">Building coverage</button>' +
       '</div>' +
     '</div>';
   document.body.appendChild(back);
@@ -3536,8 +3394,6 @@ function cqbSiteToolsDialog() {
   var foot = back.querySelector('.ft');
   var pidIn = $('cqb-se-pid'), st = $('cqb-se-st'), res = $('cqb-se-res'), live = $('cqb-se-live');
   var stopBtn = $('cqb-se-stop'), reviewBtn = $('cqb-se-review'), fillBtn = $('cqb-se-fill');
-  var coverBtn = $('cqb-se-cover');
-  function kindBtn(kind) { return kind === 'fill' ? fillBtn : (kind === 'cover' ? coverBtn : reviewBtn); }
   pidIn.value = cqbSeGuessPid();
   if (optedIn) { $('cqb-se-ok').checked = true; }
 
@@ -3584,7 +3440,7 @@ function cqbSiteToolsDialog() {
     var on = !!req;
     if (st.classList) st.classList.toggle('busy', on);
     if (on) res.setAttribute('aria-busy', 'true'); else res.removeAttribute('aria-busy');
-    reviewBtn.disabled = on; fillBtn.disabled = on; coverBtn.disabled = on;
+    reviewBtn.disabled = on; fillBtn.disabled = on;
     stopBtn.hidden = !on;
   }
   function isCurrent(req) { return !closed && active === req; }
@@ -3632,7 +3488,7 @@ function cqbSiteToolsDialog() {
     setBusy(null);
     var a = document.activeElement;
     if (a === stopBtn || a === document.body || !a || !dlg.contains(a)) {
-      try { kindBtn(req.kind).focus(); } catch (e) {}
+      try { (req.kind === 'fill' ? fillBtn : reviewBtn).focus(); } catch (e) {}
     }
     return true;
   }
@@ -3662,11 +3518,6 @@ function cqbSiteToolsDialog() {
   pidIn.addEventListener('input', syncNote);
 
   function sourcesFor(req) {
-    if (req.kind === 'cover') {
-      return 'Sources: county GIS (gis.lincoln.ne.gov) as published when read -- building footprints from ' +
-        'the BuildingFootprints map service, layer 8 (' + CQB_FOOTPRINT_LAYER + ', outlines marked demolished ' +
-        'left out), tax parcel boundaries, and the county geometry service for clipping and areas.';
-    }
     if (req.kind === 'fill') {
       return 'Sources: Salt Creek storage areas and base flood elevation lines from the county GIS ' +
         '(gis.lincoln.ne.gov), as published when read; ground heights from USGS 3DEP bare-earth ' +
@@ -3685,7 +3536,7 @@ function cqbSiteToolsDialog() {
     btn.addEventListener('click', function () {
       if (shown !== req) return;
       var text = cqbSeSummaryText(res, { label: req.label, pid: req.pid,
-        when: cqbSeStamp(req.at), sources: sourcesFor(req) });
+        when: cqbSeStamp(req.at), sources: sourcesFor(req), gaps: req.gaps || [] });
       copyText(text, req);
     });
   }
@@ -3728,6 +3579,14 @@ function cqbSiteToolsDialog() {
     copied(req, false, text);
   }
 
+  /* Retry runs again for the PID the request was for, not whatever the box says now. */
+  function wireRetry(req) {
+    var b = $('cqb-se-retry');
+    if (!b) return;
+    b.addEventListener('click', function () {
+      if (req.kind === 'fill') runFill(req.pid, this); else runReview(req.pid, this);
+    });
+  }
   function showFailure(req, e) {
     if (!settle(req)) return;
     shown = null;
@@ -3735,33 +3594,38 @@ function cqbSiteToolsDialog() {
      * keeps its own words, is not called a failure, and offers no Retry. */
     if (cqbSeNoSubject(e)) {
       var why = String((e && e.message) || e);
-      status(req.label + ' for PID ' + req.pid + ': no parcel to review.');
+      var none = e.cqbKind === 'noboundary' ? 'no mapped boundary to review.' : 'no parcel to review.';
+      status(req.label + ' for PID ' + req.pid + ': ' + none);
       res.innerHTML = '<div class="warn" data-cqb-nosubject>' + cqbSeEsc(why) + '</div>';
-      announce(req.label + ' for parcel ' + req.pid + ': no parcel to review. ' + why);
+      announce(req.label + ' for parcel ' + req.pid + ': ' + none + ' ' + why);
       return;
     }
     status(req.label + ' for PID ' + req.pid + ' could not be completed.');
     res.innerHTML = '<div class="warn">' + cqbSeEsc(String((e && e.message) || e)) + '</div>' +
       '<button type="button" id="cqb-se-retry">Retry ' + cqbSeEsc(req.label.toLowerCase()) +
       ' for PID ' + cqbSeEsc(req.pid) + '</button>';
-    $('cqb-se-retry').addEventListener('click', function () {
-      /* the PID this request was for, not whatever the box says now */
-      if (req.kind === 'fill') runFill(req.pid, this);
-      else if (req.kind === 'cover') runCover(req.pid, this);
-      else runReview(req.pid, this);
-    });
+    wireRetry(req);
     announce(req.label + ' for parcel ' + req.pid + ' could not be completed. Retry is available.');
   }
-  function showResult(req, html) {
+  /* gaps (1.16.3): the lookups that did not answer, for a result that is shown anyway. The
+   * status then says the result is incomplete instead of "Done", and Retry is offered. */
+  function showResult(req, html, gaps) {
     if (!settle(req)) return;
     shown = req;
-    status('Done: ' + req.label.toLowerCase() + ' for PID ' + req.pid + '.');
+    req.gaps = gaps || [];
+    var g = req.gaps.length;
+    status(g ? 'Finished with gaps: ' + req.label.toLowerCase() + ' for PID ' + req.pid + '. ' +
+        (g === 1 ? 'One lookup' : g + ' lookups') + ' did not answer.'
+      : 'Done: ' + req.label.toLowerCase() + ' for PID ' + req.pid + '.');
     res.innerHTML = html;
     wireCopy(req);
+    if (g) wireRetry(req);
     syncNote();
     var n = res.querySelectorAll('.cqb-se-sec').length;
-    announce(req.label + ' for parcel ' + req.pid + ' is done: ' + n + ' section' +
-      (n === 1 ? '' : 's') + ' below.');
+    announce(g ? req.label + ' for parcel ' + req.pid + ' finished with gaps: ' +
+        (g === 1 ? 'one lookup' : g + ' lookups') + ' did not answer. Retry is available.'
+      : req.label + ' for parcel ' + req.pid + ' is done: ' + n + ' section' +
+        (n === 1 ? '' : 's') + ' below.');
   }
 
   /* ---- Shared plumbing for both buttons -------------------------------- */
@@ -3798,12 +3662,13 @@ function cqbSiteToolsDialog() {
       var floodBody = cqbSeZoneHtml(rv.zone) + cqbSeFreeboardHtml(rv.zone, rv.freeboard);
       var floodState = cqbSeFloodState(rv.zone, rv.freeboard);
       if (!floodBody.trim() && floodState === 'none') floodBody = CQB_SE_NO_FLOOD_HTML;
-      showResult(req, head +
+      var gaps = cqbSeReviewGaps(rv);
+      showResult(req, head + (gaps.length ? cqbSeGapsHtml(req, gaps) : '') +
         cqbSeSection('Floodplain and required floor elevation', floodBody, floodState) +
         cqbSeSection('Recorded flood documents', cqbSeRecordsHtml(rv.records), cqbSeRecordsState(rv.records)) +
         cqbSeSection('FEMA letters of map change', cqbSeLettersHtml(rv.letters), cqbSeLettersState(rv.letters)) +
         cqbSeSection('Salt Creek flood storage', cqbSeStorageAreaHtml(rv.storageArea),
-          cqbSeStorageAreaState(rv.storageArea)));
+          cqbSeStorageAreaState(rv.storageArea)), gaps);
     }).then(null, function (e) { showFailure(req, e); });
   }
 
@@ -3843,19 +3708,6 @@ function cqbSiteToolsDialog() {
     }).then(null, function (e) { showFailure(req, e); });
   }
 
-  /* ---- Building coverage (county data, no consent needed; 1.17.0) ------- */
-  function runCover(pid, fromEl) {
-    var req = begin('cover', 'Building coverage', pid, fromEl);
-    var p;
-    try { p = cqbCoverageCalc(pid, { onStatus: progress(req) }); } catch (e) { p = Promise.reject(e); }
-    p.then(function (r) {
-      if (!isCurrent(req)) return;
-      var head = headHtml(req, r.pid, r.address) +
-        cqbSeSubjectHtml(r.ioll ? { kind: 'ioll', ioll: r.ioll } : null, r.pid, r.address);
-      showResult(req, head + cqbSeSection('Mapped building coverage', cqbSeCoverageHtml(r), cqbSeCoverageState(r)));
-    }).then(null, function (e) { showFailure(req, e); });
-  }
-
   function guard() {
     if (active) return false;  /* the buttons are disabled; a scripted click changes nothing */
     if (pluginBusy()) {
@@ -3868,7 +3720,6 @@ function cqbSiteToolsDialog() {
   reviewBtn.setAttribute('data-cqb-core', '');
   fillBtn.setAttribute('data-cqb-core', '');
   stopBtn.setAttribute('data-cqb-core', '');
-  coverBtn.setAttribute('data-cqb-core', '');
   $('cqb-se-x').setAttribute('data-cqb-core', '');
   reviewBtn.addEventListener('click', function () {
     if (!guard()) return;
@@ -3880,17 +3731,12 @@ function cqbSiteToolsDialog() {
     var pid = readPid();
     if (pid) runFill(pid, this);
   });
-  coverBtn.addEventListener('click', function () {
-    if (!guard()) return;
-    var pid = readPid();
-    if (pid) runCover(pid, this);
-  });
   stopBtn.addEventListener('click', function () {
     var req = retire('stopped');
     if (!req) return;
     status('Stopped: ' + req.label.toLowerCase() + ' for PID ' + req.pid + '. Nothing from it will be shown.');
     announce('Stopped. The ' + req.label.toLowerCase() + ' for parcel ' + req.pid + ' will not be shown.');
-    try { kindBtn(req.kind).focus(); } catch (e) {}
+    try { (req.kind === 'fill' ? fillBtn : reviewBtn).focus(); } catch (e) {}
   });
   /* A plugin's own button (bubbling here after its handler ran) takes the panes over: retire
    * whatever core request is still running so its late reply cannot overwrite the plugin's.
