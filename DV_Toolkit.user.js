@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.17.1
+// @version      1.17.2
 // @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools flood review (FEMA Zone A, freeboard facts, recorded flood documents, FEMA letters of map change) and a separate Salt Creek flood-storage and allowable-fill calculator, mapped building footprint coverage, mobile-home and leased-land parcel lookup, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
@@ -38,7 +38,7 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.17.1 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.17.2 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -56,7 +56,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.17.1', ready: false };
+  window.__dvToolkit = { version: '1.17.2', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -1138,7 +1138,8 @@ var CQB_GET_TIMEOUT_MS = 30000;
 
 /* A failure that says what kind of failure it is (1.16.0 correction R-01), in the same
  * words the Quick Bar's strict reader uses: 'timeout', 'http', 'arcgis', 'malformed' or
- * 'network'. A caller that has to tell a failed lookup from a real "none" reads e.cqbKind;
+ * 'network' -- plus 'incomplete' (1.16.4), a reply the server marked as only part of the
+ * result. A caller that has to tell a failed lookup from a real "none" reads e.cqbKind;
  * it must never search the message for words such as "not found", because a service's own
  * error text can contain them. */
 function cqbKindError(kind, msg) {
@@ -1192,6 +1193,7 @@ function cqbFailReason(e) {
   if (k === 'http') return 'the county server returned ' + e.message;
   if (k === 'arcgis') return 'the map service reported an error';
   if (k === 'malformed') return 'the county server sent an unreadable reply';
+  if (k === 'incomplete') return 'the county server sent an incomplete reply';
   return 'the request could not be completed';
 }
 
@@ -1215,6 +1217,19 @@ function cqbReplyError(detail) {
   e.cqbDetail = detail;
   return e;
 }
+
+/* A reply the server itself marked as only part of the result (1.16.4, coordinator review
+ * R2-01): ArcGIS sets exceededTransferLimit when it stopped before the end. A part cannot
+ * show that something is absent -- not even an empty part -- so it is a failed lookup with
+ * Retry, kind 'incomplete'. None of the lookups that use this pages; the coverage reader,
+ * which does, keeps its own paging and its own checks. */
+function cqbIncompleteError() {
+  var e = cqbKindError('incomplete', 'the county server sent an incomplete reply; ' +
+    CQB_INCOMPLETE_DETAIL);
+  e.cqbDetail = CQB_INCOMPLETE_DETAIL;
+  return e;
+}
+var CQB_INCOMPLETE_DETAIL = 'it was marked as only part of the result';
 
 /* A readable polygon (1.16.3; the rule the 1.17.0 coverage reader introduced): a geometry
  * object whose rings are a non-empty list, each ring at least four points of two finite
@@ -1241,17 +1256,32 @@ function cqbPolygonOk(g) {
  * Until 1.16.3 the flood review read (j.features || []): an HTTP 200 {} came out as "nothing
  * mapped", and an entry such as {}, null, [] or {"error": ...} as a record with no values.
  * Only an empty list in a reply that has one means "none". Metadata, id lists and
- * geometry-service results have other shapes and are checked where they are read, not here. */
-function cqbFeatures(j) {
+ * geometry-service results have other shapes and are checked where they are read, not here.
+ *
+ * 1.16.4 (coordinator review R2-01) adds two checks:
+ *  - The reply must be complete. One marked as only part of the result (exceededTransferLimit)
+ *    is a failed lookup (cqbIncompleteError), even when its list is empty.
+ *  - `need` names the fields the caller's conclusion reads. A reply carries every requested
+ *    outField as a key -- null when the record has no value -- so a record without one of
+ *    those keys cannot support that conclusion. The values may still be null or blank; what
+ *    a blank means is the caller's to decide (the county's single-space FLOODWAY is "not a
+ *    floodway"). A field that only describes a record is not named: the record still counts. */
+function cqbFeatures(j, need) {
   if (j && typeof j === 'object' && j.error) throw cqbReplyError('it reported an error');
   if (!j || typeof j !== 'object' || Array.isArray(j) || !Array.isArray(j.features)) {
     throw cqbReplyError('it had no features list');
   }
+  if (j.exceededTransferLimit) throw cqbIncompleteError();
   for (var i = 0; i < j.features.length; i++) {
     var f = j.features[i];
     if (!f || typeof f !== 'object' || Array.isArray(f) || !f.attributes ||
         typeof f.attributes !== 'object' || Array.isArray(f.attributes)) {
       throw cqbReplyError('it held an entry that is not a feature record');
+    }
+    for (var k = 0; need && k < need.length; k++) {
+      if (!Object.prototype.hasOwnProperty.call(f.attributes, need[k])) {
+        throw cqbReplyError('a record came back without its ' + need[k] + ' field');
+      }
     }
   }
   return j.features;
@@ -1711,6 +1741,9 @@ function cqbIollResolve(pid, deps) {
     if (!j || typeof j !== 'object' || !Array.isArray(j.features)) {
       throw cqbLookupFailure(what, cqbKindError('malformed', 'the reply had no features list'));
     }
+    /* 1.16.4 (R2-01): a reply marked incomplete is not "not found", and an empty one is not
+     * "outside every mapped tax parcel". */
+    if (j.exceededTransferLimit) throw cqbLookupFailure(what, cqbIncompleteError());
     return j.features;
   }
   return cqbGetQuery(getJson, CQB_IOLL_URL, {
@@ -2022,7 +2055,9 @@ function cqbStorageCalc(pid, opts, deps) {
         'ground elevations. Treat the depths below as unverified.');
     }
     var bfe = cqbBfeSegments(fs);
-    if (!bfe.elevs.length) { rep.noBfe = true; return null; }
+    /* 1.16.4: lines are mapped, but none has a usable elevation. Still nothing to measure
+     * against, and said as that -- until 1.16.4 it read "no BFE lines were mapped". */
+    if (!bfe.elevs.length) { rep.noBfe = true; rep.bfeUnusable = fs.length; return null; }
     /* the lines actually used; a line with no usable elevation is not one of them */
     rep.bfeLineCount = fs.length - bfe.skipped;
     if (bfe.skipped) {
@@ -2105,11 +2140,13 @@ function cqbStorageCalc(pid, opts, deps) {
  *            reply holds exactly one entry, that entry is a feature object with an attributes
  *            object, its PARCELID is a tax-parcel id by the toolkit's own rule and equals the
  *            id asked for, and its boundary is a readable polygon (cqbPolygonOk)
- *   rejects  e.cqbKind 'absent'      the reply's features list is empty: no such parcel
+ *   rejects  e.cqbKind 'absent'      the reply's features list is empty and the reply is
+ *                                    complete: no such parcel
  *            e.cqbKind 'noboundary'  the one record names this parcel and has no boundary at
  *                                    all -- geometry missing or null, or rings: [] (a real
  *                                    shape in this county's data). An answer, not a failure.
- *            a failed lookup         anything else, with Retry: no features list; more than
+ *            a failed lookup         anything else, with Retry: no features list; a reply
+ *                                    marked incomplete, empty or not (1.16.4); more than
  *                                    one entry (this tool does not choose between them); an
  *                                    entry that is not a feature record ({}, null, [],
  *                                    {"error": ...}); a PARCELID that is missing, not text or
@@ -2128,6 +2165,9 @@ function cqbParcelRecord(j, clean, what) {
   if (!j || typeof j !== 'object' || Array.isArray(j) || !Array.isArray(j.features)) {
     throw failed('it had no features list');
   }
+  /* 1.16.4 (R2-01): a part of the result cannot say the parcel is absent, or that the one
+   * record it holds is the only one. */
+  if (j.exceededTransferLimit) throw cqbLookupFailure(what, cqbIncompleteError());
   var list = j.features;
   if (!list.length) {
     throw cqbKindError('absent', 'Parcel ' + clean + ' was not found in the county\u2019s tax parcels.');
@@ -2194,14 +2234,23 @@ function cqbCheckedPoster(post) {
     try { var v = JSON.parse(json); v = key ? v[key] : v; return Array.isArray(v) ? v.length : -1; }
     catch (e) { return -1; }
   }
-  function poly(g) { return !!g && typeof g === 'object' && !Array.isArray(g) && Array.isArray(g.rings); }
+  /* 1.16.4 (coordinator review R2-02): a polygon is readable only when its coordinates are
+   * (cqbPolygonOk) -- an array of rings is not enough. Until 1.16.4 rings such as
+   * [["not a coordinate"]] passed, went on to the next geometry call, and a later finite
+   * area came out as an acreage. A union of readable Zone A polygons is never empty, so an
+   * empty union is unreadable too. Intersect may answer with a genuinely empty polygon
+   * ({rings: []}), which is how the service says "no overlap"; that stays a valid answer. */
+  function empty(g) {
+    return !!g && typeof g === 'object' && !Array.isArray(g) && Array.isArray(g.rings) && !g.rings.length;
+  }
+  function piece(g) { return cqbPolygonOk(g) || empty(g); }
   return function (op, params) {
     return Promise.resolve(post(op, params)).then(function (r) {
       var ok = !!r && typeof r === 'object' && !Array.isArray(r) && !r.error;
-      if (ok && op === 'union') ok = poly(r.geometry || r);
+      if (ok && op === 'union') ok = cqbPolygonOk(r.geometry || r);
       if (ok && op === 'intersect') {
         ok = Array.isArray(r.geometries) && r.geometries.length === count(params.geometries, 'geometries') &&
-          r.geometries.every(poly);
+          r.geometries.every(piece);
       }
       if (ok && op === 'areasAndLengths') {
         ok = Array.isArray(r.areas) && r.areas.length === count(params.polygons) &&
@@ -2246,11 +2295,17 @@ function cqbZoneAssess(parcelGeom, attrs, deps) {
     spatialRel: 'esriSpatialRelIntersects', outFields: 'FLD_ZONE,FLOODWAY',
     returnGeometry: 'false', f: 'json'
   }).then(function (j) {
-    /* 1.16.3: a checked list (cqbFeatures); an unusable reply is a failed lookup below. */
-    cqbFeatures(j).forEach(function (f) {
+    /* 1.16.3: a checked list (cqbFeatures); an unusable reply is a failed lookup below.
+     * 1.16.4 (R2-01): each record must say which zone it is. A record without a usable
+     * FLD_ZONE cannot show that no Zone A or AE touches the parcel, so the lookup is unknown
+     * -- until 1.16.4 {"attributes": {}} read as "no FEMA flood zone". FLOODWAY must be in
+     * the record, but its value may be blank: the county marks non-floodway areas with a
+     * single space. */
+    cqbFeatures(j, ['FLD_ZONE', 'FLOODWAY']).forEach(function (f) {
       var a = f.attributes;
-      var z = cqbBlank(a.FLD_ZONE) ? '' : String(a.FLD_ZONE).trim();
-      if (z && rep.zones.indexOf(z) < 0) rep.zones.push(z);
+      if (cqbBlank(a.FLD_ZONE)) throw cqbReplyError('a flood-zone record did not say which zone it is');
+      var z = String(a.FLD_ZONE).trim();
+      if (rep.zones.indexOf(z) < 0) rep.zones.push(z);
       if (!cqbBlank(a.FLOODWAY) && String(a.FLOODWAY).trim() === 'FLOODWAY') rep.floodway = true;
     });
     rep.zones.sort();
@@ -2339,7 +2394,8 @@ function cqbFreeboardAssess(parcelGeom, deps) {
                returnGeometry: 'false', f: 'json' };
     for (var k in extra) qs[k] = extra[k];
     return cqbGetQuery(getJson, url, qs).then(function (j) {
-      /* 1.16.3: a checked list; an unusable reply is ok:false, never "none mapped". */
+      /* 1.16.3: a checked list; an unusable reply is ok:false, never "none mapped".
+       * 1.16.4 (R2-01): and a complete one. */
       return { ok: true, features: cqbFeatures(j) };
     }).catch(function () { return { ok: false, features: [] }; });
   }
@@ -2354,14 +2410,19 @@ function cqbFreeboardAssess(parcelGeom, deps) {
     returnGeometry: 'false', f: 'json'
   }).then(function (j) {
     var elevs = [], datums = {}, undeclared = 0;
-    cqbFeatures(j).forEach(function (f) {   /* 1.16.3: a checked list */
+    /* 1.16.3: a checked list (1.16.4: and a complete one). A line without a usable elevation
+     * is left out of the range, as everywhere in this file -- and 1.16.4 says so: lines counts
+     * every line, so the panel can tell "none mapped" from "mapped, but no usable elevation",
+     * and a range built without some lines is flagged (the highest BFE may be higher). */
+    var lines = cqbFeatures(j);
+    lines.forEach(function (f) {
       var a = f.attributes;
       /* Same Number(null)===0 trap as everywhere else in this file. */
       var e = cqbElevOrNull(a.ELEV);
       if (e !== null) elevs.push(e);
       if (cqbBlank(a.V_DATUM)) undeclared++; else datums[String(a.V_DATUM).trim()] = 1;
     });
-    return { ok: true, count: elevs.length,
+    return { ok: true, count: elevs.length, lines: lines.length,
              min: elevs.length ? Math.min.apply(null, elevs) : null,
              max: elevs.length ? Math.max.apply(null, elevs) : null,
              datums: Object.keys(datums), datumMissing: undeclared };
@@ -2380,6 +2441,10 @@ function cqbFreeboardAssess(parcelGeom, deps) {
                effdate: eff, preFreeze: pre };
     });
   }
+  /* 1.16.4 (R2-01): these five conclude from which records are there, and say what is
+   * missing from a record instead of dropping it -- a flood prone area with no ID, a BFE line
+   * with no elevation, a zoning district with no zone are each named as such by the panel.
+   * So no field is required here; the reply must still be complete (cqbFeatures). */
   return Promise.all([
     polyQuery(CQB_FPA_URL, { outFields: 'ID' }),
     bfeQ,
@@ -2388,7 +2453,10 @@ function cqbFreeboardAssess(parcelGeom, deps) {
     polyQuery(CQB_ZONE_CNTY_URL, { outFields: 'ZONE,OVERLAY,EFFDATE' })
   ]).then(function (r) {
     return {
-      floodProne: { ok: r[0].ok, ids: r[0].features.map(function (f) {
+      /* count: the mapped flood prone areas touching the parcel (1.16.4). Until 1.16.4 the
+       * panel read "touches a flood prone area" from the IDs alone, so a record without an ID
+       * read as no flood prone area at all. ids: the ones that have an ID, for display. */
+      floodProne: { ok: r[0].ok, count: r[0].features.length, ids: r[0].features.map(function (f) {
         return (f.attributes || {}).ID;
       }).filter(function (v) { return !cqbBlank(v); }) },
       bfe: r[1],
@@ -2959,6 +3027,15 @@ var CQB_SE_STATE = {
   notComputed: 'Not computed'
 };
 
+/* How many mapped flood prone areas a freeboard report found (1.16.4, coordinator review
+ * R2-01): the records, not their IDs -- a flood prone area with no ID recorded is still a
+ * flood prone area. Until 1.16.4 "touches a flood prone area" was read from the IDs alone.
+ * A report without a count (one built by hand, as in older tests) falls back to its IDs. */
+function cqbSeFpCount(fp) {
+  if (!fp) return 0;
+  return typeof fp.count === 'number' ? fp.count : (fp.ids || []).length;
+}
+
 /* The state of each flood-review block, from the same reports the renderers read. "partial"
  * means some lookups answered and some did not, so the block is incomplete; "failed" means
  * the question it answers could not be settled at all. */
@@ -2966,7 +3043,7 @@ function cqbSeFloodState(z, fb) {
   var zoneOk = !!z && !z.failed;
   var fpOk = !!fb && fb.floodProne && fb.floodProne.ok;
   var touches = (zoneOk && z.zones && z.zones.length > 0) ||
-    (!!fb && fb.floodProne && (fb.floodProne.ids || []).length > 0);
+    (!!fb && cqbSeFpCount(fb.floodProne) > 0);
   if (touches) {
     /* 1.16.3: the chapter facts (2004 city limits, zoning) count too -- the block shows them */
     var gaps = !zoneOk || !fb || !fpOk || !fb.bfe || !fb.bfe.ok ||
@@ -3062,8 +3139,9 @@ function cqbSeFreeboardHtml(z, fb) {
   }
   var zones = (z && z.zones) || [];
   var zoneKnown = !(z && z.failed);
-  var fpIds = fb.floodProne.ids;
-  var touches = zones.length > 0 || fpIds.length > 0;
+  var fpIds = fb.floodProne.ids || [];
+  var fpCount = cqbSeFpCount(fb.floodProne);
+  var touches = zones.length > 0 || fpCount > 0;
   var fails = [];
   if (!zoneKnown) fails.push('the FEMA flood zones');
   if (!fb.floodProne.ok) fails.push('the flood prone areas');
@@ -3074,9 +3152,15 @@ function cqbSeFreeboardHtml(z, fb) {
   /* -- what the parcel touches -- */
   var basis = [];
   if (zones.length) basis.push('FEMA zone ' + zones.map(esc).join(', '));
-  if (fpIds.length) basis.push('mapped flood prone area ' + fpIds.map(function (i) {
-    return '#' + esc(i);
-  }).join(', '));
+  if (fpCount) {
+    /* 1.16.4: an area with no ID recorded is named as that, not left out */
+    var noId = fpCount - fpIds.length;
+    basis.push(fpIds.length
+      ? 'mapped flood prone area ' + fpIds.map(function (i) { return '#' + esc(i); }).join(', ') +
+        (noId > 0 ? ' and ' + noId + ' more with no ID recorded' : '')
+      : (fpCount === 1 ? 'a mapped flood prone area (no ID recorded)'
+                       : fpCount + ' mapped flood prone areas (no ID recorded)'));
+  }
   if (basis.length) {
     bits.push('<div style="margin-top:6px"><b>Freeboard.</b> This parcel touches ' +
       basis.join(' and ') + '. The lowest floor of new or substantially improved ' +
@@ -3107,6 +3191,20 @@ function cqbSeFreeboardHtml(z, fb) {
       bits.push('<div class="warn">None of the nearby BFE lines declares a vertical datum, ' +
         'so the NAVD88 basis of these elevations is unverified.</div>');
     }
+    var leftOut = (fb.bfe.lines || 0) - fb.bfe.count;
+    if (leftOut > 0) {
+      /* 1.16.4: the range and the floor heights come from the lines with an elevation only */
+      bits.push('<div class="warn">' + leftOut + ' of the ' + fb.bfe.lines + ' BFE lines within ' +
+        '2,000 ft record' + (leftOut === 1 ? 's' : '') + ' no usable elevation and ' +
+        (leftOut === 1 ? 'was' : 'were') + ' left out, so the highest nearby BFE may be higher ' +
+        'than shown.</div>');
+    }
+  } else if (fb.bfe.lines > 0) {
+    /* 1.16.4: lines are mapped but none records a usable elevation -- not "none mapped" */
+    bits.push('<div class="warn">' + fb.bfe.lines + ' base flood elevation line' +
+      (fb.bfe.lines === 1 ? ' is' : 's are') + ' mapped within 2,000 ft of this parcel, but ' +
+      (fb.bfe.lines === 1 ? 'it records no' : 'none records a') + ' usable elevation, so no ' +
+      'heights are shown.</div>');
   } else {
     bits.push('<div style="margin-top:6px">No base flood elevation lines are mapped within ' +
       '2,000 ft of this parcel' + (zones.indexOf('A') >= 0
@@ -3121,7 +3219,8 @@ function cqbSeFreeboardHtml(z, fb) {
   if (fb.city2004 === null) facts.push('2004 city limits could not be checked');
   function zoneFact(rows, label) {
     rows.forEach(function (r) {
-      if (!r.zone) return;
+      /* 1.16.4 (R2-01): a mapped district with no zone recorded is said, not dropped */
+      if (!r.zone) { facts.push('a mapped ' + label + ' zoning district with no zone recorded'); return; }
       var s = label + ' zoning ' + esc(r.zone);
       if (r.preFreeze === true) s += ' (in effect since ' + esc(r.effdate) + ', before the 2004 freeze date)';
       if (r.preFreeze === false) s += ' (in effect since ' + esc(r.effdate) + ' &mdash; its 2004 zoning is not knowable from the public map)';
@@ -3271,6 +3370,13 @@ function cqbSeStorageHtml(r) {
   if (r.emptyClip) {
     return '<div style="margin-top:6px;color:#c2d4e6">The parcel only touches ' +
       'the edge of storage area ' + r.saLabel + '; none of its area falls inside.</div>';
+  }
+  if (r.noBfe && r.bfeUnusable) {
+    /* 1.16.4: lines are mapped, but none records a usable elevation */
+    return '<div class="warn">Storage area ' + r.saLabel + ' was found, and ' + r.bfeUnusable +
+      ' base flood elevation line' + (r.bfeUnusable === 1 ? ' is' : 's are') + ' mapped within ' +
+      '2,000 ft, but ' + (r.bfeUnusable === 1 ? 'it records no' : 'none records a') + ' usable ' +
+      'elevation, so there is nothing to measure depth against.</div>';
   }
   if (r.noBfe) {
     return '<div class="warn">Storage area ' + r.saLabel + ' was found, but ' +
@@ -3638,7 +3744,7 @@ function cqbSeReviewGaps(rv) {
     '2004 city limits, zoning)');
   else if (!fpOk) g.push('flood prone areas');
   var touches = (zoneOk && z.zones && z.zones.length > 0) ||
-    (!!fb && fb.floodProne && (fb.floodProne.ids || []).length > 0);
+    (!!fb && cqbSeFpCount(fb.floodProne) > 0);
   /* the chapter facts matter where the parcel touches a zone -- or might, when the zone or
    * flood prone area lookup itself did not answer */
   if (touches || !zoneOk || !fpOk) {

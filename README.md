@@ -44,7 +44,7 @@ The choice is remembered in `__claude_qb_ext_optin`. Remove that key to be asked
 2. Click **[DV_Toolkit.user.js](DV_Toolkit.user.js)** → **Raw**. Tampermonkey will offer to install it.
 3. Open the Development Viewer. The Quick Bar appears near the bottom of the map once the map finishes loading (this can take 30–45 seconds on a slow connection).
 
-If you install while the viewer is already open, **reload the page** — userscripts only inject at page load. To check which version is running, press F12 and type `window.__dvToolkit`; you should get `{version: "1.17.1", ready: true}`. That check is useful before reporting a bug, although different review builds can share the same version number.
+If you install while the viewer is already open, **reload the page** — userscripts only inject at page load. To check which version is running, press F12 and type `window.__dvToolkit`; you should get `{version: "1.17.2", ready: true}`. That check is useful before reporting a bug, although different review builds can share the same version number.
 
 `ready: true` means the start-up sequence ran. It does **not** prove that both parts started. The popup patch and the Quick Bar start separately, and a failure in either is logged to the console as `[DV Toolkit] popup patch failed` or `[DV Toolkit] Quick Bar failed` while `ready` still turns true. If something looks missing, check the console for those lines.
 
