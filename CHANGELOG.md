@@ -1,15 +1,29 @@
 # Changelog
 
+## 1.17.3 — Building coverage with the 1.16.5 reply checks
+
+**Not yet independently verified.** Built and checked by the builder with automated tests. The independent browser review is still to come. Includes everything in 1.16.5. 1.17.2 was not released: the independent review on October 15, 2026 asked for the 1.16.5 corrections.
+
+- **The same reply checks as 1.16.5.** Building coverage already refused a land boundary it could not read; it now gets the shared lookup's failure for it, still with Retry and no figure.
+- **The coverage method and its figures are unchanged** from 1.17.2.
+
+## 1.16.5 — Site tools: FEMA zone values must be text; leased-land boundaries must be readable
+
+**Not yet independently verified.** Built and checked by the builder with automated tests; the replies below were produced on purpose in those tests, because the county does not send them on request. The independent review is still to come. 1.16.4 was not released: the independent review on October 15, 2026 found two more kinds of reply it believed, and 1.16.5 corrects them.
+
+- **A FEMA zone value that is not text is not an answer.** The flood review turned the zone and floodway values into text before reading them. An object showed and copied as "FEMA zone [object Object]" under "Done"; false and 0 became zone names; a list such as ["A"] became Zone A and started the Zone A measurement; and an object, list, true/false or number in the floodway field still gave a floodway answer (a list holding "FLOODWAY" counted as a floodway, the rest as "not a floodway"). Now any of those leaves the FEMA zones unknown: "Finished with gaps", Retry, and Copy summary says INCOMPLETE. The Zone A measurement does not start. One unusable record among good ones makes the whole answer unknown; before, the zones of the good records were still named in the freeboard paragraph. Any zone name written as text still reads (A, AE, X and others), and the county's blank floodway values still mean "not a floodway".
+- **The land under a mobile home must have a readable boundary.** For an improvement ID, Site tools finds the tax parcel under the home's point. That parcel's boundary only had to be present: one whose rings held no coordinates still counted, and Flood review and Fill capacity sent it on to the county. Now such a boundary is a failed lookup, with Retry, and nothing more is asked. Find Parcel shows its "could not be completed" card with Retry in the same case.
+
 ## 1.17.2 — Building coverage with the 1.16.4 reply checks
 
-**Not yet independently verified.** Built and checked by the builder with automated tests and in Chrome on the live viewer. The independent browser review is still to come. Includes everything in 1.16.4. 1.17.1 was not released: the coordinator's review on October 14, 2026 asked for the 1.16.4 corrections.
+**Not released.** Superseded by 1.17.3: the independent review on October 15, 2026 asked for two more corrections. It was built and checked by the builder with automated tests and in Chrome on the live viewer. Includes everything in 1.16.4. 1.17.1 was not released: the coordinator's review on October 14, 2026 asked for the 1.16.4 corrections.
 
 - **The same reply checks as 1.16.4.** Building coverage reads the parcel and the leased-land lookups through the same checked readers. A reply marked incomplete is a failed lookup with Retry: no footprint is requested and no figure is shown. Its own footprint reader, which reads a long list page by page, works as before.
 - **The coverage method and its figures are unchanged** from 1.17.1.
 
 ## 1.16.4 — Site tools: a partial or field-less reply is not an answer
 
-**Not yet independently verified.** Built and checked by the builder with automated tests and in Chrome on the live viewer, where the replies below were produced on purpose because the county does not send them on request. The independent browser review is still to come. 1.16.3 was not released: the coordinator's review on October 14, 2026 found two kinds of reply it still believed, and 1.16.4 corrects them.
+**Not released.** Superseded by 1.16.5: the independent review on October 15, 2026 asked for two more corrections. It was built and checked by the builder with automated tests and in Chrome on the live viewer, where the replies below were produced on purpose because the county does not send them on request. 1.16.3 was not released: the coordinator's review on October 14, 2026 found two kinds of reply it still believed, and 1.16.4 corrects them.
 
 - **A reply marked incomplete is a failed lookup.** The county's map server can mark a reply as only part of the result. Site tools now treats such a reply as "could not be completed", with Retry, even when its list is empty. This covers the parcel lookup, the leased-land (mobile-home) lookups, every flood layer and Fill capacity's own lookups. 1.16.3 read an empty part as "no parcel to review" or "No mapped match". A complete empty list is still the answer "not found" or "No mapped match".
 - **A FEMA flood-zone record must say which zone it is.** A record with no zone designation, or without its floodway field, leaves the FEMA zones unknown. The review ends "Finished with gaps" with Retry, and Copy summary says INCOMPLETE. 1.16.3 read such a record as "no FEMA flood zone touches this parcel". The county's single-space floodway value still means "not a floodway".
