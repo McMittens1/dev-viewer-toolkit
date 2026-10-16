@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lincoln/Lancaster Development Viewer Toolkit
 // @namespace    https://gis.lincoln.ne.gov/
-// @version      1.16.4
+// @version      1.16.5
 // @description  Auto-applies the redesigned parcel popup (v8) and the Quick Bar to the public Development Viewer: Site tools flood review (FEMA Zone A, freeboard facts, recorded flood documents, FEMA letters of map change) and a separate Salt Creek flood-storage and allowable-fill calculator, mobile-home and leased-land parcel lookup, floodplain share of parcel, the #INVALID repair extended to 20 rows, shareable deep links, parcel results in the search box, and the Inspector-rows fix.
 // @match        https://gis.lincoln.ne.gov/apps/*
 // @homepageURL  https://github.com/McMittens1/dev-viewer-toolkit
@@ -38,7 +38,7 @@
   'use strict';
 
   /* ---------------------------------------------------------------------
-   * Development Viewer Toolkit 1.16.4 -- auto-run wrapper.
+   * Development Viewer Toolkit 1.16.5 -- auto-run wrapper.
    *
    * Runs the SAME two payloads as the manual install, at the right moment:
    *   applyPopup()   = seed_apply_popup_v8.js  (popup v8, fail-safe gates + FEMA Zone A)
@@ -56,7 +56,7 @@
    * ------------------------------------------------------------------- */
 
   if (window.__dvToolkit) return;              /* never install twice */
-  window.__dvToolkit = { version: '1.16.4', ready: false };
+  window.__dvToolkit = { version: '1.16.5', ready: false };
 
   /* The payloads alert() on "map not ready" / "layer not found". That is right
    * for a bookmarklet someone just clicked, and wrong for something that runs on
@@ -1791,6 +1791,15 @@ function cqbIollResolve(pid, deps) {
       if (!pf || !pf.geometry || !Array.isArray(pf.geometry.rings) || !pf.geometry.rings.length) {
         throw cqbLookupFailure(landWhat, cqbKindError('malformed', 'the land parcel came back without a boundary'));
       }
+      /* 1.16.5 (coordinator review SF-02): the boundary must be READABLE, by the same rule the
+       * parcel reader and Building coverage use (cqbPolygonOk), before the land counts as found.
+       * Until 1.16.5 only its presence was checked, so a land record whose rings held no
+       * coordinates -- [["bad"]] -- came back as found, and Flood review and Fill capacity sent
+       * that boundary on to the county's layers and geometry service. Every caller gets this
+       * failed lookup instead, with Retry: Site tools' three tools and Find Parcel. */
+      if (!cqbPolygonOk(pf.geometry)) {
+        throw cqbLookupFailure(landWhat, cqbReplyError('the land parcel\u2019s boundary could not be read'));
+      }
       var land = cqbLandRecord(pf);
       if (!land) {
         throw cqbLookupFailure(landWhat, cqbKindError('malformed', 'the land parcel came back without a usable parcel id'));
@@ -2300,13 +2309,35 @@ function cqbZoneAssess(parcelGeom, attrs, deps) {
      * FLD_ZONE cannot show that no Zone A or AE touches the parcel, so the lookup is unknown
      * -- until 1.16.4 {"attributes": {}} read as "no FEMA flood zone". FLOODWAY must be in
      * the record, but its value may be blank: the county marks non-floodway areas with a
-     * single space. */
-    cqbFeatures(j, ['FLD_ZONE', 'FLOODWAY']).forEach(function (f) {
+     * single space.
+     * 1.16.5 (coordinator review SF-01): both values must be TEXT before they are read. Until
+     * 1.16.5 they were turned into text first, so {"FLD_ZONE": {}} read as "FEMA zone [object
+     * Object]", false and 0 became zone names, a list such as ["A"] became zone A, and an
+     * object, list, true/false or number in FLOODWAY still gave a floodway answer (["FLOODWAY"]
+     * as a floodway, the others as "not a floodway") -- each a finished answer. A zone is any
+     * non-blank text: the county uses A and AE, and other FEMA names such
+     * as X stay readable -- this checks the type, not the name. FLOODWAY is text, blank text or
+     * null. Anything else leaves the whole zone lookup unknown (gaps, Retry, INCOMPLETE), and
+     * nothing that depends on it runs: the Zone A query below is never sent.
+     * Every record is checked before any is read. Until 1.16.5 the zones of the records before
+     * an unusable one were already kept when it failed, so a good "A" followed by a bad record
+     * still showed "This parcel touches FEMA zone A" under a FEMA lookup marked unknown. */
+    var feats = cqbFeatures(j, ['FLD_ZONE', 'FLOODWAY']);
+    feats.forEach(function (f) {
       var a = f.attributes;
+      if (a.FLD_ZONE !== null && typeof a.FLD_ZONE !== 'string') {
+        throw cqbReplyError('a flood-zone record gave its zone as something other than text');
+      }
       if (cqbBlank(a.FLD_ZONE)) throw cqbReplyError('a flood-zone record did not say which zone it is');
-      var z = String(a.FLD_ZONE).trim();
+      if (a.FLOODWAY !== null && typeof a.FLOODWAY !== 'string') {
+        throw cqbReplyError('a flood-zone record gave its floodway value as something other than text');
+      }
+    });
+    feats.forEach(function (f) {
+      var a = f.attributes;
+      var z = a.FLD_ZONE.trim();
       if (rep.zones.indexOf(z) < 0) rep.zones.push(z);
-      if (!cqbBlank(a.FLOODWAY) && String(a.FLOODWAY).trim() === 'FLOODWAY') rep.floodway = true;
+      if (a.FLOODWAY !== null && a.FLOODWAY.trim() === 'FLOODWAY') rep.floodway = true;
     });
     rep.zones.sort();
     rep.inZoneA = rep.zones.indexOf('A') >= 0;
@@ -2344,7 +2375,11 @@ function cqbZoneAssess(parcelGeom, attrs, deps) {
       return rep;
     });
   }).catch(function () {
+    /* 1.16.5 (SF-01): a failed zone lookup reports no zones at all -- nothing half-read */
     rep.failed = true;
+    rep.zones = [];
+    rep.floodway = false;
+    rep.inZoneA = false;
     return rep;
   });
 }
